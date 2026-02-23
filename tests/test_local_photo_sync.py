@@ -8,11 +8,11 @@ from typing import Any, Dict, Optional
 
 import pytest
 
-from imagetracker.captioner import CaptionResult
-from imagetracker.config import Settings
-from imagetracker.gps_extractor import GpsCoordinates
-from imagetracker.local_photo_sync import (
+from ImageTracker import (
+    CaptionResult,
+    GpsCoordinates,
     LocalPhotoSyncService,
+    Settings,
     _drive_item_id_for_path,
     parse_cutoff_date,
 )
