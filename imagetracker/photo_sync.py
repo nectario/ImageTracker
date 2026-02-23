@@ -252,8 +252,8 @@ class PhotoSyncService:
                 conn,
                 source=self.SOURCE,
                 drive_item_id=drive_item_id,
-                short_description=caption.short_description,
-                short_description_model=caption.model,
+                description=caption.short_description,
+                description_model=caption.model,
                 updated_at_utc=now,
             )
 
@@ -286,16 +286,16 @@ class PhotoSyncService:
         if existing is None:
             return True
 
-        short_description = existing.get("ShortDescription")
-        if not short_description:
+        description = existing.get("Description")
+        if not description:
             return True
 
-        existing_model = existing.get("ShortDescriptionModel")
+        existing_model = existing.get("DescriptionModel")
         current_model = getattr(self._captioner, "model", None)
         if current_model and existing_model != current_model:
             return True
 
-        if existing.get("ShortDescriptionUpdatedAtUtc") is None:
+        if existing.get("DescriptionUpdatedAtUtc") is None:
             return True
 
         return False

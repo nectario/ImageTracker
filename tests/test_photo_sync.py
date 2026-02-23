@@ -104,9 +104,9 @@ class FakeImageRepository:
                 "Source": payload.source,
                 "DriveItemId": payload.drive_item_id,
                 "FileName": payload.file_name,
-                "ShortDescription": row.get("ShortDescription"),
-                "ShortDescriptionModel": row.get("ShortDescriptionModel"),
-                "ShortDescriptionUpdatedAtUtc": row.get("ShortDescriptionUpdatedAtUtc"),
+                "Description": row.get("Description"),
+                "DescriptionModel": row.get("DescriptionModel"),
+                "DescriptionUpdatedAtUtc": row.get("DescriptionUpdatedAtUtc"),
             }
         )
         self.rows[payload.drive_item_id] = row
@@ -120,15 +120,15 @@ class FakeImageRepository:
         conn,
         source: str,
         drive_item_id: str,
-        short_description: str,
-        short_description_model: str,
+        description: str,
+        description_model: str,
         updated_at_utc: datetime,
     ):
         row = self.rows.setdefault(drive_item_id, {})
-        row["ShortDescription"] = short_description
-        row["ShortDescriptionModel"] = short_description_model
-        row["ShortDescriptionUpdatedAtUtc"] = updated_at_utc
-        self.caption_updates.append((source, drive_item_id, short_description, short_description_model))
+        row["Description"] = description
+        row["DescriptionModel"] = description_model
+        row["DescriptionUpdatedAtUtc"] = updated_at_utc
+        self.caption_updates.append((source, drive_item_id, description, description_model))
 
 
 class FakeGraphClient:
@@ -287,9 +287,9 @@ def test_upsert_sql_uses_pascal_case_identifiers():
     sql = ImageAssetRepository.UPSERT_SQL
     assert "`ImageAsset`" in sql
     assert "`DriveItemId`" in sql
-    assert "`ShortDescription`" not in sql  # Caption is updated separately.
+    assert "`Description`" not in sql  # Caption is updated separately.
     assert "drive_item_id" not in sql
-    assert "short_description" not in sql
+    assert "description" not in sql
 
 
 @pytest.mark.parametrize(
@@ -302,9 +302,9 @@ def test_upsert_sql_uses_pascal_case_identifiers():
             {
                 "Source": "OneDrive",
                 "DriveItemId": "item-3",
-                "ShortDescription": "Already captioned.",
-                "ShortDescriptionModel": "vision-model",
-                "ShortDescriptionUpdatedAtUtc": datetime(2026, 2, 20, 0, 0, 0),
+                "Description": "Already captioned.",
+                "DescriptionModel": "vision-model",
+                "DescriptionUpdatedAtUtc": datetime(2026, 2, 20, 0, 0, 0),
             },
             0,
         ),
@@ -313,9 +313,9 @@ def test_upsert_sql_uses_pascal_case_identifiers():
             {
                 "Source": "OneDrive",
                 "DriveItemId": "item-3",
-                "ShortDescription": "Old model caption.",
-                "ShortDescriptionModel": "old-model",
-                "ShortDescriptionUpdatedAtUtc": datetime(2026, 2, 20, 0, 0, 0),
+                "Description": "Old model caption.",
+                "DescriptionModel": "old-model",
+                "DescriptionUpdatedAtUtc": datetime(2026, 2, 20, 0, 0, 0),
             },
             1,
         ),

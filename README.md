@@ -7,7 +7,7 @@ ImageTracker syncs iPhone photos from OneDrive Camera Upload into MySQL using Mi
 - Incremental sync with Microsoft Graph `delta` (no repeated full scans after first run)
 - Stores photo metadata in MySQL PascalCase tables/columns:
   - `ImageAsset.FileName`
-  - `ImageAsset.ShortDescription`
+  - `ImageAsset.Description`
   - `ImageAsset.Latitude` / `ImageAsset.Longitude`
 - Device-code auth command for OneDrive token bootstrap
 - Optional OpenAI vision captioning
@@ -113,7 +113,7 @@ SELECT
   `TakenDateTimeUtc`,
   `Latitude`,
   `Longitude`,
-  `ShortDescription`
+  `Description`
 FROM `ImageAsset`
 WHERE `IsDeleted` = 0
   AND `TakenDateTimeUtc` >= @StartUtc

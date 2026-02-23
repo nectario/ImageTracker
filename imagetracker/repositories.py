@@ -62,9 +62,9 @@ class ImageAssetRepository:
                     `Id`,
                     `Source`,
                     `DriveItemId`,
-                    `ShortDescription`,
-                    `ShortDescriptionModel`,
-                    `ShortDescriptionUpdatedAtUtc`
+                    `Description`,
+                    `DescriptionModel`,
+                    `DescriptionUpdatedAtUtc`
                 FROM `ImageAsset`
                 WHERE `Source` = %s AND `DriveItemId` = %s
                 """,
@@ -115,8 +115,8 @@ class ImageAssetRepository:
         conn: Connection,
         source: str,
         drive_item_id: str,
-        short_description: str,
-        short_description_model: str,
+        description: str,
+        description_model: str,
         updated_at_utc: datetime,
     ) -> None:
         with conn.cursor() as cursor:
@@ -124,15 +124,15 @@ class ImageAssetRepository:
                 """
                 UPDATE `ImageAsset`
                 SET
-                    `ShortDescription` = %s,
-                    `ShortDescriptionModel` = %s,
-                    `ShortDescriptionUpdatedAtUtc` = %s,
+                    `Description` = %s,
+                    `DescriptionModel` = %s,
+                    `DescriptionUpdatedAtUtc` = %s,
                     `UpdatedAtUtc` = %s
                 WHERE `Source` = %s AND `DriveItemId` = %s
                 """,
                 (
-                    short_description,
-                    short_description_model,
+                    description,
+                    description_model,
                     updated_at_utc,
                     updated_at_utc,
                     source,
