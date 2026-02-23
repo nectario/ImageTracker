@@ -25,7 +25,15 @@ Copy `.env.example` to `.env` and set values.
 Required:
 
 - `ONEDRIVE_CLIENT_ID`
-- `MYSQL_DSN` (or `MYSQL_HOST` / `MYSQL_USER` / `MYSQL_DATABASE`)
+- `MYSQL_DSN` or project-scoped MySQL vars (`IMAGETRACKER_MYSQL_*`)
+
+MySQL env resolution order when `MYSQL_DSN` is not set:
+
+- Host: `IMAGETRACKER_MYSQL_HOST` -> `MYSQL_HOST`
+- Port: `IMAGETRACKER_MYSQL_PORT` -> `MYSQL_PORT`
+- User: `IMAGETRACKER_MYSQL_USER` -> `MYSQL_USERID` -> `MYSQL_USER`
+- Password: `IMAGETRACKER_MYSQL_PASSWORD` -> `MYSQL_PASSWORD`
+- Database: `IMAGETRACKER_MYSQL_DATABASE` -> `MYSQL_DATABASE_IMAGETRACKER` -> `MYSQL_DATABASE`
 
 Defaults included:
 

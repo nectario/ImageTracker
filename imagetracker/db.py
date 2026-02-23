@@ -51,14 +51,21 @@ def parse_mysql_config(settings: Settings) -> MysqlConnectionConfig:
             charset=charset,
         )
 
-    host = _env_or_default("MYSQL_HOST", "127.0.0.1")
-    port = int(_env_or_default("MYSQL_PORT", "3306"))
-    user = _env_or_default("MYSQL_USER", "")
-    password = _env_or_default("MYSQL_PASSWORD", "")
-    database = _env_or_default("MYSQL_DATABASE", "")
+    host = _first_env(("IMAGETRACKER_MYSQL_HOST", "MYSQL_HOST"), "127.0.0.1")
+    port = int(_first_env(("IMAGETRACKER_MYSQL_PORT", "MYSQL_PORT"), "3306"))
+    user = _first_env(("IMAGETRACKER_MYSQL_USER", "MYSQL_USERID", "MYSQL_USER"), "")
+    password = _first_env(("IMAGETRACKER_MYSQL_PASSWORD", "MYSQL_PASSWORD"), "")
+    database = _first_env(
+        ("IMAGETRACKER_MYSQL_DATABASE", "MYSQL_DATABASE_IMAGETRACKER", "MYSQL_DATABASE"),
+        "",
+    )
 
     if not user or not database:
-        raise DbError("Set MYSQL_DSN or MYSQL_HOST/MYSQL_USER/MYSQL_DATABASE")
+        raise DbError(
+            "Set MYSQL_DSN or IMAGETRACKER_MYSQL_* "
+            "(fallbacks: MYSQL_HOST/MYSQL_PORT/MYSQL_USERID-or-MYSQL_USER/MYSQL_PASSWORD/"
+            "MYSQL_DATABASE_IMAGETRACKER-or-MYSQL_DATABASE)"
+        )
 
     return MysqlConnectionConfig(
         host=host,
@@ -69,10 +76,14 @@ def parse_mysql_config(settings: Settings) -> MysqlConnectionConfig:
     )
 
 
-def _env_or_default(name: str, default: str) -> str:
+def _first_env(names: tuple[str, ...], default: str) -> str:
     import os
 
-    return os.getenv(name, default)
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return default
 
 
 class Database:
