@@ -10,6 +10,7 @@ import pytest
 from imagetracker.captioner import CaptionResult
 from imagetracker.config import Settings
 from imagetracker.graph_client import GraphApiError
+from imagetracker.gps_extractor import GpsCoordinates
 from imagetracker.photo_sync import PhotoSyncService
 from imagetracker.repositories import ImageAssetRepository
 
@@ -138,6 +139,7 @@ class FakeGraphClient:
         self.requested_pages = []
         self.resolved_paths = []
         self.thumbnail_calls = []
+        self.content_calls = []
 
     def get(self, path_or_url: str):
         self.requested_pages.append(path_or_url)
@@ -156,6 +158,10 @@ class FakeGraphClient:
     def get_bytes(self, url: str):
         return b"image-bytes"
 
+    def get_item_content(self, drive_item_id: str):
+        self.content_calls.append(drive_item_id)
+        return b"image-content"
+
 
 class FakeCaptioner:
     def __init__(self, model: str = "vision-model"):
@@ -165,6 +171,16 @@ class FakeCaptioner:
     def generate_caption(self, image_bytes: bytes):
         self.calls += 1
         return CaptionResult(short_description="A short photo description.", model=self.model)
+
+
+class FakeGpsExtractor:
+    def __init__(self, result=None):
+        self.result = result
+        self.calls = []
+
+    def extract(self, content_bytes: bytes, *, mime_type: Optional[str], file_name: str):
+        self.calls.append((content_bytes, mime_type, file_name))
+        return self.result
 
 
 def make_settings() -> Settings:
@@ -188,6 +204,7 @@ def build_service(
     state: Optional[Dict[str, Any]],
     image_repo: Optional[FakeImageRepository] = None,
     captioner: Optional[FakeCaptioner] = None,
+    gps_extractor: Optional[FakeGpsExtractor] = None,
 ):
     now = datetime(2026, 2, 23, 12, 0, 0)
     image_repo = image_repo or FakeImageRepository()
@@ -205,6 +222,7 @@ def build_service(
         token_cache_repo=token_repo,
         graph_client_factory=lambda _token: graph_client,
         captioner=captioner,
+        gps_extractor=gps_extractor,
         now_fn=lambda: now,
     )
 
@@ -281,6 +299,177 @@ def test_deleted_item_marks_asset_deleted():
     assert result.deleted_count == 1
     assert len(image_repo.deleted) == 1
     assert image_repo.deleted[0][1] == "item-2"
+
+
+def test_gps_extraction_from_content_is_primary_over_graph_location():
+    pages = {
+        "https://graph.microsoft.com/v1.0/delta-start": {
+            "value": [
+                {
+                    "id": "item-gps-primary",
+                    "name": "IMG_0101.JPG",
+                    "photo": {"takenDateTime": "2026-02-22T14:00:00Z"},
+                    "file": {"mimeType": "image/jpeg"},
+                    "location": {"geoCoordinates": {"latitude": 1.0, "longitude": 2.0, "altitude": 3.0}},
+                }
+            ],
+            "@odata.deltaLink": "https://graph.microsoft.com/v1.0/delta-new",
+        }
+    }
+    gps_extractor = FakeGpsExtractor(
+        GpsCoordinates(latitude=40.7128, longitude=-74.0060, altitude=9.5)
+    )
+    image_repo = FakeImageRepository()
+    service, _, _, graph_client = build_service(
+        graph_client=FakeGraphClient(pages),
+        state={
+            "Id": 1,
+            "FolderDriveItemId": "folder-1",
+            "FolderPath": "/Pictures/Camera Roll",
+            "DeltaLink": "https://graph.microsoft.com/v1.0/delta-start",
+            "LastRunAtUtc": None,
+            "LastSuccessAtUtc": None,
+            "LastError": None,
+            "UpdatedAtUtc": None,
+        },
+        image_repo=image_repo,
+        gps_extractor=gps_extractor,
+    )
+
+    service.run_sync()
+
+    upsert_payload = image_repo.upserts[0]
+    assert upsert_payload.latitude == pytest.approx(40.7128)
+    assert upsert_payload.longitude == pytest.approx(-74.0060)
+    assert upsert_payload.altitude == pytest.approx(9.5)
+    assert graph_client.content_calls == ["item-gps-primary"]
+    assert len(gps_extractor.calls) == 1
+
+
+def test_graph_location_is_used_when_gps_extraction_missing():
+    pages = {
+        "https://graph.microsoft.com/v1.0/delta-start": {
+            "value": [
+                {
+                    "id": "item-gps-fallback",
+                    "name": "IMG_0102.JPG",
+                    "photo": {"takenDateTime": "2026-02-22T14:00:00Z"},
+                    "file": {"mimeType": "image/jpeg"},
+                    "location": {"geoCoordinates": {"latitude": 10.1, "longitude": 20.2, "altitude": 30.3}},
+                }
+            ],
+            "@odata.deltaLink": "https://graph.microsoft.com/v1.0/delta-new",
+        }
+    }
+    gps_extractor = FakeGpsExtractor(result=None)
+    image_repo = FakeImageRepository()
+    service, _, _, graph_client = build_service(
+        graph_client=FakeGraphClient(pages),
+        state={
+            "Id": 1,
+            "FolderDriveItemId": "folder-1",
+            "FolderPath": "/Pictures/Camera Roll",
+            "DeltaLink": "https://graph.microsoft.com/v1.0/delta-start",
+            "LastRunAtUtc": None,
+            "LastSuccessAtUtc": None,
+            "LastError": None,
+            "UpdatedAtUtc": None,
+        },
+        image_repo=image_repo,
+        gps_extractor=gps_extractor,
+    )
+
+    service.run_sync()
+
+    upsert_payload = image_repo.upserts[0]
+    assert upsert_payload.latitude == pytest.approx(10.1)
+    assert upsert_payload.longitude == pytest.approx(20.2)
+    assert upsert_payload.altitude == pytest.approx(30.3)
+    assert graph_client.content_calls == ["item-gps-fallback"]
+    assert len(gps_extractor.calls) == 1
+
+
+def test_existing_gps_is_preserved_when_new_item_has_no_gps():
+    pages = {
+        "https://graph.microsoft.com/v1.0/delta-start": {
+            "value": [
+                {
+                    "id": "item-preserve-gps",
+                    "name": "IMG_0103.JPG",
+                    "photo": {"takenDateTime": "2026-02-22T14:00:00Z"},
+                    "file": {"mimeType": "image/jpeg"},
+                }
+            ],
+            "@odata.deltaLink": "https://graph.microsoft.com/v1.0/delta-new",
+        }
+    }
+    gps_extractor = FakeGpsExtractor(result=None)
+    image_repo = FakeImageRepository()
+    image_repo.rows["item-preserve-gps"] = {
+        "Source": "OneDrive",
+        "DriveItemId": "item-preserve-gps",
+        "Latitude": 44.1,
+        "Longitude": -71.2,
+        "Altitude": 321.0,
+    }
+    service, _, _, _ = build_service(
+        graph_client=FakeGraphClient(pages),
+        state={
+            "Id": 1,
+            "FolderDriveItemId": "folder-1",
+            "FolderPath": "/Pictures/Camera Roll",
+            "DeltaLink": "https://graph.microsoft.com/v1.0/delta-start",
+            "LastRunAtUtc": None,
+            "LastSuccessAtUtc": None,
+            "LastError": None,
+            "UpdatedAtUtc": None,
+        },
+        image_repo=image_repo,
+        gps_extractor=gps_extractor,
+    )
+
+    service.run_sync()
+
+    upsert_payload = image_repo.upserts[0]
+    assert upsert_payload.latitude == pytest.approx(44.1)
+    assert upsert_payload.longitude == pytest.approx(-71.2)
+    assert upsert_payload.altitude == pytest.approx(321.0)
+
+
+def test_non_image_file_skips_content_download_for_gps_extraction():
+    pages = {
+        "https://graph.microsoft.com/v1.0/delta-start": {
+            "value": [
+                {
+                    "id": "item-video",
+                    "name": "clip.mov",
+                    "photo": {"takenDateTime": "2026-02-22T14:00:00Z"},
+                    "file": {"mimeType": "video/quicktime"},
+                }
+            ],
+            "@odata.deltaLink": "https://graph.microsoft.com/v1.0/delta-new",
+        }
+    }
+    gps_extractor = FakeGpsExtractor(result=None)
+    service, _, _, graph_client = build_service(
+        graph_client=FakeGraphClient(pages),
+        state={
+            "Id": 1,
+            "FolderDriveItemId": "folder-1",
+            "FolderPath": "/Pictures/Camera Roll",
+            "DeltaLink": "https://graph.microsoft.com/v1.0/delta-start",
+            "LastRunAtUtc": None,
+            "LastSuccessAtUtc": None,
+            "LastError": None,
+            "UpdatedAtUtc": None,
+        },
+        gps_extractor=gps_extractor,
+    )
+
+    service.run_sync()
+
+    assert graph_client.content_calls == []
+    assert gps_extractor.calls == []
 
 
 def test_upsert_sql_uses_pascal_case_identifiers():

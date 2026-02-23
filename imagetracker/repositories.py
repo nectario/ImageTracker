@@ -62,6 +62,9 @@ class ImageAssetRepository:
                     `Id`,
                     `Source`,
                     `DriveItemId`,
+                    `Latitude`,
+                    `Longitude`,
+                    `Altitude`,
                     `Description`,
                     `DescriptionModel`,
                     `DescriptionUpdatedAtUtc`

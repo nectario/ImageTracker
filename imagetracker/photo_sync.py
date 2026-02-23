@@ -4,12 +4,14 @@ import json
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from imagetracker.captioner import CaptionResult, OpenAIVisionCaptioner
 from imagetracker.config import Settings
 from imagetracker.db import Database, utc_now
 from imagetracker.graph_client import GraphApiError, GraphClient
+from imagetracker.gps_extractor import ExifGpsExtractor, GpsCoordinates, GpsExtractor
 from imagetracker.migrations import MigrationRunner
 from imagetracker.onedrive_auth import AuthRequiredError, OneDriveAuthService
 from imagetracker.repositories import (
@@ -86,6 +88,7 @@ class PhotoSyncService:
         token_cache_repo: Optional[TokenCacheRepository] = None,
         graph_client_factory: Optional[Callable[[str], GraphClient]] = None,
         captioner: Optional[OpenAIVisionCaptioner] = None,
+        gps_extractor: Optional[GpsExtractor] = None,
         now_fn: Callable[[], datetime] = utc_now,
     ):
         self._settings = settings
@@ -97,6 +100,7 @@ class PhotoSyncService:
         self._token_cache_repo = token_cache_repo or TokenCacheRepository()
         self._graph_client_factory = graph_client_factory or (lambda token: GraphClient(token))
         self._captioner = captioner
+        self._gps_extractor = gps_extractor or ExifGpsExtractor()
         self._now_fn = now_fn
 
     def run_sync(self) -> SyncResult:
@@ -222,22 +226,56 @@ class PhotoSyncService:
         if initial_run and not self._within_initial_cutoff(taken_datetime, now):
             return None
 
+        with self._database.connection() as conn:
+            existing = self._image_repo.get_by_source_and_drive_item(conn, self.SOURCE, drive_item_id)
+
+        existing_latitude = _as_float(existing.get("Latitude")) if existing else None
+        existing_longitude = _as_float(existing.get("Longitude")) if existing else None
+        existing_altitude = _as_float(existing.get("Altitude")) if existing else None
+
         geo_coordinates = item.get("location", {}).get("geoCoordinates", {})
+        graph_latitude = _as_float(geo_coordinates.get("latitude"))
+        graph_longitude = _as_float(geo_coordinates.get("longitude"))
+        graph_altitude = _as_float(geo_coordinates.get("altitude"))
+
+        file_name = item.get("name", "")
+        mime_type = item.get("file", {}).get("mimeType")
+        extracted_gps = self._extract_gps_from_content(
+            graph_client=graph_client,
+            drive_item_id=drive_item_id,
+            file_name=file_name,
+            mime_type=mime_type if isinstance(mime_type, str) else None,
+        )
+        final_latitude = (
+            extracted_gps.latitude
+            if extracted_gps
+            else (graph_latitude if graph_latitude is not None else existing_latitude)
+        )
+        final_longitude = (
+            extracted_gps.longitude
+            if extracted_gps
+            else (graph_longitude if graph_longitude is not None else existing_longitude)
+        )
+        final_altitude = (
+            extracted_gps.altitude
+            if extracted_gps and extracted_gps.altitude is not None
+            else (graph_altitude if graph_altitude is not None else existing_altitude)
+        )
+
         payload = ImageUpsertPayload(
             source=self.SOURCE,
             drive_item_id=drive_item_id,
-            file_name=item.get("name", ""),
+            file_name=file_name,
             taken_datetime_utc=taken_datetime,
-            latitude=_as_float(geo_coordinates.get("latitude")),
-            longitude=_as_float(geo_coordinates.get("longitude")),
-            altitude=_as_float(geo_coordinates.get("altitude")),
+            latitude=final_latitude,
+            longitude=final_longitude,
+            altitude=final_altitude,
             raw_graph_json=json.dumps(item, ensure_ascii=False),
             inserted_at_utc=now,
             updated_at_utc=now,
         )
 
         with self._database.connection() as conn:
-            existing = self._image_repo.get_by_source_and_drive_item(conn, self.SOURCE, drive_item_id)
             self._image_repo.upsert(conn, payload)
 
         if not self._should_caption(existing):
@@ -278,6 +316,48 @@ class PhotoSyncService:
         except Exception as exc:
             print(f"Caption generation skipped for {drive_item_id}: {exc}", file=sys.stderr)
             return None
+
+    def _extract_gps_from_content(
+        self,
+        graph_client: GraphClient,
+        drive_item_id: str,
+        file_name: str,
+        mime_type: Optional[str],
+    ) -> Optional[GpsCoordinates]:
+        if not self._gps_extractor:
+            return None
+        if hasattr(self._gps_extractor, "is_available") and not getattr(self._gps_extractor, "is_available"):
+            return None
+
+        # Skip expensive content downloads for files that are not likely still images.
+        if not self._is_likely_still_image(file_name=file_name, mime_type=mime_type):
+            return None
+
+        try:
+            content_bytes = graph_client.get_item_content(drive_item_id)
+            return self._gps_extractor.extract(
+                content_bytes,
+                mime_type=mime_type,
+                file_name=file_name,
+            )
+        except Exception as exc:
+            print(f"GPS extraction skipped for {drive_item_id}: {exc}", file=sys.stderr)
+            return None
+
+    def _is_likely_still_image(self, file_name: str, mime_type: Optional[str]) -> bool:
+        if mime_type and mime_type.startswith("image/"):
+            return True
+
+        return Path(file_name).suffix.lower() in {
+            ".jpg",
+            ".jpeg",
+            ".heic",
+            ".heif",
+            ".tif",
+            ".tiff",
+            ".png",
+            ".webp",
+        }
 
     def _should_caption(self, existing: Optional[Dict[str, Any]]) -> bool:
         if not self._captioner:

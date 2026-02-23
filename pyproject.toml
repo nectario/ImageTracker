@@ -8,6 +8,8 @@ dependencies = [
   "pymysql>=1.1.0",
   "requests>=2.31.0",
   "msal>=1.28.0",
+  "Pillow>=10.3.0",
+  "pillow-heif>=0.16.0",
 ]
 
 [project.optional-dependencies]

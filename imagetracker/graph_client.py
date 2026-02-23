@@ -34,6 +34,17 @@ class GraphClient:
             raise GraphApiError(f"Thumbnail request failed ({response.status_code}): {response.text}")
         return response.content
 
+    def get_item_content(self, drive_item_id: str) -> bytes:
+        response = self._session.get(
+            f"{self._base_url}/me/drive/items/{drive_item_id}/content",
+            headers={"Authorization": f"Bearer {self._access_token}"},
+            timeout=60,
+            allow_redirects=True,
+        )
+        if response.status_code >= 400:
+            raise GraphApiError(f"Drive item content request failed ({response.status_code}): {response.text}")
+        return response.content
+
     def resolve_folder_by_path(self, folder_path: str) -> Dict[str, Any]:
         normalized = folder_path if folder_path.startswith("/") else f"/{folder_path}"
         encoded_path = quote(normalized)

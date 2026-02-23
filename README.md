@@ -9,6 +9,7 @@ ImageTracker syncs iPhone photos from OneDrive Camera Upload into MySQL using Mi
   - `ImageAsset.FileName`
   - `ImageAsset.Description`
   - `ImageAsset.Latitude` / `ImageAsset.Longitude`
+- GPS extraction primarily uses EXIF metadata from downloaded image content; Graph location data is fallback-only
 - Device-code auth command for OneDrive token bootstrap
 - Optional OpenAI vision captioning
 - First-run ingestion cutoff (`PHOTO_SYNC_INITIAL_CUTOFF_DAYS`) to reduce initial cost while still walking all delta pages to store `DeltaLink`
@@ -126,7 +127,7 @@ ORDER BY `TakenDateTimeUtc` DESC;
 - `Run imagetracker photos:auth` error:
   - Token cache is missing/expired or silent token refresh failed. Run `imagetracker photos:auth` again.
 - Missing GPS data:
-  - Graph item does not include `location.geoCoordinates`; many photos do not carry location metadata.
+  - Image file has no EXIF GPS metadata and Graph `location.geoCoordinates` is also missing.
 - Caption missing:
   - `OPENAI_API_KEY` is not set, thumbnail is unavailable, or caption generation failed.
 - No scheduler wiring:
