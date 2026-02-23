@@ -472,6 +472,42 @@ def test_non_image_file_skips_content_download_for_gps_extraction():
     assert gps_extractor.calls == []
 
 
+def test_file_name_is_preserved_verbatim_from_graph_name():
+    pages = {
+        "https://graph.microsoft.com/v1.0/delta-start": {
+            "value": [
+                {
+                    "id": "item-file-name",
+                    "name": "IMG_8677.JPG",
+                    "photo": {"takenDateTime": "2026-02-22T14:00:00Z"},
+                    "file": {"mimeType": "image/jpeg"},
+                }
+            ],
+            "@odata.deltaLink": "https://graph.microsoft.com/v1.0/delta-new",
+        }
+    }
+    image_repo = FakeImageRepository()
+    service, _, _, _ = build_service(
+        graph_client=FakeGraphClient(pages),
+        state={
+            "Id": 1,
+            "FolderDriveItemId": "folder-1",
+            "FolderPath": "/Pictures/Camera Roll",
+            "DeltaLink": "https://graph.microsoft.com/v1.0/delta-start",
+            "LastRunAtUtc": None,
+            "LastSuccessAtUtc": None,
+            "LastError": None,
+            "UpdatedAtUtc": None,
+        },
+        image_repo=image_repo,
+    )
+
+    service.run_sync()
+
+    upsert_payload = image_repo.upserts[0]
+    assert upsert_payload.file_name == "IMG_8677.JPG"
+
+
 def test_upsert_sql_uses_pascal_case_identifiers():
     sql = ImageAssetRepository.UPSERT_SQL
     assert "`ImageAsset`" in sql

@@ -9,6 +9,7 @@ ImageTracker syncs iPhone photos from OneDrive Camera Upload into MySQL using Mi
   - `ImageAsset.FileName`
   - `ImageAsset.Description`
   - `ImageAsset.Latitude` / `ImageAsset.Longitude`
+- `ImageAsset.FileName` is copied verbatim from OneDrive `driveItem.name` (no filename rewrite by ImageTracker)
 - GPS extraction primarily uses EXIF metadata from downloaded image content; Graph location data is fallback-only
 - Device-code auth command for OneDrive token bootstrap
 - Optional OpenAI vision captioning
