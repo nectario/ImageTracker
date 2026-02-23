@@ -1,0 +1,26 @@
+[project]
+name = "imagetracker"
+version = "0.1.0"
+description = "OneDrive photo sync to MySQL with optional AI captions"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "pymysql>=1.1.0",
+  "requests>=2.31.0",
+  "msal>=1.28.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[project.scripts]
+imagetracker = "imagetracker.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
