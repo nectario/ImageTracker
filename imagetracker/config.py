@@ -82,7 +82,7 @@ def load_settings() -> Settings:
         onedrive_camera_upload_fallback_paths=fallback_paths,
         mysql_dsn=os.getenv("MYSQL_DSN", ""),
         openai_api_key=os.getenv("OPENAI_API_KEY"),
-        openai_vision_model=os.getenv("OPENAI_VISION_MODEL", "gpt-4.1-mini"),
+        openai_vision_model=os.getenv("OPENAI_VISION_MODEL", "gpt-5.2"),
         photo_sync_initial_cutoff_days=int(os.getenv("PHOTO_SYNC_INITIAL_CUTOFF_DAYS", "14")),
         photo_caption_max_words=int(os.getenv("PHOTO_CAPTION_MAX_WORDS", "18")),
     )

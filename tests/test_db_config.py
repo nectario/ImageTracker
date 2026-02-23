@@ -13,7 +13,7 @@ def make_settings() -> Settings:
         onedrive_camera_upload_fallback_paths=[],
         mysql_dsn="",
         openai_api_key=None,
-        openai_vision_model="gpt-4.1-mini",
+        openai_vision_model="gpt-5.2",
         photo_sync_initial_cutoff_days=14,
         photo_caption_max_words=18,
     )

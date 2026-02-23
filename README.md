@@ -47,7 +47,7 @@ Defaults included:
 Optional captioning:
 
 - `OPENAI_API_KEY`
-- `OPENAI_VISION_MODEL` (default: `gpt-4.1-mini`)
+- `OPENAI_VISION_MODEL` (default: `gpt-5.2`)
 
 ## Microsoft App Registration
 
