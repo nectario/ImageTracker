@@ -6,6 +6,7 @@ from pathlib import Path
 
 from imagetracker.config import load_settings
 from imagetracker.db import Database, DbError, parse_mysql_config, utc_now
+from imagetracker.local_photo_sync import LocalPhotoSyncService, parse_cutoff_date
 from imagetracker.migrations import MigrationRunner
 from imagetracker.onedrive_auth import AuthRequiredError, OneDriveAuthService
 from imagetracker.photo_sync import PhotoSyncService, build_default_captioner
@@ -17,6 +18,25 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("photos:auth", help="Authenticate with OneDrive via device code flow")
     subparsers.add_parser("photos:sync", help="Run incremental OneDrive photo sync")
+    local_sync_parser = subparsers.add_parser(
+        "photos:sync-local",
+        help="Run local directory photo sync with cutoff date",
+    )
+    local_sync_parser.add_argument(
+        "--directory",
+        required=True,
+        help="Directory containing local photos to process",
+    )
+    local_sync_parser.add_argument(
+        "--cutoff-date",
+        required=True,
+        help="Cutoff date (YYYY-MM-DD or ISO datetime). Only files >= cutoff are processed.",
+    )
+    local_sync_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Reprocess files even if already processed before",
+    )
     return parser
 
 
@@ -106,6 +126,48 @@ def run_photos_sync() -> int:
     return 0
 
 
+def run_photos_sync_local(directory: str, cutoff_date: str, force: bool) -> int:
+    settings = load_settings()
+
+    try:
+        database = _build_database()
+    except DbError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    try:
+        cutoff_utc = parse_cutoff_date(cutoff_date)
+    except ValueError as exc:
+        print(f"Invalid --cutoff-date: {exc}", file=sys.stderr)
+        return 2
+
+    migration_runner = _build_migration_runner()
+    captioner = build_default_captioner(settings)
+
+    service = LocalPhotoSyncService(
+        settings=settings,
+        database=database,
+        migration_runner=migration_runner,
+        captioner=captioner,
+    )
+
+    result = service.run_sync(
+        directory=Path(directory),
+        cutoff_utc=cutoff_utc,
+        force=force,
+    )
+
+    print(
+        "Local sync complete: "
+        f"scanned={result.scanned_count}, "
+        f"eligible={result.eligible_count}, "
+        f"skipped={result.skipped_count}, "
+        f"upserted={result.upserted_count}, "
+        f"captioned={result.captioned_count}"
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -114,6 +176,12 @@ def main(argv: list[str] | None = None) -> int:
         return run_photos_auth()
     if args.command == "photos:sync":
         return run_photos_sync()
+    if args.command == "photos:sync-local":
+        return run_photos_sync_local(
+            directory=args.directory,
+            cutoff_date=args.cutoff_date,
+            force=args.force,
+        )
 
     parser.print_help()
     return 1

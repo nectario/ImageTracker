@@ -19,6 +19,7 @@ ImageTracker syncs iPhone photos from OneDrive Camera Upload into MySQL using Mi
 
 - `imagetracker photos:auth`
 - `imagetracker photos:sync`
+- `imagetracker photos:sync-local --directory "<path>" --cutoff-date "<YYYY-MM-DD|ISO>" [--force]`
 
 ## Environment
 
@@ -78,6 +79,25 @@ Run incremental sync:
 ```bash
 imagetracker photos:sync
 ```
+
+Run local directory sync (no OneDrive calls):
+
+```bash
+imagetracker photos:sync-local --directory "/mnt/d/Pictures/Camera Uploads" --cutoff-date "2026-01-01"
+```
+
+Reprocess already-processed files:
+
+```bash
+imagetracker photos:sync-local --directory "/mnt/d/Pictures/Camera Uploads" --cutoff-date "2026-01-01" --force
+```
+
+Behavior for local sync:
+
+1. Recursively scans supported photo files in the given directory.
+2. Filters files by filesystem modified timestamp >= cutoff date.
+3. Skips files already processed in `ImageAsset` (`Source = 'LocalFile'`) unless `--force` is provided.
+4. Stores `FileName` verbatim from the local file name.
 
 ## Sync Behavior
 
