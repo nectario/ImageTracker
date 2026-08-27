@@ -4,3 +4,15 @@ __pycache__/
 .env
 .idea/
 codex.txt
+.venv/
+.backups/
+.coverage
+coverage.xml
+htmlcov/
+build/
+dist/
+*.egg-info/
+node_modules/
+.serverless/
+infra/.build/
+contracts/generated/

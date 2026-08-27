@@ -1,0 +1,3 @@
+# The infrastructure validation and staging scripts use only Python's standard
+# library. Runtime dependencies are owned by services/api/requirements.txt and
+# are copied into the Lambda staging directory by scripts/stage_service.py.

@@ -1,0 +1,4372 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "ImageTracker API",
+    "version": "0.1.0",
+    "description": "Versioned foundation contract for ImageTracker mobile, CLI, and future native Windows clients. The v1 API stores metadata for Local sources, manages exact-deduplicated originals for Remote sources, and exposes cursor-based media evidence without coupling clients to the MySQL schema."
+  },
+  "tags": [
+    {
+      "name": "Health",
+      "description": "Authenticated liveness and restricted dependency health."
+    },
+    {
+      "name": "Account",
+      "description": "Current user and registered devices."
+    },
+    {
+      "name": "Sources",
+      "description": "Local or Remote media sources and source manifests."
+    },
+    {
+      "name": "Uploads",
+      "description": "Direct-to-object-storage upload planning and finalization."
+    },
+    {
+      "name": "Sync",
+      "description": "Incremental change feed."
+    },
+    {
+      "name": "Media",
+      "description": "Timeline, search, detail, and trash lifecycle."
+    },
+    {
+      "name": "Jobs",
+      "description": "Asynchronous processing activity."
+    },
+    {
+      "name": "Webhooks",
+      "description": "Provider callbacks."
+    },
+    {
+      "name": "Admin",
+      "description": "Restricted operational diagnostics."
+    }
+  ],
+  "security": [
+    {
+      "CognitoBearer": []
+    }
+  ],
+  "paths": {
+    "/v1/health": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "operationId": "getHealth",
+        "summary": "Get service liveness",
+        "description": "Returns non-sensitive liveness information to an authenticated client. Dependency details are available from the restricted admin health endpoint.",
+        "responses": {
+          "200": {
+            "description": "Successful response.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/v1/me": {
+      "get": {
+        "tags": [
+          "Account"
+        ],
+        "operationId": "getCurrentUser",
+        "summary": "Get the signed-in ImageTracker user",
+        "responses": {
+          "200": {
+            "description": "Successful response.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CurrentUser"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        }
+      }
+    },
+    "/v1/devices": {
+      "get": {
+        "tags": [
+          "Account"
+        ],
+        "operationId": "listDevices",
+        "summary": "List registered devices",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CursorQuery"
+          },
+          {
+            "$ref": "#/components/parameters/LimitQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DevicePage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Account"
+        ],
+        "operationId": "registerDevice",
+        "summary": "Register or refresh an app installation",
+        "description": "The stable client installation ID makes registration safely repeatable across app restarts.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKeyHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeviceRegistrationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Existing device registration refreshed.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              },
+              "Idempotency-Replayed": {
+                "$ref": "#/components/headers/IdempotencyReplayedHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Device"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Device registered.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              },
+              "Idempotency-Replayed": {
+                "$ref": "#/components/headers/IdempotencyReplayedHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Device"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        }
+      }
+    },
+    "/v1/sources": {
+      "get": {
+        "tags": [
+          "Sources"
+        ],
+        "operationId": "listSources",
+        "summary": "List the user's media sources",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CursorQuery"
+          },
+          {
+            "$ref": "#/components/parameters/LimitQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MediaSourcePage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Sources"
+        ],
+        "operationId": "createSource",
+        "summary": "Create a Local or Remote media source",
+        "description": "Storage mode defaults to Local. A source belongs to exactly one registered device.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKeyHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MediaSourceCreateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Source created.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              },
+              "Idempotency-Replayed": {
+                "$ref": "#/components/headers/IdempotencyReplayedHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MediaSource"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        }
+      }
+    },
+    "/v1/sources/{sourceId}": {
+      "get": {
+        "tags": [
+          "Sources"
+        ],
+        "operationId": "getSource",
+        "summary": "Get a media source",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SourceIdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MediaSource"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "Sources"
+        ],
+        "operationId": "updateSource",
+        "summary": "Update source settings or storage mode",
+        "description": "Changing Local to Remote schedules missing originals for upload. Changing Remote to Local affects future uploads only and does not delete cloud copies.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SourceIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKeyHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MediaSourceUpdateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Source updated.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              },
+              "Idempotency-Replayed": {
+                "$ref": "#/components/headers/IdempotencyReplayedHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MediaSource"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Sources"
+        ],
+        "operationId": "removeSource",
+        "summary": "Remove a media source",
+        "description": "Marks the source removed. Assets enter trash only when their final occurrence is removed.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SourceIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKeyHeader"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Source removed.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              },
+              "Idempotency-Replayed": {
+                "$ref": "#/components/headers/IdempotencyReplayedHeader"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        }
+      }
+    },
+    "/v1/sources/{sourceId}/manifest": {
+      "post": {
+        "tags": [
+          "Sources"
+        ],
+        "operationId": "submitSourceManifest",
+        "summary": "Submit a batch of source occurrence changes",
+        "description": "Upserts occurrence metadata and links exact duplicates. Deletions are applied only when the client explicitly declares deletion detection reliable; permission loss, limited access, or an unreadable source is never interpreted as deletion.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SourceIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKeyHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ManifestRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Manifest batch accepted.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              },
+              "Idempotency-Replayed": {
+                "$ref": "#/components/headers/IdempotencyReplayedHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManifestResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        }
+      }
+    },
+    "/v1/uploads/plan": {
+      "post": {
+        "tags": [
+          "Uploads"
+        ],
+        "operationId": "createUploadPlan",
+        "summary": "Plan an exact-deduplicated direct upload",
+        "description": "The server checks the per-user SHA-256 identity and upload lease before returning any signed upload URL. Media bytes never pass through the API. Local sources return LocalOnly for permanent Original/Preview purposes, but may receive a one-day staging upload for TemporaryProcessing when an eligible processingJobId is authorized.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKeyHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UploadPlanRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Upload plan created or duplicate detected.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              },
+              "Idempotency-Replayed": {
+                "$ref": "#/components/headers/IdempotencyReplayedHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadPlan"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/v1/uploads/{uploadSessionId}": {
+      "get": {
+        "tags": [
+          "Uploads"
+        ],
+        "operationId": "getUploadSession",
+        "summary": "Get resumable upload state",
+        "description": "Returns the authoritative uploaded-part list and current lease state after an app restart or interrupted transfer.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/UploadSessionIdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current upload session state.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadSessionStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/v1/uploads/{uploadSessionId}/parts": {
+      "post": {
+        "tags": [
+          "Uploads"
+        ],
+        "operationId": "signUploadParts",
+        "summary": "Re-sign bounded multipart upload parts",
+        "description": "Issues fresh URLs only for requested unfinished part numbers while preserving the original upload lease and provider upload ID.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/UploadSessionIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKeyHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UploadPartSigningRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Fresh signed URLs for unfinished requested parts.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              },
+              "Idempotency-Replayed": {
+                "$ref": "#/components/headers/IdempotencyReplayedHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadPartSigningResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/v1/uploads/{uploadSessionId}/complete": {
+      "post": {
+        "tags": [
+          "Uploads"
+        ],
+        "operationId": "completeUpload",
+        "summary": "Complete and verify a direct upload",
+        "description": "Finalizes a single-part or multipart upload, verifies the expected content identity, and queues derived processing.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/UploadSessionIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKeyHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UploadCompleteRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Upload completed.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              },
+              "Idempotency-Replayed": {
+                "$ref": "#/components/headers/IdempotencyReplayedHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadCompleteResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/v1/uploads/{uploadSessionId}/cancel": {
+      "post": {
+        "tags": [
+          "Uploads"
+        ],
+        "operationId": "cancelUpload",
+        "summary": "Cancel an upload session",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/UploadSessionIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKeyHeader"
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UploadCancelRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Upload session cancelled.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              },
+              "Idempotency-Replayed": {
+                "$ref": "#/components/headers/IdempotencyReplayedHeader"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/v1/changes": {
+      "get": {
+        "tags": [
+          "Sync"
+        ],
+        "operationId": "listChanges",
+        "summary": "Read incremental changes for a device",
+        "description": "Returns an ordered, opaque-cursor feed. The device header allows the server to omit Local-only assets owned by other devices.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/DeviceIdHeader"
+          },
+          {
+            "$ref": "#/components/parameters/CursorQuery"
+          },
+          {
+            "$ref": "#/components/parameters/LimitQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangePage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        }
+      }
+    },
+    "/v1/media": {
+      "get": {
+        "tags": [
+          "Media"
+        ],
+        "operationId": "listMedia",
+        "summary": "List timeline media",
+        "description": "Returns Remote media plus Local media available on the requesting device. Pagination is stable and keyset-based.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/DeviceIdHeader"
+          },
+          {
+            "$ref": "#/components/parameters/CursorQuery"
+          },
+          {
+            "$ref": "#/components/parameters/LimitQuery"
+          },
+          {
+            "$ref": "#/components/parameters/SourceFilterQuery"
+          },
+          {
+            "$ref": "#/components/parameters/MediaTypeQuery"
+          },
+          {
+            "$ref": "#/components/parameters/StorageModeQuery"
+          },
+          {
+            "$ref": "#/components/parameters/CapturedAfterQuery"
+          },
+          {
+            "$ref": "#/components/parameters/CapturedBeforeQuery"
+          },
+          {
+            "$ref": "#/components/parameters/CategoryQuery"
+          },
+          {
+            "$ref": "#/components/parameters/HasLocationQuery"
+          },
+          {
+            "$ref": "#/components/parameters/TrashStateQuery"
+          },
+          {
+            "$ref": "#/components/parameters/MediaSortQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MediaAssetPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        }
+      }
+    },
+    "/v1/media/search": {
+      "get": {
+        "tags": [
+          "Media"
+        ],
+        "operationId": "searchMedia",
+        "summary": "Search media metadata and transcripts",
+        "description": "Searches filename, description, transcript, category, date, media type, and normalized location while enforcing device visibility for Local assets.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/DeviceIdHeader"
+          },
+          {
+            "$ref": "#/components/parameters/SearchQuery"
+          },
+          {
+            "$ref": "#/components/parameters/CursorQuery"
+          },
+          {
+            "$ref": "#/components/parameters/LimitQuery"
+          },
+          {
+            "$ref": "#/components/parameters/SourceFilterQuery"
+          },
+          {
+            "$ref": "#/components/parameters/MediaTypeQuery"
+          },
+          {
+            "$ref": "#/components/parameters/StorageModeQuery"
+          },
+          {
+            "$ref": "#/components/parameters/CapturedAfterQuery"
+          },
+          {
+            "$ref": "#/components/parameters/CapturedBeforeQuery"
+          },
+          {
+            "$ref": "#/components/parameters/CategoryQuery"
+          },
+          {
+            "$ref": "#/components/parameters/HasLocationQuery"
+          },
+          {
+            "$ref": "#/components/parameters/TrashStateQuery"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MediaSearchPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        }
+      }
+    },
+    "/v1/media/{mediaAssetId}": {
+      "get": {
+        "tags": [
+          "Media"
+        ],
+        "operationId": "getMediaAsset",
+        "summary": "Get media details",
+        "description": "Local locators are returned only for occurrences owned by the requesting device.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MediaAssetIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/DeviceIdHeader"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MediaAssetDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        }
+      }
+    },
+    "/v1/media/{mediaAssetId}/trash": {
+      "post": {
+        "tags": [
+          "Media"
+        ],
+        "operationId": "trashMediaAsset",
+        "summary": "Move a media asset to recoverable trash",
+        "description": "The asset remains recoverable for 30 days. Source manifest deletion normally applies last-occurrence semantics automatically.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MediaAssetIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/DeviceIdHeader"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKeyHeader"
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TrashRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Asset moved to trash.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              },
+              "Idempotency-Replayed": {
+                "$ref": "#/components/headers/IdempotencyReplayedHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MediaAssetDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        }
+      }
+    },
+    "/v1/media/{mediaAssetId}/restore": {
+      "post": {
+        "tags": [
+          "Media"
+        ],
+        "operationId": "restoreMediaAsset",
+        "summary": "Restore a media asset from trash",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MediaAssetIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/DeviceIdHeader"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKeyHeader"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Asset restored.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              },
+              "Idempotency-Replayed": {
+                "$ref": "#/components/headers/IdempotencyReplayedHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MediaAssetDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        }
+      }
+    },
+    "/v1/jobs": {
+      "get": {
+        "tags": [
+          "Jobs"
+        ],
+        "operationId": "listProcessingJobs",
+        "summary": "List processing activity",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CursorQuery"
+          },
+          {
+            "$ref": "#/components/parameters/LimitQuery"
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ProcessingJobStatus"
+            }
+          },
+          {
+            "name": "jobType",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ProcessingJobType"
+            }
+          },
+          {
+            "name": "mediaAssetId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessingJobPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        }
+      }
+    },
+    "/v1/jobs/{jobId}": {
+      "get": {
+        "tags": [
+          "Jobs"
+        ],
+        "operationId": "getProcessingJob",
+        "summary": "Get processing job status",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/JobIdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessingJob"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        }
+      }
+    },
+    "/v1/jobs/{jobId}/retry": {
+      "post": {
+        "tags": [
+          "Jobs"
+        ],
+        "operationId": "retryProcessingJob",
+        "summary": "Retry an actionable failed processing job",
+        "description": "Ordinary transient failures retry automatically. This endpoint is for jobs that reached Needs attention.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/JobIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKeyHeader"
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Retry queued.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              },
+              "Idempotency-Replayed": {
+                "$ref": "#/components/headers/IdempotencyReplayedHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessingJob"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          }
+        }
+      }
+    },
+    "/v1/webhooks/elevenlabs": {
+      "post": {
+        "tags": [
+          "Webhooks"
+        ],
+        "operationId": "receiveElevenLabsWebhook",
+        "summary": "Receive an ElevenLabs transcription event",
+        "description": "The backend must verify the provider signature against the raw body before parsing. Duplicate events are acknowledged without duplicating transcript data.",
+        "security": [],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ElevenLabsSignatureHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ElevenLabsWebhookEnvelope"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Webhook accepted.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookAcknowledgement"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/v1/admin/health": {
+      "get": {
+        "tags": [
+          "Admin"
+        ],
+        "operationId": "getAdminHealth",
+        "summary": "Get restricted dependency health",
+        "description": "Requires an ImageTracker administrator claim. The response contains service-level status only and never returns credentials, DSNs, bucket keys, or provider secrets.",
+        "security": [
+          {
+            "AdminBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminHealthResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/v1/admin/audit": {
+      "get": {
+        "tags": [
+          "Admin"
+        ],
+        "operationId": "getAdminAudit",
+        "summary": "Run a read-only foundation audit",
+        "description": "Placeholder for read-only schema, queue, deduplication, processing, and legacy-migration checks. It performs no repair or migration.",
+        "security": [
+          {
+            "AdminBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful response.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminAuditResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "CognitoBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "Amazon Cognito access token for the ImageTracker user pool."
+      },
+      "AdminBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "The same Cognito access token with the ImageTracker administrator claim."
+      }
+    },
+    "headers": {
+      "RequestIdHeader": {
+        "description": "Server-generated request correlation identifier.",
+        "schema": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 128
+        }
+      },
+      "IdempotencyReplayedHeader": {
+        "description": "True when the response was replayed from a prior identical mutation.",
+        "schema": {
+          "type": "boolean"
+        }
+      },
+      "RetryAfterHeader": {
+        "description": "Seconds before retrying the operation.",
+        "schema": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "parameters": {
+      "IdempotencyKeyHeader": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": true,
+        "description": "Client-generated key scoped to the signed-in user and operation. Reuse is valid only with an identical request body and target.",
+        "schema": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._:-]+$"
+        }
+      },
+      "DeviceIdHeader": {
+        "name": "X-ImageTracker-Device-Id",
+        "in": "header",
+        "required": true,
+        "description": "Registered calling device used to enforce Local-media visibility.",
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "CursorQuery": {
+        "name": "cursor",
+        "in": "query",
+        "required": false,
+        "description": "Opaque continuation cursor returned by the previous page. Clients must not parse or construct it.",
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        }
+      },
+      "LimitQuery": {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "default": 50
+        }
+      },
+      "SourceIdPath": {
+        "name": "sourceId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "MediaAssetIdPath": {
+        "name": "mediaAssetId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "UploadSessionIdPath": {
+        "name": "uploadSessionId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "JobIdPath": {
+        "name": "jobId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "SearchQuery": {
+        "name": "q",
+        "in": "query",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        }
+      },
+      "SourceFilterQuery": {
+        "name": "sourceId",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "MediaTypeQuery": {
+        "name": "mediaType",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "$ref": "#/components/schemas/MediaType"
+        }
+      },
+      "StorageModeQuery": {
+        "name": "storageMode",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "$ref": "#/components/schemas/StorageMode"
+        }
+      },
+      "CapturedAfterQuery": {
+        "name": "capturedAfterUtc",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "CapturedBeforeQuery": {
+        "name": "capturedBeforeUtc",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "CategoryQuery": {
+        "name": "category",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        }
+      },
+      "HasLocationQuery": {
+        "name": "hasLocation",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "boolean"
+        }
+      },
+      "TrashStateQuery": {
+        "name": "trashState",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "enum": [
+            "Active",
+            "Trashed",
+            "All"
+          ],
+          "default": "Active"
+        }
+      },
+      "MediaSortQuery": {
+        "name": "sort",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "enum": [
+            "CapturedAtDesc",
+            "CapturedAtAsc",
+            "UpdatedAtDesc"
+          ],
+          "default": "CapturedAtDesc"
+        }
+      },
+      "ElevenLabsSignatureHeader": {
+        "name": "elevenlabs-signature",
+        "in": "header",
+        "required": true,
+        "description": "ElevenLabs HMAC signature. Verification is performed against the unmodified request body.",
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "The request is malformed or a cursor is invalid.",
+        "headers": {
+          "X-Request-Id": {
+            "$ref": "#/components/headers/RequestIdHeader"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Authentication or provider signature verification failed.",
+        "headers": {
+          "X-Request-Id": {
+            "$ref": "#/components/headers/RequestIdHeader"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "The caller is authenticated but cannot access the resource.",
+        "headers": {
+          "X-Request-Id": {
+            "$ref": "#/components/headers/RequestIdHeader"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "The resource does not exist or is not visible to the caller.",
+        "headers": {
+          "X-Request-Id": {
+            "$ref": "#/components/headers/RequestIdHeader"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails"
+            }
+          }
+        }
+      },
+      "Conflict": {
+        "description": "The request conflicts with current state or idempotency history.",
+        "headers": {
+          "X-Request-Id": {
+            "$ref": "#/components/headers/RequestIdHeader"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails"
+            }
+          }
+        }
+      },
+      "Unprocessable": {
+        "description": "The request is syntactically valid but violates resource rules.",
+        "headers": {
+          "X-Request-Id": {
+            "$ref": "#/components/headers/RequestIdHeader"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails"
+            }
+          }
+        }
+      },
+      "RateLimited": {
+        "description": "The request is rate limited or deferred by a hard quota.",
+        "headers": {
+          "X-Request-Id": {
+            "$ref": "#/components/headers/RequestIdHeader"
+          },
+          "Retry-After": {
+            "$ref": "#/components/headers/RetryAfterHeader"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails"
+            }
+          }
+        }
+      },
+      "ServerError": {
+        "description": "An unexpected server error occurred.",
+        "headers": {
+          "X-Request-Id": {
+            "$ref": "#/components/headers/RequestIdHeader"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails"
+            }
+          }
+        }
+      },
+      "ServiceUnavailable": {
+        "description": "A required dependency is temporarily unavailable.",
+        "headers": {
+          "X-Request-Id": {
+            "$ref": "#/components/headers/RequestIdHeader"
+          },
+          "Retry-After": {
+            "$ref": "#/components/headers/RetryAfterHeader"
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/ProblemDetails"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "ProblemDetails": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "title",
+          "status",
+          "code",
+          "traceId"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "format": "uri-reference"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "minimum": 400,
+            "maximum": 599
+          },
+          "code": {
+            "type": "string",
+            "description": "Stable machine-readable error code such as INVALID_CURSOR or IDEMPOTENCY_KEY_REUSED."
+          },
+          "detail": {
+            "type": "string",
+            "nullable": true
+          },
+          "instance": {
+            "type": "string",
+            "format": "uri-reference",
+            "nullable": true
+          },
+          "traceId": {
+            "type": "string"
+          },
+          "fieldErrors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FieldError"
+            },
+            "default": []
+          }
+        }
+      },
+      "FieldError": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "field",
+          "code",
+          "message"
+        ],
+        "properties": {
+          "field": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "PageInfo": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "hasMore"
+        ],
+        "properties": {
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          },
+          "hasMore": {
+            "type": "boolean"
+          }
+        }
+      },
+      "HealthStatus": {
+        "type": "string",
+        "enum": [
+          "Ok",
+          "Degraded",
+          "Unavailable"
+        ]
+      },
+      "HealthResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "service",
+          "version",
+          "status",
+          "timeUtc"
+        ],
+        "properties": {
+          "service": {
+            "type": "string",
+            "example": "ImageTracker API"
+          },
+          "version": {
+            "type": "string",
+            "example": "0.1.0"
+          },
+          "status": {
+            "$ref": "#/components/schemas/HealthStatus"
+          },
+          "timeUtc": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "CurrentUser": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "userId",
+          "email",
+          "createdAtUtc"
+        ],
+        "properties": {
+          "userId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "email": {
+            "type": "string",
+            "format": "email"
+          },
+          "displayName": {
+            "type": "string",
+            "maxLength": 200,
+            "nullable": true
+          },
+          "createdAtUtc": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "Platform": {
+        "type": "string",
+        "enum": [
+          "iOS",
+          "Android",
+          "Windows",
+          "LinuxCLI",
+          "WindowsCLI"
+        ]
+      },
+      "DeviceStatus": {
+        "type": "string",
+        "enum": [
+          "Active",
+          "SignedOut",
+          "Removed"
+        ]
+      },
+      "DeviceRegistrationRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "installationId",
+          "platform",
+          "displayName",
+          "appVersion",
+          "osVersion"
+        ],
+        "properties": {
+          "installationId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "platform": {
+            "$ref": "#/components/schemas/Platform"
+          },
+          "displayName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "appVersion": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 50
+          },
+          "osVersion": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          }
+        }
+      },
+      "Device": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "deviceId",
+          "installationId",
+          "platform",
+          "displayName",
+          "appVersion",
+          "osVersion",
+          "status",
+          "registeredAtUtc",
+          "lastSeenAtUtc"
+        ],
+        "properties": {
+          "deviceId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "installationId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "platform": {
+            "$ref": "#/components/schemas/Platform"
+          },
+          "displayName": {
+            "type": "string"
+          },
+          "appVersion": {
+            "type": "string"
+          },
+          "osVersion": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/DeviceStatus"
+          },
+          "registeredAtUtc": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "lastSeenAtUtc": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "DevicePage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "items",
+          "page"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Device"
+            }
+          },
+          "page": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        }
+      },
+      "StorageMode": {
+        "type": "string",
+        "enum": [
+          "Local",
+          "Remote"
+        ]
+      },
+      "SourceType": {
+        "type": "string",
+        "enum": [
+          "PhotoLibrary",
+          "Folder",
+          "SingleUpload",
+          "LegacyImport"
+        ]
+      },
+      "PermissionState": {
+        "type": "string",
+        "enum": [
+          "Full",
+          "Limited",
+          "Denied",
+          "Unavailable",
+          "NotApplicable"
+        ]
+      },
+      "SourceStatus": {
+        "type": "string",
+        "enum": [
+          "Active",
+          "Paused",
+          "Removed"
+        ]
+      },
+      "NetworkPolicy": {
+        "type": "string",
+        "enum": [
+          "WiFiOnly",
+          "WiFiOrCellular"
+        ]
+      },
+      "SyncSettings": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "automaticSync",
+          "networkPolicy",
+          "requireChargingForHistoricalUpload"
+        ],
+        "properties": {
+          "automaticSync": {
+            "type": "boolean",
+            "default": true
+          },
+          "networkPolicy": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/NetworkPolicy"
+              }
+            ],
+            "default": "WiFiOnly"
+          },
+          "requireChargingForHistoricalUpload": {
+            "type": "boolean",
+            "default": true
+          }
+        }
+      },
+      "MediaSourceCreateRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "deviceId",
+          "sourceKey",
+          "sourceType",
+          "displayName"
+        ],
+        "properties": {
+          "deviceId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "sourceKey": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._:-]+$",
+            "description": "Opaque stable client-generated identity for this library or folder. Local paths must not be used as the key."
+          },
+          "sourceType": {
+            "$ref": "#/components/schemas/SourceType"
+          },
+          "displayName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "storageMode": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/StorageMode"
+              }
+            ],
+            "default": "Local"
+          },
+          "permissionState": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PermissionState"
+              }
+            ],
+            "default": "NotApplicable"
+          },
+          "syncSettings": {
+            "$ref": "#/components/schemas/SyncSettings"
+          }
+        }
+      },
+      "MediaSourceUpdateRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "displayName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "storageMode": {
+            "$ref": "#/components/schemas/StorageMode"
+          },
+          "permissionState": {
+            "$ref": "#/components/schemas/PermissionState"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "Active",
+              "Paused"
+            ]
+          },
+          "syncSettings": {
+            "$ref": "#/components/schemas/SyncSettings"
+          }
+        },
+        "minProperties": 1
+      },
+      "MediaSource": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "sourceId",
+          "deviceId",
+          "sourceKey",
+          "sourceType",
+          "displayName",
+          "storageMode",
+          "permissionState",
+          "status",
+          "syncSettings",
+          "createdAtUtc",
+          "updatedAtUtc"
+        ],
+        "properties": {
+          "sourceId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "deviceId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "sourceKey": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "sourceType": {
+            "$ref": "#/components/schemas/SourceType"
+          },
+          "displayName": {
+            "type": "string"
+          },
+          "storageMode": {
+            "$ref": "#/components/schemas/StorageMode"
+          },
+          "permissionState": {
+            "$ref": "#/components/schemas/PermissionState"
+          },
+          "status": {
+            "$ref": "#/components/schemas/SourceStatus"
+          },
+          "syncSettings": {
+            "$ref": "#/components/schemas/SyncSettings"
+          },
+          "lastManifestAtUtc": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "createdAtUtc": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAtUtc": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "MediaSourcePage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "items",
+          "page"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MediaSource"
+            }
+          },
+          "page": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        }
+      },
+      "MediaType": {
+        "type": "string",
+        "enum": [
+          "Photo",
+          "Video"
+        ]
+      },
+      "ManifestKind": {
+        "type": "string",
+        "enum": [
+          "Incremental",
+          "Full"
+        ]
+      },
+      "ManifestOperation": {
+        "type": "string",
+        "enum": [
+          "Upsert",
+          "Deleted"
+        ]
+      },
+      "GeoPointInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "latitude",
+          "longitude"
+        ],
+        "properties": {
+          "latitude": {
+            "type": "number",
+            "minimum": -90,
+            "maximum": 90
+          },
+          "longitude": {
+            "type": "number",
+            "minimum": -180,
+            "maximum": 180
+          },
+          "altitudeMeters": {
+            "type": "number",
+            "nullable": true
+          },
+          "horizontalAccuracyMeters": {
+            "type": "number",
+            "minimum": 0,
+            "nullable": true
+          }
+        }
+      },
+      "ProvenanceSource": {
+        "type": "string",
+        "enum": [
+          "Exif",
+          "Device",
+          "FileMtime",
+          "Google",
+          "Manual",
+          "AI",
+          "Legacy",
+          "Unknown"
+        ]
+      },
+      "FieldProvenance": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "field",
+          "source"
+        ],
+        "properties": {
+          "field": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "source": {
+            "$ref": "#/components/schemas/ProvenanceSource"
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "nullable": true
+          },
+          "processorVersion": {
+            "type": "string",
+            "maxLength": 100,
+            "nullable": true
+          },
+          "observedAtUtc": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          }
+        }
+      },
+      "ManifestUpsertEntry": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "operation",
+          "sourceItemId",
+          "sourceRevision",
+          "fileName",
+          "mediaType",
+          "mimeType",
+          "byteSize"
+        ],
+        "properties": {
+          "operation": {
+            "type": "string",
+            "enum": [
+              "Upsert"
+            ]
+          },
+          "sourceItemId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "sourceRevision": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255
+          },
+          "fileName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "localLocator": {
+            "type": "string",
+            "maxLength": 4096,
+            "description": "Device-local reference. It is returned only to the owning device.",
+            "nullable": true
+          },
+          "contentSha256": {
+            "type": "string",
+            "pattern": "^[A-Fa-f0-9]{64}$",
+            "description": "Hex-encoded SHA-256 of the exact original bytes.",
+            "nullable": true
+          },
+          "mediaType": {
+            "$ref": "#/components/schemas/MediaType"
+          },
+          "mimeType": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255
+          },
+          "byteSize": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "widthPixels": {
+            "type": "integer",
+            "minimum": 1,
+            "nullable": true
+          },
+          "heightPixels": {
+            "type": "integer",
+            "minimum": 1,
+            "nullable": true
+          },
+          "durationMs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "nullable": true
+          },
+          "capturedAtLocal": {
+            "type": "string",
+            "description": "ISO 8601 local wall-clock value without an implied time zone.",
+            "example": "2026-08-27T14:30:05",
+            "nullable": true
+          },
+          "capturedAtUtc": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "timeZoneId": {
+            "type": "string",
+            "maxLength": 64,
+            "nullable": true
+          },
+          "utcOffsetMinutes": {
+            "type": "integer",
+            "minimum": -840,
+            "maximum": 840,
+            "nullable": true
+          },
+          "location": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/GeoPointInput"
+              }
+            ],
+            "nullable": true
+          },
+          "provenance": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FieldProvenance"
+            },
+            "default": []
+          }
+        },
+        "description": "Creates or updates a source occurrence while preserving its exact filename. contentSha256 may arrive in a later batch."
+      },
+      "ManifestDeletedEntry": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "operation",
+          "sourceItemId",
+          "sourceRevision"
+        ],
+        "properties": {
+          "operation": {
+            "type": "string",
+            "enum": [
+              "Deleted"
+            ]
+          },
+          "sourceItemId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "sourceRevision": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255
+          }
+        }
+      },
+      "ManifestEntry": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ManifestUpsertEntry"
+          },
+          {
+            "$ref": "#/components/schemas/ManifestDeletedEntry"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "operation",
+          "mapping": {
+            "Upsert": "#/components/schemas/ManifestUpsertEntry",
+            "Deleted": "#/components/schemas/ManifestDeletedEntry"
+          }
+        }
+      },
+      "ManifestRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "permissionState",
+          "deletionDetectionReliable",
+          "entries"
+        ],
+        "properties": {
+          "snapshotId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ManifestKind"
+          },
+          "permissionState": {
+            "$ref": "#/components/schemas/PermissionState"
+          },
+          "deletionDetectionReliable": {
+            "type": "boolean",
+            "description": "Must be false when permission is limited/revoked or the source could not be read completely."
+          },
+          "clientCursor": {
+            "type": "string",
+            "maxLength": 1024,
+            "nullable": true
+          },
+          "entries": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 500,
+            "items": {
+              "$ref": "#/components/schemas/ManifestEntry"
+            }
+          }
+        }
+      },
+      "ManifestOutcome": {
+        "type": "string",
+        "enum": [
+          "CreatedOccurrence",
+          "UpdatedOccurrence",
+          "DuplicateLinked",
+          "DeletedOccurrence",
+          "IgnoredDeletion",
+          "Unchanged",
+          "Rejected"
+        ]
+      },
+      "ManifestEntryResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "sourceItemId",
+          "outcome",
+          "uploadRequired"
+        ],
+        "properties": {
+          "sourceItemId": {
+            "type": "string"
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/ManifestOutcome"
+          },
+          "occurrenceId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "mediaAssetId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "uploadRequired": {
+            "type": "boolean"
+          },
+          "errorCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "errorMessage": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "ManifestCounts": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "created",
+          "updated",
+          "duplicatesLinked",
+          "deleted",
+          "ignoredDeletions",
+          "unchanged",
+          "rejected"
+        ],
+        "properties": {
+          "created": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "updated": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "duplicatesLinked": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "deleted": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "ignoredDeletions": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "unchanged": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "rejected": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "ManifestResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "sourceId",
+          "acceptedAtUtc",
+          "counts",
+          "results"
+        ],
+        "properties": {
+          "sourceId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "acceptedAtUtc": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "sourceCursor": {
+            "type": "string",
+            "nullable": true
+          },
+          "counts": {
+            "$ref": "#/components/schemas/ManifestCounts"
+          },
+          "results": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ManifestEntryResult"
+            }
+          }
+        }
+      },
+      "UploadPurpose": {
+        "type": "string",
+        "description": "Original and Preview are durable only for Remote sources. TemporaryProcessing is short-lived staging for an authorized enrichment job and does not change Local storage mode.",
+        "enum": [
+          "Original",
+          "Preview",
+          "TemporaryProcessing"
+        ]
+      },
+      "UploadPlanRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "sourceId",
+          "occurrenceId",
+          "assetContentSha256",
+          "objectSha256",
+          "fileName",
+          "mediaType",
+          "objectMimeType",
+          "objectByteSize",
+          "purpose"
+        ],
+        "properties": {
+          "sourceId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "occurrenceId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "assetContentSha256": {
+            "type": "string",
+            "pattern": "^[A-Fa-f0-9]{64}$",
+            "description": "Hex-encoded SHA-256 of the exact original bytes used for per-user MediaAsset identity and deduplication."
+          },
+          "objectSha256": {
+            "type": "string",
+            "pattern": "^[A-Fa-f0-9]{64}$",
+            "description": "Hex-encoded SHA-256 of the specific object bytes being uploaded. It equals assetContentSha256 for an original but differs for generated previews."
+          },
+          "fileName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "mediaType": {
+            "$ref": "#/components/schemas/MediaType"
+          },
+          "objectMimeType": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "description": "MIME type of the specific uploaded object."
+          },
+          "objectByteSize": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "description": "Byte size of the specific uploaded object."
+          },
+          "purpose": {
+            "$ref": "#/components/schemas/UploadPurpose"
+          },
+          "processingJobId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Required when purpose is TemporaryProcessing. The job must belong to this user and asset and be eligible for provider submission."
+          }
+        }
+      },
+      "UploadDisposition": {
+        "type": "string",
+        "enum": [
+          "UploadRequired",
+          "AlreadyStored",
+          "LocalOnly",
+          "LeaseHeld",
+          "Deferred"
+        ]
+      },
+      "UploadStrategy": {
+        "type": "string",
+        "enum": [
+          "None",
+          "SinglePart",
+          "Multipart"
+        ]
+      },
+      "SignedUploadRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "url",
+          "method",
+          "headers",
+          "expiresAtUtc"
+        ],
+        "properties": {
+          "url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "method": {
+            "type": "string",
+            "enum": [
+              "PUT"
+            ]
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Headers that must be sent exactly as supplied, including the S3 checksum header."
+          },
+          "expiresAtUtc": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "SignedUploadPart": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "partNumber",
+          "url",
+          "headers",
+          "expiresAtUtc"
+        ],
+        "properties": {
+          "partNumber": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10000
+          },
+          "url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Headers that must be sent exactly as supplied, including x-amz-checksum-sha256 for this part."
+          },
+          "expiresAtUtc": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "MultipartUploadPlan": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "providerUploadId",
+          "partSizeBytes",
+          "checksumAlgorithm",
+          "checksumType"
+        ],
+        "properties": {
+          "providerUploadId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "partSizeBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 5242880
+          },
+          "checksumAlgorithm": {
+            "type": "string",
+            "enum": [
+              "SHA256"
+            ]
+          },
+          "checksumType": {
+            "type": "string",
+            "enum": [
+              "COMPOSITE"
+            ],
+            "description": "Multipart transport integrity is validated by S3 using per-part SHA-256 values and its composite checksum. It is separate from the exact whole-object assetContentSha256."
+          }
+        }
+      },
+      "UploadSessionStatusValue": {
+        "type": "string",
+        "enum": [
+          "Preparing",
+          "Uploading",
+          "Completing",
+          "Completed",
+          "Cancelled",
+          "Expired",
+          "Failed"
+        ]
+      },
+      "UploadSessionStatus": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "uploadSessionId",
+          "strategy",
+          "status",
+          "expectedByteSize",
+          "uploadedByteSize",
+          "uploadedParts",
+          "expiresAtUtc"
+        ],
+        "properties": {
+          "uploadSessionId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "strategy": {
+            "$ref": "#/components/schemas/UploadStrategy"
+          },
+          "status": {
+            "$ref": "#/components/schemas/UploadSessionStatusValue"
+          },
+          "expectedByteSize": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "uploadedByteSize": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "uploadedParts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CompletedUploadPart"
+            }
+          },
+          "expiresAtUtc": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          }
+        }
+      },
+      "UploadPartSigningRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "parts"
+        ],
+        "properties": {
+          "parts": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 100,
+            "items": {
+              "$ref": "#/components/schemas/UploadPartChecksum"
+            }
+          }
+        }
+      },
+      "UploadPartChecksum": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "partNumber",
+          "checksumSha256"
+        ],
+        "properties": {
+          "partNumber": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10000
+          },
+          "checksumSha256": {
+            "type": "string",
+            "minLength": 44,
+            "maxLength": 44,
+            "pattern": "^[A-Za-z0-9+/]{43}=$",
+            "description": "Base64-encoded SHA-256 of this exact part. The server binds it into the signed S3 request headers."
+          }
+        }
+      },
+      "UploadPartSigningResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "uploadSessionId",
+          "parts",
+          "expiresAtUtc"
+        ],
+        "properties": {
+          "uploadSessionId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "parts": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "$ref": "#/components/schemas/SignedUploadPart"
+            }
+          },
+          "expiresAtUtc": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "UploadPlan": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "disposition",
+          "strategy",
+          "mediaAssetId",
+          "occurrenceId",
+          "deduplicated"
+        ],
+        "properties": {
+          "disposition": {
+            "$ref": "#/components/schemas/UploadDisposition"
+          },
+          "strategy": {
+            "$ref": "#/components/schemas/UploadStrategy"
+          },
+          "mediaAssetId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "occurrenceId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "uploadSessionId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "expiresAtUtc": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "deduplicated": {
+            "type": "boolean"
+          },
+          "retryAfterSeconds": {
+            "type": "integer",
+            "minimum": 1,
+            "nullable": true
+          },
+          "singlePart": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SignedUploadRequest"
+              }
+            ],
+            "nullable": true
+          },
+          "multipart": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/MultipartUploadPlan"
+              }
+            ],
+            "nullable": true
+          }
+        },
+        "description": "Signed upload data is present only when disposition is UploadRequired. Local sources receive LocalOnly for Original or Preview. An authorized Local TemporaryProcessing request receives short-lived staging upload data without making the asset remotely available. An already stored durable hash receives AlreadyStored."
+      },
+      "CompletedUploadPart": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "partNumber",
+          "etag",
+          "checksumSha256"
+        ],
+        "properties": {
+          "partNumber": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10000
+          },
+          "etag": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255
+          },
+          "checksumSha256": {
+            "type": "string",
+            "minLength": 44,
+            "maxLength": 44,
+            "pattern": "^[A-Za-z0-9+/]{43}=$",
+            "description": "Base64-encoded SHA-256 returned for the uploaded part and supplied to S3 multipart completion."
+          }
+        }
+      },
+      "UploadCompleteRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "objectSha256"
+        ],
+        "properties": {
+          "objectSha256": {
+            "type": "string",
+            "pattern": "^[A-Fa-f0-9]{64}$",
+            "description": "Hex-encoded SHA-256 of the completed object bytes. The server compares this to the UploadSession checksum before finalization."
+          },
+          "etag": {
+            "type": "string",
+            "maxLength": 255,
+            "nullable": true
+          },
+          "parts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CompletedUploadPart"
+            },
+            "default": []
+          }
+        }
+      },
+      "UploadCancelRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "reason": {
+            "type": "string",
+            "maxLength": 500
+          }
+        }
+      },
+      "StorageState": {
+        "type": "string",
+        "enum": [
+          "LocalOnly",
+          "UploadPending",
+          "Uploading",
+          "RemoteAvailable",
+          "Trashed",
+          "Purged"
+        ]
+      },
+      "UserFacingState": {
+        "type": "string",
+        "enum": [
+          "Preparing",
+          "Uploading",
+          "Processing",
+          "Ready",
+          "WaitingForMonthlyQuota",
+          "NeedsAttention"
+        ]
+      },
+      "UploadCompleteResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "mediaAssetId",
+          "storageState",
+          "processingJobs"
+        ],
+        "properties": {
+          "mediaAssetId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "storageState": {
+            "$ref": "#/components/schemas/StorageState"
+          },
+          "processingJobs": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        }
+      },
+      "MediaAvailability": {
+        "type": "string",
+        "enum": [
+          "LocalOnThisDevice",
+          "Remote",
+          "Unavailable"
+        ]
+      },
+      "TemporalMetadata": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "capturedAtLocal": {
+            "type": "string",
+            "example": "2026-08-27T14:30:05",
+            "nullable": true
+          },
+          "capturedAtUtc": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "timeZoneId": {
+            "type": "string",
+            "nullable": true
+          },
+          "utcOffsetMinutes": {
+            "type": "integer",
+            "minimum": -840,
+            "maximum": 840,
+            "nullable": true
+          },
+          "source": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ProvenanceSource"
+              }
+            ],
+            "nullable": true
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "nullable": true
+          }
+        }
+      },
+      "LocationSummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "latitude": {
+            "type": "number",
+            "minimum": -90,
+            "maximum": 90,
+            "nullable": true
+          },
+          "longitude": {
+            "type": "number",
+            "minimum": -180,
+            "maximum": 180,
+            "nullable": true
+          },
+          "displayName": {
+            "type": "string",
+            "nullable": true
+          },
+          "city": {
+            "type": "string",
+            "nullable": true
+          },
+          "state": {
+            "type": "string",
+            "nullable": true
+          },
+          "countryCode": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 2,
+            "nullable": true
+          }
+        }
+      },
+      "MediaAssetSummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "mediaAssetId",
+          "contentSha256",
+          "mediaType",
+          "mimeType",
+          "byteSize",
+          "displayFileName",
+          "storageMode",
+          "storageState",
+          "availability",
+          "state",
+          "temporal",
+          "isTrashed",
+          "createdAtUtc",
+          "updatedAtUtc"
+        ],
+        "properties": {
+          "mediaAssetId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "contentSha256": {
+            "type": "string",
+            "pattern": "^[A-Fa-f0-9]{64}$",
+            "description": "Hex-encoded SHA-256 of the exact original bytes."
+          },
+          "mediaType": {
+            "$ref": "#/components/schemas/MediaType"
+          },
+          "mimeType": {
+            "type": "string"
+          },
+          "byteSize": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "displayFileName": {
+            "type": "string"
+          },
+          "storageMode": {
+            "$ref": "#/components/schemas/StorageMode"
+          },
+          "storageState": {
+            "$ref": "#/components/schemas/StorageState"
+          },
+          "availability": {
+            "$ref": "#/components/schemas/MediaAvailability"
+          },
+          "state": {
+            "$ref": "#/components/schemas/UserFacingState"
+          },
+          "temporal": {
+            "$ref": "#/components/schemas/TemporalMetadata"
+          },
+          "durationMs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "nullable": true
+          },
+          "widthPixels": {
+            "type": "integer",
+            "minimum": 1,
+            "nullable": true
+          },
+          "heightPixels": {
+            "type": "integer",
+            "minimum": 1,
+            "nullable": true
+          },
+          "category": {
+            "type": "string",
+            "nullable": true
+          },
+          "location": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/LocationSummary"
+              }
+            ],
+            "nullable": true
+          },
+          "descriptionExcerpt": {
+            "type": "string",
+            "maxLength": 500,
+            "nullable": true
+          },
+          "previewUrl": {
+            "type": "string",
+            "format": "uri",
+            "nullable": true
+          },
+          "previewUrlExpiresAtUtc": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "isTrashed": {
+            "type": "boolean"
+          },
+          "purgeAfterUtc": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "createdAtUtc": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAtUtc": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "MediaAssetPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "items",
+          "page"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MediaAssetSummary"
+            }
+          },
+          "page": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        }
+      },
+      "MediaOccurrence": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "occurrenceId",
+          "sourceId",
+          "sourceItemId",
+          "sourceRevision",
+          "exactFileName",
+          "firstSeenAtUtc",
+          "lastSeenAtUtc",
+          "isDeleted"
+        ],
+        "properties": {
+          "occurrenceId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "sourceId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "sourceItemId": {
+            "type": "string"
+          },
+          "sourceRevision": {
+            "type": "string"
+          },
+          "exactFileName": {
+            "type": "string"
+          },
+          "localLocator": {
+            "type": "string",
+            "description": "Present only when the occurrence belongs to the requesting device.",
+            "nullable": true
+          },
+          "firstSeenAtUtc": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "lastSeenAtUtc": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "isDeleted": {
+            "type": "boolean"
+          },
+          "deletedAtUtc": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          }
+        }
+      },
+      "MediaLocation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "provenance"
+        ],
+        "properties": {
+          "latitude": {
+            "type": "number",
+            "minimum": -90,
+            "maximum": 90,
+            "nullable": true
+          },
+          "longitude": {
+            "type": "number",
+            "minimum": -180,
+            "maximum": 180,
+            "nullable": true
+          },
+          "altitudeMeters": {
+            "type": "number",
+            "nullable": true
+          },
+          "horizontalAccuracyMeters": {
+            "type": "number",
+            "minimum": 0,
+            "nullable": true
+          },
+          "displayName": {
+            "type": "string",
+            "nullable": true
+          },
+          "streetAddress": {
+            "type": "string",
+            "nullable": true
+          },
+          "neighborhood": {
+            "type": "string",
+            "nullable": true
+          },
+          "city": {
+            "type": "string",
+            "nullable": true
+          },
+          "county": {
+            "type": "string",
+            "nullable": true
+          },
+          "state": {
+            "type": "string",
+            "nullable": true
+          },
+          "postalCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "country": {
+            "type": "string",
+            "nullable": true
+          },
+          "countryCode": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 2,
+            "nullable": true
+          },
+          "provenance": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FieldProvenance"
+            }
+          }
+        }
+      },
+      "EnrichmentStatus": {
+        "type": "string",
+        "enum": [
+          "NotRequested",
+          "Queued",
+          "Processing",
+          "Succeeded",
+          "Failed",
+          "DeferredQuota"
+        ]
+      },
+      "MediaDescription": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/EnrichmentStatus"
+          },
+          "text": {
+            "type": "string",
+            "nullable": true
+          },
+          "provider": {
+            "type": "string",
+            "nullable": true
+          },
+          "model": {
+            "type": "string",
+            "nullable": true
+          },
+          "promptVersion": {
+            "type": "string",
+            "nullable": true
+          },
+          "updatedAtUtc": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          }
+        }
+      },
+      "TranscriptSegment": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "segmentId",
+          "index",
+          "startMs",
+          "endMs",
+          "text"
+        ],
+        "properties": {
+          "segmentId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "startMs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "endMs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "speaker": {
+            "type": "string",
+            "nullable": true
+          },
+          "text": {
+            "type": "string"
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "nullable": true
+          }
+        }
+      },
+      "MediaTranscript": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "transcriptId",
+          "status",
+          "segments"
+        ],
+        "properties": {
+          "transcriptId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "$ref": "#/components/schemas/EnrichmentStatus"
+          },
+          "languageCode": {
+            "type": "string",
+            "maxLength": 20,
+            "nullable": true
+          },
+          "provider": {
+            "type": "string",
+            "example": "ElevenLabs",
+            "nullable": true
+          },
+          "model": {
+            "type": "string",
+            "nullable": true
+          },
+          "providerRequestId": {
+            "type": "string",
+            "nullable": true
+          },
+          "fullText": {
+            "type": "string",
+            "nullable": true
+          },
+          "durationMs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "nullable": true
+          },
+          "segments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TranscriptSegment"
+            }
+          },
+          "updatedAtUtc": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          }
+        }
+      },
+      "RemoteMediaAccess": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "originalUrl",
+          "expiresAtUtc"
+        ],
+        "properties": {
+          "originalUrl": {
+            "type": "string",
+            "format": "uri"
+          },
+          "previewUrl": {
+            "type": "string",
+            "format": "uri",
+            "nullable": true
+          },
+          "expiresAtUtc": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "MediaAssetDetail": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/MediaAssetSummary"
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "occurrences",
+              "provenance"
+            ],
+            "properties": {
+              "occurrences": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/MediaOccurrence"
+                }
+              },
+              "locationDetail": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/MediaLocation"
+                  }
+                ],
+                "nullable": true
+              },
+              "description": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/MediaDescription"
+                  }
+                ],
+                "nullable": true
+              },
+              "transcript": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/MediaTranscript"
+                  }
+                ],
+                "nullable": true
+              },
+              "remoteAccess": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/RemoteMediaAccess"
+                  }
+                ],
+                "nullable": true
+              },
+              "provenance": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/FieldProvenance"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "MatchField": {
+        "type": "string",
+        "enum": [
+          "FileName",
+          "Description",
+          "Transcript",
+          "Category",
+          "Date",
+          "MediaType",
+          "Location"
+        ]
+      },
+      "MediaSearchHit": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "asset",
+          "matchedField"
+        ],
+        "properties": {
+          "asset": {
+            "$ref": "#/components/schemas/MediaAssetSummary"
+          },
+          "matchedField": {
+            "$ref": "#/components/schemas/MatchField"
+          },
+          "highlight": {
+            "type": "string",
+            "maxLength": 1000,
+            "nullable": true
+          },
+          "transcriptSegmentId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "seekToMs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "nullable": true
+          }
+        }
+      },
+      "MediaSearchPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "items",
+          "page"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MediaSearchHit"
+            }
+          },
+          "page": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        }
+      },
+      "TrashRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "reason": {
+            "type": "string",
+            "maxLength": 500
+          }
+        }
+      },
+      "ProcessingJobType": {
+        "type": "string",
+        "enum": [
+          "Metadata",
+          "Geocode",
+          "Description",
+          "Transcription",
+          "SearchIndex",
+          "Cleanup",
+          "LegacyMigration"
+        ]
+      },
+      "ProcessingJobStatus": {
+        "type": "string",
+        "enum": [
+          "Queued",
+          "Running",
+          "Succeeded",
+          "Failed",
+          "DeferredQuota",
+          "Cancelled"
+        ]
+      },
+      "FailureClass": {
+        "type": "string",
+        "enum": [
+          "Transient",
+          "Authentication",
+          "Quota",
+          "UnsupportedFormat",
+          "InvalidMedia",
+          "Internal"
+        ]
+      },
+      "ProcessingJob": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "jobId",
+          "mediaAssetId",
+          "jobType",
+          "status",
+          "state",
+          "attemptCount",
+          "createdAtUtc",
+          "updatedAtUtc"
+        ],
+        "properties": {
+          "jobId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "mediaAssetId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "jobType": {
+            "$ref": "#/components/schemas/ProcessingJobType"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ProcessingJobStatus"
+          },
+          "state": {
+            "$ref": "#/components/schemas/UserFacingState"
+          },
+          "attemptCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "nextAttemptAtUtc": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "failureClass": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/FailureClass"
+              }
+            ],
+            "nullable": true
+          },
+          "errorCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "userMessage": {
+            "type": "string",
+            "nullable": true
+          },
+          "canRetry": {
+            "type": "boolean",
+            "default": false
+          },
+          "createdAtUtc": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "startedAtUtc": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "completedAtUtc": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "updatedAtUtc": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ProcessingJobPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "items",
+          "page"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProcessingJob"
+            }
+          },
+          "page": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        }
+      },
+      "ChangeType": {
+        "type": "string",
+        "enum": [
+          "Upsert",
+          "Delete"
+        ]
+      },
+      "ChangeResourceType": {
+        "type": "string",
+        "enum": [
+          "MediaAsset",
+          "MediaOccurrence",
+          "MediaSource",
+          "ProcessingJob"
+        ]
+      },
+      "MediaChange": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "cursor",
+          "changeType",
+          "resourceType",
+          "resourceId",
+          "occurredAtUtc"
+        ],
+        "properties": {
+          "cursor": {
+            "type": "string",
+            "description": "Opaque position after this individual change."
+          },
+          "changeType": {
+            "$ref": "#/components/schemas/ChangeType"
+          },
+          "resourceType": {
+            "$ref": "#/components/schemas/ChangeResourceType"
+          },
+          "resourceId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "occurredAtUtc": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "mediaAsset": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/MediaAssetSummary"
+              }
+            ],
+            "nullable": true
+          },
+          "source": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/MediaSource"
+              }
+            ],
+            "nullable": true
+          },
+          "processingJob": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ProcessingJob"
+              }
+            ],
+            "nullable": true
+          }
+        }
+      },
+      "ChangePage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "items",
+          "page"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MediaChange"
+            }
+          },
+          "page": {
+            "$ref": "#/components/schemas/PageInfo"
+          }
+        }
+      },
+      "ElevenLabsWebhookEnvelope": {
+        "type": "object",
+        "required": [
+          "type",
+          "data"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "minLength": 1
+          },
+          "event_timestamp": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          },
+          "data": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Provider payload retained only as needed for correlation and normalized immediately."
+          }
+        },
+        "additionalProperties": true
+      },
+      "WebhookAcknowledgement": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "accepted",
+          "duplicate"
+        ],
+        "properties": {
+          "accepted": {
+            "type": "boolean"
+          },
+          "duplicate": {
+            "type": "boolean"
+          }
+        }
+      },
+      "DependencyHealth": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "status"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/HealthStatus"
+          },
+          "latencyMs": {
+            "type": "integer",
+            "minimum": 0,
+            "nullable": true
+          },
+          "message": {
+            "type": "string",
+            "maxLength": 500,
+            "nullable": true
+          }
+        }
+      },
+      "AdminHealthResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "service",
+          "version",
+          "status",
+          "timeUtc",
+          "dependencies"
+        ],
+        "properties": {
+          "service": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/HealthStatus"
+          },
+          "timeUtc": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "dependencies": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DependencyHealth"
+            }
+          }
+        }
+      },
+      "AuditSeverity": {
+        "type": "string",
+        "enum": [
+          "Info",
+          "Warning",
+          "Error"
+        ]
+      },
+      "AuditCheck": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "severity",
+          "title",
+          "count"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "severity": {
+            "$ref": "#/components/schemas/AuditSeverity"
+          },
+          "title": {
+            "type": "string"
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "details": {
+            "type": "string",
+            "maxLength": 2000,
+            "nullable": true
+          }
+        }
+      },
+      "AdminAuditResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "runAtUtc",
+          "readOnly",
+          "status",
+          "checks"
+        ],
+        "properties": {
+          "runAtUtc": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "readOnly": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/HealthStatus"
+          },
+          "checks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AuditCheck"
+            }
+          }
+        }
+      }
+    }
+  }
+}

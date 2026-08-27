@@ -206,7 +206,7 @@ Explain:
 - the legacy meaning of `RawGraphJson`;
 - the remaining OneDrive tables and why they are inactive.
 
-Identify any schema or naming decisions that may matter when ImageTracker becomes a reusable Intellige Layer source.
+Identify any schema or naming decisions that may matter when ImageTracker becomes a reusable Intelligence Layer source.
 
 ### 5. Verified behavior and tests
 

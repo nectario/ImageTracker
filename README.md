@@ -1,111 +1,131 @@
 # ImageTracker
 
-ImageTracker is a single Python script (`ImageTracker.py`) that syncs local photos into MySQL using PascalCase schema names.
+ImageTracker is becoming a consumer media app for indexing, finding, and
+reliving photos and videos. It supports two storage modes per source:
 
-## Script Location
+- **Local:** originals remain on the device or computer; searchable metadata is
+  stored in the `ImageTracker` MySQL database.
+- **Remote:** the exact original is stored once per user in private Amazon S3
+  and is available across the user's devices.
 
-- `ImageTracker.py` at repository root.
-- No `imagetracker/` module package is required.
+The current repository contains the Phase 0 product foundation plus the legacy
+local photo importer. The approved architecture and delivery sequence are in
+[the UX-first implementation plan](docs/ImageTracker%20App%20UX-First%20Implementation%20Plan.md).
 
-## Run
+## Phase 0 foundation
 
-Use `python` (not `python3`):
+- `contracts/v1/openapi.json`: versioned REST/JSON contract for native clients
+  and the CLI.
+- `services/api`: FastAPI health surface and AWS Lambda adapter.
+- `services/common`: shared configuration and public state values.
+- `cli/imagetracker_cli`: Typer/Rich CLI foundation.
+- `infra`: isolated low-cost AWS Serverless foundation.
+- `migrations/007_CreateMediaAppTables.sql`: additive PascalCase media schema;
+  the legacy `ImageAsset` table is not altered.
+- `apps/ios`, `apps/android`, and `apps/windows`: explicit native-client
+  boundaries for later delivery phases.
+
+The Windows client will be a packaged native WinUI 3 app whose visual language
+is derived from Nektron Write and Nektron Mail. Generic template aesthetics are
+not considered finished product UI.
+
+## Development setup
+
+Use `python`, not `python3`:
 
 ```bash
-python ImageTracker.py --directory "/mnt/d/Pictures/Camera Uploads" --cutoff-date "2026-01-01"
+python -m venv .venv
+.venv/bin/python -m pip install -e ".[dev]"
 ```
 
-Force reprocessing of previously processed files:
+On Windows PowerShell, activate the environment using the normal Windows venv
+activation script and run the same `python -m pip` command.
+
+Run verification:
 
 ```bash
-python ImageTracker.py --directory "/mnt/d/Pictures/Camera Uploads" --cutoff-date "2026-01-01" --force
+python -m pytest -q
+python contracts/validate_openapi.py
+imagetracker doctor --json
 ```
 
-Manual location tagging (separate script):
+Infrastructure remains independently packageable from `infra/`; see
+`infra/README.md`. Always validate the package before deployment, and configure
+each required SSM SecureString before enabling the feature that consumes it.
+Secret values must never be committed or included in deployment archives.
+
+## CLI foundation
+
+Phase 0 provides non-networking commands:
 
 ```bash
-python tag_location.py --address 99 Prospect Ave Bayonne NJ 07002 --category "Home"
-python tag_location.py --gps 40.6631583333,-74.1143888889 --category "Kids at the Park"
+imagetracker version
+imagetracker doctor
+imagetracker doctor --json
 ```
 
-Useful options:
+Upload, sync, media, job, and migration commands arrive in Phase 1 against the
+versioned API. User-facing CLI commands will not connect directly to MySQL.
 
-- `--radius-meters` (default `10`)
-- `--dry-run` (preview matching rows before update)
-- `--where-category-is-null` (only fill unclassified rows)
-- Tags are stored as `CategorySource='Manual'`.
+## Legacy local importer
 
-## Local Sync Behavior
+The root `ImageTracker.py` remains operational during the transition and keeps
+its existing behavior. It recursively scans a local folder, preserves exact
+filenames, extracts EXIF metadata, optionally enriches locations/captions, and
+upserts `ImageAsset`.
 
-1. Scans supported image files recursively in `--directory`.
-2. Processes files with modified timestamp >= `--cutoff-date`.
-3. Skips already processed files (`Source='LocalFile'`) unless `--force` is supplied.
-4. Stores file names exactly as-is (for example: `IMG_8677.JPG`).
-5. Extracts GPS primarily from EXIF metadata in the local file bytes.
-6. Optionally generates `Description` when `OPENAI_API_KEY` is set.
-7. Optionally reverse-geocodes GPS to location fields when `GOOGLE_MAPS_API_KEY` is set.
-8. Applies configurable location normalization rules from `location_normalization_rules.json` (or `LOCATION_NORMALIZATION_RULES_PATH`).
-9. Persists capture-time analytics fields: `DateTime`, `Date`, `Time`, `TimeZone`, `UtcOffsetMinutes`, and `DateTimeUtc`.
-10. Enriches missing `TimeZone`/`UtcOffsetMinutes` for GPS rows via Google Time Zone API.
-11. Auto-assigns `Category` from existing tagged photos using `StreetAddress` first, then a 10-meter GPS radius fallback.
-12. Prints periodic progress lines during long scans so the importer does not appear stalled.
+```bash
+python ImageTracker.py \
+  --directory "/mnt/d/Pictures/Camera Uploads" \
+  --cutoff-date "2026-01-01"
+```
 
-## Database
+Force reprocessing remains available but should be used carefully:
 
-Migrations are applied automatically from `migrations/`.
+```bash
+python ImageTracker.py \
+  --directory "/mnt/d/Pictures/Camera Uploads" \
+  --cutoff-date "2026-01-01" \
+  --force
+```
 
-Expected tables:
+Manual location tagging remains in the separate root utility:
 
-- `ImageAsset`
-- `OneDriveSyncState`
-- `OneDriveTokenCache`
-- `SchemaMigration`
+```bash
+python tag_location.py --gps 40.0,-74.0 --category "Example" --dry-run
+```
 
-## Environment
+Useful tagging options are `--radius-meters`, `--dry-run`, and
+`--where-category-is-null`. Manual categories remain authoritative.
 
-Copy `.env.example` to `.env` and set values.
+## Configuration
 
-MySQL resolution order when `MYSQL_DSN` is not set:
+Copy `.env.example` only for legacy/local development and fill in values
+without committing `.env`. Prefer project-scoped MySQL names:
 
-- Host: `IMAGETRACKER_MYSQL_HOST` -> `MYSQL_HOST`
-- Port: `IMAGETRACKER_MYSQL_PORT` -> `MYSQL_PORT`
-- User: `IMAGETRACKER_MYSQL_USER` -> `MYSQL_USERID` -> `MYSQL_USER`
-- Password: `IMAGETRACKER_MYSQL_PASSWORD` -> `MYSQL_PASSWORD`
-- Database: `IMAGETRACKER_MYSQL_DATABASE` -> `MYSQL_DATABASE_IMAGETRACKER` -> `MYSQL_DATABASE`
+- `IMAGETRACKER_MYSQL_HOST`
+- `IMAGETRACKER_MYSQL_PORT`
+- `IMAGETRACKER_MYSQL_USER`
+- `IMAGETRACKER_MYSQL_PASSWORD`
+- `IMAGETRACKER_MYSQL_DATABASE=ImageTracker`
 
-Optional captioning:
+The service foundation accepts only the `ImageTracker` database scope. Cloud
+credentials are represented by SSM parameter names rather than plaintext
+provider keys in repository configuration.
 
-- `OPENAI_API_KEY`
-- `OPENAI_VISION_MODEL` (default: `gpt-5.2`)
-- `PHOTO_CAPTION_MAX_WORDS` (default: `18`)
+Optional legacy enrichments still use:
 
-Optional location enrichment:
-
+- `OPENAI_API_KEY` and `OPENAI_VISION_MODEL`
 - `GOOGLE_MAPS_API_KEY`
-- `LOCATION_NORMALIZATION_RULES_PATH` (default: `location_normalization_rules.json`)
-- Populates `LocationDisplayName`, `StreetAddress`, `Neighborhood`, `City`, `County`,
-  `State`, `PostalCode`, `Country`, `CountryCode`, `OriginalStreetNumber`,
-  `LocationProvider`, `LocationUpdatedAtUtc`.
-- Enable both Google APIs in the same project: Geocoding API and Time Zone API.
+- `LOCATION_NORMALIZATION_RULES_PATH`
 
-Category fields:
+## Compatibility invariants
 
-- `Category` (`VARCHAR(255)`): optional location bucket such as `Home`.
-- `CategorySource` (`VARCHAR(64)`): provenance (`Manual`, `AddressPropagation`, `RadiusPropagation10m`, etc.).
-- Rows without GPS/address (for example screenshots) remain unclassified unless manually tagged.
-
-Location normalization rules:
-
-- File format is JSON with a top-level `Rules` array.
-- Current default rule canonicalizes Bayonne `Prospect Ave/Avenue` edge numbers
-  (`97/99/101/103`) to `99 Prospect Avenue`, preserving `OriginalStreetNumber`.
-
-Capture-time fields:
-
-- `DateTime`: local capture date/time (EXIF-first, fallback to file modified time converted to local timezone).
-- `Date`: derived from `DateTime`.
-- `Time`: derived from `DateTime`.
-- `TimeZone`: timezone identifier or UTC offset label.
-- `UtcOffsetMinutes`: offset minutes at capture time.
-- `DateTimeUtc`: UTC companion timestamp for stable cross-timezone ordering.
-- `CreatedAt` / `ModifiedAt`: MySQL `TIMESTAMP` columns for row lifecycle.
+- Work directly on `main`; do not create implementation branches.
+- Preserve original filenames verbatim.
+- Preserve PascalCase MySQL table and column names.
+- Keep `ImageAsset` readable and unchanged while the additive media model is
+  introduced.
+- Use exact per-user SHA-256 deduplication in the new model; do not use path
+  hashes as durable content identity.
+- Do not upload Local-mode originals or previews to permanent S3 storage.

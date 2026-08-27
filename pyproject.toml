@@ -1,20 +1,33 @@
 [project]
 name = "imagetracker"
-version = "0.1.0"
-description = "Local photo sync to MySQL with optional AI captions"
+version = "0.2.0"
+description = "UX-first local and remote media ingestion foundation"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-  "pymysql>=1.1.0",
-  "requests>=2.31.0",
-  "Pillow>=10.3.0",
-  "pillow-heif>=0.16.0",
+  "boto3>=1.35.0,<2",
+  "fastapi>=0.115.0,<1",
+  "httpx>=0.27.0,<1",
+  "mangum>=0.19.0,<1",
+  "Pillow>=10.3.0,<13",
+  "pillow-heif>=0.16.0,<2",
+  "pydantic-settings>=2.6.0,<3",
+  "pymysql>=1.1.0,<2",
+  "requests>=2.31.0,<3",
+  "rich>=13.9.0,<15",
+  "sqlalchemy>=2.0.0,<3",
+  "typer>=0.15.0,<1",
 ]
 
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0.0",
+  "openapi-spec-validator>=0.7.0,<1",
+  "PyYAML>=6.0,<7",
 ]
+
+[project.scripts]
+imagetracker = "cli.imagetracker_cli.app:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
@@ -22,3 +35,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.setuptools]
+py-modules = ["ImageTracker", "tag_location"]
+
+[tool.setuptools.packages.find]
+include = ["services*", "cli*"]

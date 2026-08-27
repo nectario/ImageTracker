@@ -1,0 +1,562 @@
+service: image-tracker
+frameworkVersion: '4'
+configValidationMode: error
+
+custom:
+  parameterPrefix: /imagetracker/${sls:stage}
+  maintenanceSchedulesState: ${param:maintenanceSchedulesState, 'DISABLED'}
+  monthlyBudgetUsd: ${param:monthlyBudgetUsd, 50}
+  budgetEmail: ${param:budgetEmail, ''}
+
+provider:
+  name: aws
+  region: us-east-2
+  stage: ${opt:stage, 'prod'}
+  runtime: python3.12
+  architecture: x86_64
+  memorySize: 256
+  timeout: 10
+  versionFunctions: false
+  deploymentMethod: changesets
+  logRetentionInDays: 14
+  deploymentBucket:
+    blockPublicAccess: true
+    serverSideEncryption: AES256
+  tags:
+    Application: ImageTracker
+    Product: NektronAI
+    Environment: ${sls:stage}
+    ManagedBy: ServerlessFramework
+  stackTags:
+    Application: ImageTracker
+    Product: NektronAI
+    Environment: ${sls:stage}
+    ManagedBy: ServerlessFramework
+  logs:
+    httpApi: true
+  httpApi:
+    cors:
+      allowedOrigins:
+        - ${param:allowedOrigin, '*'}
+      allowedHeaders:
+        - Authorization
+        - Content-Type
+        - Idempotency-Key
+      allowedMethods:
+        - GET
+        - OPTIONS
+      maxAge: 86400
+    authorizers:
+      cognito:
+        type: jwt
+        identitySource: $request.header.Authorization
+        issuerUrl:
+          Fn::Join:
+            - ''
+            - - https://cognito-idp.
+              - Ref: AWS::Region
+              - .amazonaws.com/
+              - Ref: ImageTrackerUserPoolV2
+        audience:
+          - Ref: ImageTrackerUserPoolClientV2
+  environment:
+    IMAGETRACKER_SERVICE_NAME: imagetracker-api
+    IMAGETRACKER_STAGE: ${sls:stage}
+    IMAGETRACKER_AWS_REGION: ${aws:region}
+    IMAGETRACKER_MYSQL_DATABASE: ImageTracker
+    IMAGETRACKER_CONFIG_PARAMETER_PREFIX: ${self:custom.parameterPrefix}
+    IMAGETRACKER_DB_SECRET_PARAMETER: ${self:custom.parameterPrefix}/mysql
+    IMAGETRACKER_GOOGLE_SECRET_PARAMETER: ${self:custom.parameterPrefix}/google
+    IMAGETRACKER_OPENAI_SECRET_PARAMETER: ${self:custom.parameterPrefix}/openai
+    IMAGETRACKER_ELEVENLABS_SECRET_PARAMETER: ${self:custom.parameterPrefix}/elevenlabs
+    IMAGETRACKER_MEDIA_BUCKET:
+      Ref: MediaBucket
+    IMAGETRACKER_PROCESSING_QUEUE_URL:
+      Ref: ProcessingQueue
+    IMAGETRACKER_PROCESSING_QUEUE_ARN:
+      Fn::GetAtt:
+        - ProcessingQueue
+        - Arn
+  iam:
+    role:
+      statements:
+        - Sid: ReadImageTrackerConfiguration
+          Effect: Allow
+          Action:
+            - ssm:GetParameter
+            - ssm:GetParameters
+          Resource:
+            Fn::Join:
+              - ''
+              - - 'arn:'
+                - Ref: AWS::Partition
+                - ':ssm:'
+                - Ref: AWS::Region
+                - ':'
+                - Ref: AWS::AccountId
+                - ':parameter${self:custom.parameterPrefix}/*'
+        - Sid: ReadAndWriteImageTrackerMedia
+          Effect: Allow
+          Action:
+            - s3:GetObject
+            - s3:PutObject
+            - s3:DeleteObject
+            - s3:AbortMultipartUpload
+            - s3:ListMultipartUploadParts
+          Resource:
+            Fn::Join:
+              - ''
+              - - Fn::GetAtt:
+                    - MediaBucket
+                    - Arn
+                - '/*'
+        - Sid: ListImageTrackerMediaUploads
+          Effect: Allow
+          Action:
+            - s3:ListBucket
+            - s3:ListBucketMultipartUploads
+          Resource:
+            Fn::GetAtt:
+              - MediaBucket
+              - Arn
+        - Sid: EnqueueImageTrackerProcessing
+          Effect: Allow
+          Action:
+            - sqs:SendMessage
+          Resource:
+            Fn::GetAtt:
+              - ProcessingQueue
+              - Arn
+
+package:
+  patterns:
+    - '!**/__pycache__/**'
+    - '!**/*.py[cod]'
+    - '!**/.pytest_cache/**'
+    - '!**/tests/**'
+
+functions:
+  api:
+    name: ${self:service}-${sls:stage}-api
+    description: ImageTracker authenticated HTTP API
+    handler: services/api/handler.handler
+    reservedConcurrency: 4
+    events:
+      - httpApi:
+          method: GET
+          path: /v1/health
+          authorizer:
+            name: cognito
+
+resources:
+  Parameters:
+    BudgetNotificationEmail:
+      Type: String
+      Default: ${self:custom.budgetEmail}
+      Description: Optional email subscriber for the monthly ImageTracker budget.
+    MonthlyBudgetUsd:
+      Type: Number
+      Default: ${self:custom.monthlyBudgetUsd}
+      MinValue: 1
+      Description: Monthly incremental ImageTracker budget in USD.
+
+  Conditions:
+    HasBudgetNotificationEmail:
+      Fn::Not:
+        - Fn::Equals:
+            - Ref: BudgetNotificationEmail
+            - ''
+
+  Resources:
+    ImageTrackerUserPoolV2:
+      Type: AWS::Cognito::UserPool
+      DeletionPolicy: Retain
+      UpdateReplacePolicy: Retain
+      Properties:
+        UserPoolName: ${self:service}-${sls:stage}-users-v2
+        UsernameAttributes:
+          - email
+        UsernameConfiguration:
+          CaseSensitive: false
+        AutoVerifiedAttributes:
+          - email
+        MfaConfiguration: 'OFF'
+        AccountRecoverySetting:
+          RecoveryMechanisms:
+            - Name: verified_email
+              Priority: 1
+        AdminCreateUserConfig:
+          AllowAdminCreateUserOnly: false
+        Policies:
+          PasswordPolicy:
+            MinimumLength: 8
+            RequireUppercase: false
+            RequireLowercase: false
+            RequireNumbers: false
+            RequireSymbols: false
+            TemporaryPasswordValidityDays: 7
+        Schema:
+          - Name: email
+            AttributeDataType: String
+            Mutable: true
+            Required: true
+        VerificationMessageTemplate:
+          DefaultEmailOption: CONFIRM_WITH_CODE
+          EmailSubject: Your ImageTracker verification code
+          EmailMessage: Your ImageTracker verification code is {####}.
+        UserPoolTags:
+          Application: ImageTracker
+          Product: NektronAI
+          Environment: ${sls:stage}
+          ManagedBy: ServerlessFramework
+
+    ImageTrackerUserPoolClientV2:
+      Type: AWS::Cognito::UserPoolClient
+      Properties:
+        ClientName: ${self:service}-${sls:stage}-native-apps-v2
+        UserPoolId:
+          Ref: ImageTrackerUserPoolV2
+        GenerateSecret: false
+        EnableTokenRevocation: true
+        PreventUserExistenceErrors: ENABLED
+        ExplicitAuthFlows:
+          - ALLOW_USER_PASSWORD_AUTH
+          - ALLOW_USER_SRP_AUTH
+          - ALLOW_REFRESH_TOKEN_AUTH
+        AccessTokenValidity: 1
+        IdTokenValidity: 1
+        RefreshTokenValidity: 365
+        TokenValidityUnits:
+          AccessToken: hours
+          IdToken: hours
+          RefreshToken: days
+        ReadAttributes:
+          - email
+          - email_verified
+        WriteAttributes:
+          - email
+        SupportedIdentityProviders:
+          - COGNITO
+
+    MediaBucket:
+      Type: AWS::S3::Bucket
+      DeletionPolicy: Retain
+      UpdateReplacePolicy: Retain
+      Properties:
+        BucketName:
+          Fn::Join:
+            - ''
+            - - ${self:service}-${sls:stage}-
+              - Ref: AWS::AccountId
+              - -${aws:region}-media
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        OwnershipControls:
+          Rules:
+            - ObjectOwnership: BucketOwnerEnforced
+        LifecycleConfiguration:
+          Rules:
+            - Id: AbortIncompleteMultipartUploads
+              Status: Enabled
+              AbortIncompleteMultipartUpload:
+                DaysAfterInitiation: 7
+            - Id: ExpireLocalProcessingStaging
+              Status: Enabled
+              Prefix: staging/
+              ExpirationInDays: 1
+            - Id: ExpireTrash
+              Status: Enabled
+              Prefix: trash/
+              ExpirationInDays: 30
+            - Id: TierRemoteOriginals
+              Status: Enabled
+              Prefix: originals/
+              Transitions:
+                - StorageClass: INTELLIGENT_TIERING
+                  TransitionInDays: 0
+        Tags:
+          - Key: Application
+            Value: ImageTracker
+          - Key: Product
+            Value: NektronAI
+          - Key: Environment
+            Value: ${sls:stage}
+          - Key: ManagedBy
+            Value: ServerlessFramework
+
+    MediaBucketPolicy:
+      Type: AWS::S3::BucketPolicy
+      Properties:
+        Bucket:
+          Ref: MediaBucket
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Sid: DenyInsecureTransport
+              Effect: Deny
+              Principal: '*'
+              Action: s3:*
+              Resource:
+                - Fn::GetAtt:
+                    - MediaBucket
+                    - Arn
+                - Fn::Join:
+                    - ''
+                    - - Fn::GetAtt:
+                          - MediaBucket
+                          - Arn
+                      - '/*'
+              Condition:
+                Bool:
+                  aws:SecureTransport: false
+
+    ProcessingDeadLetterQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${sls:stage}-processing-dlq
+        MessageRetentionPeriod: 1209600
+        SqsManagedSseEnabled: true
+        Tags:
+          - Key: Application
+            Value: ImageTracker
+          - Key: Product
+            Value: NektronAI
+          - Key: Environment
+            Value: ${sls:stage}
+          - Key: ManagedBy
+            Value: ServerlessFramework
+
+    ProcessingQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${sls:stage}-processing
+        MessageRetentionPeriod: 345600
+        ReceiveMessageWaitTimeSeconds: 20
+        VisibilityTimeout: 180
+        SqsManagedSseEnabled: true
+        RedrivePolicy:
+          deadLetterTargetArn:
+            Fn::GetAtt:
+              - ProcessingDeadLetterQueue
+              - Arn
+          maxReceiveCount: 5
+        Tags:
+          - Key: Application
+            Value: ImageTracker
+          - Key: Product
+            Value: NektronAI
+          - Key: Environment
+            Value: ${sls:stage}
+          - Key: ManagedBy
+            Value: ServerlessFramework
+
+    RetrySchedule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: ${self:service}-${sls:stage}-retry-due-jobs
+        Description: Enqueues retry sweeps after the Phase 1 worker is enabled.
+        ScheduleExpression: rate(5 minutes)
+        State: ${self:custom.maintenanceSchedulesState}
+        Targets:
+          - Arn:
+              Fn::GetAtt:
+                - ProcessingQueue
+                - Arn
+            Id: ProcessingQueue
+            Input: '{"jobType":"RetryDueJobs","source":"schedule"}'
+        Tags:
+          - Key: Application
+            Value: ImageTracker
+          - Key: Environment
+            Value: ${sls:stage}
+
+    ReconciliationSchedule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: ${self:service}-${sls:stage}-reconcile
+        Description: Enqueues source reconciliation after the Phase 1 worker is enabled.
+        ScheduleExpression: rate(1 hour)
+        State: ${self:custom.maintenanceSchedulesState}
+        Targets:
+          - Arn:
+              Fn::GetAtt:
+                - ProcessingQueue
+                - Arn
+            Id: ProcessingQueue
+            Input: '{"jobType":"ReconcileSources","source":"schedule"}'
+        Tags:
+          - Key: Application
+            Value: ImageTracker
+          - Key: Environment
+            Value: ${sls:stage}
+
+    QuotaResetSchedule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: ${self:service}-${sls:stage}-quota-reset
+        Description: Enqueues the monthly provider quota reset after the worker is enabled.
+        ScheduleExpression: cron(0 1 1 * ? *)
+        State: ${self:custom.maintenanceSchedulesState}
+        Targets:
+          - Arn:
+              Fn::GetAtt:
+                - ProcessingQueue
+                - Arn
+            Id: ProcessingQueue
+            Input: '{"jobType":"ResetProviderQuota","source":"schedule"}'
+        Tags:
+          - Key: Application
+            Value: ImageTracker
+          - Key: Environment
+            Value: ${sls:stage}
+
+    TrashPurgeSchedule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: ${self:service}-${sls:stage}-trash-purge
+        Description: Enqueues trash purges after the Phase 1 worker is enabled.
+        ScheduleExpression: rate(1 day)
+        State: ${self:custom.maintenanceSchedulesState}
+        Targets:
+          - Arn:
+              Fn::GetAtt:
+                - ProcessingQueue
+                - Arn
+            Id: ProcessingQueue
+            Input: '{"jobType":"PurgeExpiredTrash","source":"schedule"}'
+        Tags:
+          - Key: Application
+            Value: ImageTracker
+          - Key: Environment
+            Value: ${sls:stage}
+
+    ScheduleQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - Ref: ProcessingQueue
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Sid: AllowImageTrackerSchedules
+              Effect: Allow
+              Principal:
+                Service: events.amazonaws.com
+              Action: sqs:SendMessage
+              Resource:
+                Fn::GetAtt:
+                  - ProcessingQueue
+                  - Arn
+              Condition:
+                ArnLike:
+                  aws:SourceArn:
+                    Fn::Join:
+                      - ''
+                      - - 'arn:'
+                        - Ref: AWS::Partition
+                        - ':events:'
+                        - Ref: AWS::Region
+                        - ':'
+                        - Ref: AWS::AccountId
+                        - ':rule/${self:service}-${sls:stage}-*'
+
+    MonthlyCostBudget:
+      Type: AWS::Budgets::Budget
+      Properties:
+        ResourceTags:
+          - Key: Application
+            Value: ImageTracker
+          - Key: Product
+            Value: NektronAI
+          - Key: Environment
+            Value: ${sls:stage}
+          - Key: ManagedBy
+            Value: ServerlessFramework
+        Budget:
+          BudgetName: ${self:service}-${sls:stage}-incremental-monthly
+          BudgetType: COST
+          TimeUnit: MONTHLY
+          BudgetLimit:
+            Amount:
+              Ref: MonthlyBudgetUsd
+            Unit: USD
+          FilterExpression:
+            And:
+              - Tags:
+                  Key: Application
+                  Values:
+                    - ImageTracker
+                  MatchOptions:
+                    - EQUALS
+              - Tags:
+                  Key: Environment
+                  Values:
+                    - ${sls:stage}
+                  MatchOptions:
+                    - EQUALS
+        NotificationsWithSubscribers:
+          Fn::If:
+            - HasBudgetNotificationEmail
+            - - Notification:
+                  ComparisonOperator: GREATER_THAN
+                  NotificationType: ACTUAL
+                  Threshold: 80
+                  ThresholdType: PERCENTAGE
+                Subscribers:
+                  - Address:
+                      Ref: BudgetNotificationEmail
+                    SubscriptionType: EMAIL
+            - Ref: AWS::NoValue
+
+  Outputs:
+    ImageTrackerHttpApiUrl:
+      Description: ImageTracker HTTP API base URL.
+      Value:
+        Fn::GetAtt:
+          - HttpApi
+          - ApiEndpoint
+    CognitoUserPoolId:
+      Description: Cognito user pool ID for native clients.
+      Value:
+        Ref: ImageTrackerUserPoolV2
+    CognitoUserPoolClientId:
+      Description: Public Cognito app client ID for native clients.
+      Value:
+        Ref: ImageTrackerUserPoolClientV2
+    CognitoIssuerUrl:
+      Description: JWT issuer URL used by API Gateway and native clients.
+      Value:
+        Fn::Join:
+          - ''
+          - - https://cognito-idp.
+            - Ref: AWS::Region
+            - .amazonaws.com/
+            - Ref: ImageTrackerUserPoolV2
+    MediaBucketName:
+      Description: Private bucket for Remote originals, previews, and temporary staging.
+      Value:
+        Ref: MediaBucket
+    ProcessingQueueUrl:
+      Description: Asynchronous processing queue URL.
+      Value:
+        Ref: ProcessingQueue
+    ProcessingDeadLetterQueueUrl:
+      Description: Processing dead-letter queue URL.
+      Value:
+        Ref: ProcessingDeadLetterQueue
+    ConfigurationParameterPrefix:
+      Description: SSM path prefix expected by the runtime.
+      Value: ${self:custom.parameterPrefix}
+    MaintenanceSchedulesState:
+      Description: Maintenance schedule state deployed with this stack.
+      Value: ${self:custom.maintenanceSchedulesState}
+    MonthlyBudgetName:
+      Description: Incremental ImageTracker cost budget name.
+      Value: ${self:service}-${sls:stage}-incremental-monthly
