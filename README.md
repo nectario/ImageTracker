@@ -49,6 +49,18 @@ python contracts/validate_openapi.py
 imagetracker doctor --json
 ```
 
+The WSL shell toolkit wraps these commands and the safe deployed-resource
+checks:
+
+```bash
+./scripts/play.sh help
+./scripts/play.sh check
+```
+
+See [`scripts/README.md`](scripts/README.md) for individual commands and safety
+boundaries. The toolkit intentionally contains no deployment or importer
+command.
+
 Infrastructure remains independently packageable from `infra/`; see
 `infra/README.md`. Always validate the package before deployment, and configure
 each required SSM SecureString before enabling the feature that consumes it.

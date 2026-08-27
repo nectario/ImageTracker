@@ -48,7 +48,7 @@ intentionally omitted from this document.
 ## Verification
 
 ```text
-pytest: 37 passed
+pytest: 40 passed
 OpenAPI structural validation: passed
 OpenAPI specification validation: passed
 Python wheel build: passed
