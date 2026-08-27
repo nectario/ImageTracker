@@ -13,6 +13,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 
 
 INFRA_ROOT = Path(__file__).resolve().parents[1]
@@ -51,7 +52,20 @@ def _validate_paths() -> None:
 
 def _replace_build_tree() -> None:
     if BUILD_ROOT.exists():
-        shutil.rmtree(BUILD_ROOT)
+        # Windows antivirus/indexing can briefly retain handles while WSL is
+        # replacing the generated dependency tree. Retrying the same tightly
+        # validated build path keeps packaging deterministic without touching
+        # repository-owned source files.
+        for attempt in range(6):
+            try:
+                shutil.rmtree(BUILD_ROOT)
+                break
+            except FileNotFoundError:
+                break
+            except OSError:
+                if attempt == 5:
+                    raise
+                time.sleep(0.25 * (attempt + 1))
 
     staged_source = BUILD_ROOT / "services"
     staged_source.parent.mkdir(parents=True, exist_ok=True)

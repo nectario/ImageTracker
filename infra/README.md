@@ -15,15 +15,15 @@ Nothing here deploys automatically.
   Remote originals transition to S3 Intelligent-Tiering.
 - One encrypted processing queue plus a 14-day dead-letter queue.
 - Retry, reconciliation, quota-reset, and trash-purge EventBridge rules. They
-  are **disabled by default** until the Phase 1 worker is connected, preventing
+  are **disabled by default** until a bounded processing worker is connected, preventing
   an unconsumed queue backlog.
 - A tag-filtered monthly AWS budget, defaulting to USD 50. An email subscriber
   is added only when `budgetEmail` is supplied.
 
 The stack deliberately has no VPC attachment, NAT gateway, new database, RDS
 Proxy, ECS service, load balancer, CDN, vector database, or SageMaker endpoint.
-Lambda reaches the existing public DeepTrading RDS endpoint only after the API
-data layer is enabled in a later phase.
+The Phase 1 API reaches only the existing `ImageTracker` database using its
+dedicated credential and the bundled Amazon RDS regional CA.
 
 ## Application-code boundary
 
@@ -62,12 +62,12 @@ credentials:
 
 ```bash
 cd /mnt/c/Development/Projects/ImageTracker/infra
-npm install
+npm ci
 npm run validate
 npm run package
 ```
 
-`package:dev` produces CloudFormation and Lambda artifacts under
+`npm run package` produces CloudFormation and Lambda artifacts under
 `.build/.serverless`; it does not deploy them. Review those artifacts before the
 first deployment, then run the credential-free artifact assertions:
 
@@ -75,6 +75,11 @@ first deployment, then run the credential-free artifact assertions:
 python scripts/validate_foundation.py --stage prod \
   --packaged-template .build/.serverless/cloudformation-template-update-stack.json
 ```
+
+The deploy script calls `scripts/deploy_packaged.py` after validation. That
+helper passes absolute config and package paths to Serverless, avoiding its
+different relative-path behavior between package, deploy, and post-deploy
+hooks.
 
 ## Configuration and deployment
 

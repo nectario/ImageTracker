@@ -21,7 +21,7 @@ class AppSettings(BaseSettings):
     )
 
     service_name: str = "imagetracker-api"
-    service_version: str = "0.2.0"
+    service_version: str = "0.3.0"
     stage: str = "local"
     aws_region: str = "us-east-2"
     mysql_database: str = "ImageTracker"

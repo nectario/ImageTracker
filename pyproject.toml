@@ -1,6 +1,6 @@
 [project]
 name = "imagetracker"
-version = "0.2.0"
+version = "0.3.0"
 description = "UX-first local and remote media ingestion foundation"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,6 +17,7 @@ dependencies = [
   "rich>=13.9.0,<15",
   "sqlalchemy>=2.0.0,<3",
   "typer>=0.15.0,<1",
+  "tzlocal>=5.2,<6",
 ]
 
 [project.optional-dependencies]
@@ -24,6 +25,8 @@ dev = [
   "pytest>=8.0.0",
   "openapi-spec-validator>=0.7.0,<1",
   "PyYAML>=6.0,<7",
+  "setuptools>=68",
+  "wheel",
 ]
 
 [project.scripts]
@@ -41,3 +44,6 @@ py-modules = ["ImageTracker", "tag_location"]
 
 [tool.setuptools.packages.find]
 include = ["services*", "cli*"]
+
+[tool.setuptools.package-data]
+"services.data" = ["certs/*.pem"]

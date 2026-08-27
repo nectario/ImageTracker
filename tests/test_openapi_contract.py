@@ -83,6 +83,41 @@ def test_media_source_has_a_stable_non_path_source_key():
     assert "sourceKey" in schemas["MediaSource"]["required"]
 
 
+def test_source_create_documents_idempotent_return_and_reactivation() -> None:
+    document = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+    operation = document["paths"]["/v1/sources"]["post"]
+
+    assert {"200", "201"}.issubset(operation["responses"])
+    assert "reactivates the same source identity" in operation["description"]
+
+
+def test_implemented_authenticated_phase1_operations_document_service_outages():
+    document = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+    implemented_operations = {
+        "/v1/health": ("get",),
+        "/v1/me": ("get",),
+        "/v1/devices": ("get", "post"),
+        "/v1/sources": ("get", "post"),
+        "/v1/sources/{sourceId}": ("get", "patch", "delete"),
+        "/v1/sources/{sourceId}/manifest": ("post",),
+        "/v1/changes": ("get",),
+        "/v1/media": ("get",),
+        "/v1/media/search": ("get",),
+        "/v1/media/{mediaAssetId}": ("get",),
+        "/v1/jobs": ("get",),
+        "/v1/jobs/{jobId}": ("get",),
+        "/v1/jobs/{jobId}/retry": ("post",),
+        "/v1/admin/health": ("get",),
+        "/v1/admin/audit": ("get",),
+    }
+
+    for path, methods in implemented_operations.items():
+        for method in methods:
+            assert document["paths"][path][method]["responses"]["503"] == {
+                "$ref": "#/components/responses/ServiceUnavailable"
+            }
+
+
 def test_manifest_variants_preserve_filename_and_match_live_column_limits():
     document = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
     schemas = document["components"]["schemas"]

@@ -14,8 +14,8 @@ provider:
   stage: ${opt:stage, 'prod'}
   runtime: python3.12
   architecture: x86_64
-  memorySize: 256
-  timeout: 10
+  memorySize: 512
+  timeout: 28
   versionFunctions: false
   deploymentMethod: changesets
   logRetentionInDays: 14
@@ -42,8 +42,13 @@ provider:
         - Authorization
         - Content-Type
         - Idempotency-Key
+        - X-ImageTracker-Device-Id
+        - X-Request-Id
       allowedMethods:
         - GET
+        - POST
+        - PATCH
+        - DELETE
         - OPTIONS
       maxAge: 86400
     authorizers:
@@ -145,6 +150,11 @@ functions:
       - httpApi:
           method: GET
           path: /v1/health
+          authorizer:
+            name: cognito
+      - httpApi:
+          method: '*'
+          path: /v1/{proxy+}
           authorizer:
             name: cognito
 

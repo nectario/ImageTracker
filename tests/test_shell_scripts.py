@@ -46,5 +46,6 @@ def test_playground_help_is_available_without_environment_setup():
         text=True,
     )
 
-    assert "ImageTracker Phase 0 playground" in result.stdout
+    assert "ImageTracker developer playground" in result.stdout
     assert "No command in this toolkit deploys AWS resources" in result.stdout
+    assert "applies database migrations" in result.stdout

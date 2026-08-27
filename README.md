@@ -1,33 +1,43 @@
 # ImageTracker
 
-ImageTracker is becoming a consumer media app for indexing, finding, and
-reliving photos and videos. It supports two storage modes per source:
+ImageTracker is a consumer media app for indexing, finding, and reliving
+photos and videos. It is also the media source for the future NektronAI
+Intelligence Layer.
 
-- **Local:** originals remain on the device or computer; searchable metadata is
-  stored in the `ImageTracker` MySQL database.
-- **Remote:** the exact original is stored once per user in private Amazon S3
-  and is available across the user's devices.
+Phase 1 currently implements the Local-mode data path: the CLI discovers a
+folder, extracts available metadata, computes an exact SHA-256 content hash,
+and sends metadata manifests to the authenticated API. MySQL stores one
+`MediaAsset` per user and exact hash while retaining a separate
+`MediaOccurrence` for every source path. Original Local-mode files remain on
+the source computer and are not uploaded to permanent S3 storage.
 
-The current repository contains the Phase 0 product foundation plus the legacy
-local photo importer. The approved architecture and delivery sequence are in
+The approved architecture and delivery sequence are in
 [the UX-first implementation plan](docs/ImageTracker%20App%20UX-First%20Implementation%20Plan.md).
+The current implementation and verification ledger is in
+[the Phase 1 status](docs/PHASE1_STATUS.md).
 
-## Phase 0 foundation
+## What works now
 
-- `contracts/v1/openapi.json`: versioned REST/JSON contract for native clients
-  and the CLI.
-- `services/api`: FastAPI health surface and AWS Lambda adapter.
-- `services/common`: shared configuration and public state values.
-- `cli/imagetracker_cli`: Typer/Rich CLI foundation.
-- `infra`: isolated low-cost AWS Serverless foundation.
-- `migrations/007_CreateMediaAppTables.sql`: additive PascalCase media schema;
-  the legacy `ImageAsset` table is not altered.
-- `apps/ios`, `apps/android`, and `apps/windows`: explicit native-client
-  boundaries for later delivery phases.
+- Cognito email/password sign-up, one-time email confirmation, login, session
+  status, token refresh, and logout.
+- Device registration and Local folder source creation, listing, update, and
+  removal.
+- Recursive photo and video discovery with exact filenames and local locators.
+- Streaming SHA-256 hashing, a local hash/metadata cache, and per-user exact
+  deduplication in MySQL.
+- EXIF photo metadata and GPS extraction; `ffprobe` adds available video
+  dimensions, duration, capture time, and embedded coordinates when installed.
+- Batched manifest upserts and explicit deletion events with durable local
+  outbox state, stable idempotency keys, and safe interruption recovery.
+- Authenticated change-feed, media timeline/search/detail, and processing-job
+  API surfaces.
+- Read-only legacy `ImageAsset` audit and paged migration preview.
 
-The Windows client will be a packaged native WinUI 3 app whose visual language
-is derived from Nektron Write and Nektron Mail. Generic template aesthetics are
-not considered finished product UI.
+Remote-mode upload and retrieval are not implemented yet. The CLI rejects
+`Remote` before changing a source or uploading anything. Reverse geocoding,
+AI captions, video-audio transcription, face recognition, and all other media
+enrichment are also deferred. The legacy migration command is preview-only;
+it never writes mappings or new media rows.
 
 ## Development setup
 
@@ -38,10 +48,20 @@ python -m venv .venv
 .venv/bin/python -m pip install -e ".[dev]"
 ```
 
-On Windows PowerShell, activate the environment using the normal Windows venv
-activation script and run the same `python -m pip` command.
+On Windows PowerShell:
 
-Run verification:
+```powershell
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -e ".[dev]"
+```
+
+Run the complete repository verification:
+
+```bash
+./scripts/play.sh check
+```
+
+Or run the components directly:
 
 ```bash
 python -m pytest -q
@@ -49,87 +69,152 @@ python contracts/validate_openapi.py
 imagetracker doctor --json
 ```
 
-The WSL shell toolkit wraps these commands and the safe deployed-resource
-checks:
+See [`scripts/README.md`](scripts/README.md) for the individual WSL shell
+wrappers and their safety boundaries. The toolkit contains no deployment,
+database migration, or legacy-importer command.
+
+## Configure the CLI
+
+The easiest setup uses AWS credentials already available to WSL and discovers
+the API and Cognito identifiers from the deployed CloudFormation stack:
 
 ```bash
-./scripts/play.sh help
-./scripts/play.sh check
-```
+imagetracker configure \
+  --stack image-tracker-prod \
+  --region us-east-2
 
-See [`scripts/README.md`](scripts/README.md) for individual commands and safety
-boundaries. The toolkit intentionally contains no deployment or importer
-command.
-
-Infrastructure remains independently packageable from `infra/`; see
-`infra/README.md`. Always validate the package before deployment, and configure
-each required SSM SecureString before enabling the feature that consumes it.
-Secret values must never be committed or included in deployment archives.
-
-## CLI foundation
-
-Phase 0 provides non-networking commands:
-
-```bash
-imagetracker version
 imagetracker doctor
-imagetracker doctor --json
 ```
 
-Upload, sync, media, job, and migration commands arrive in Phase 1 against the
-versioned API. User-facing CLI commands will not connect directly to MySQL.
+Add `--profile PROFILE` when the credentials are under a named AWS profile.
+For isolated development or automation, configuration may instead be supplied
+with `IMAGETRACKER_API_URL`, `IMAGETRACKER_AWS_REGION`,
+`IMAGETRACKER_COGNITO_USER_POOL_ID`, and
+`IMAGETRACKER_COGNITO_CLIENT_ID`. Set `IMAGETRACKER_CONFIG_DIR` to relocate
+the CLI configuration and SQLite state directory.
 
-## Legacy local importer
+## Create an account and sign in
 
-The root `ImageTracker.py` remains operational during the transition and keeps
-its existing behavior. It recursively scans a local folder, preserves exact
-filenames, extracts EXIF metadata, optionally enriches locations/captions, and
-upserts `ImageAsset`.
+Omit `--password` to use the private interactive prompt:
 
 ```bash
-python ImageTracker.py \
-  --directory "/mnt/d/Pictures/Camera Uploads" \
-  --cutoff-date "2026-01-01"
+imagetracker auth signup you@example.com
+imagetracker auth confirm you@example.com ONE_TIME_CODE
+imagetracker auth login you@example.com
+imagetracker auth status
 ```
 
-Force reprocessing remains available but should be used carefully:
+The session uses the operating-system credential vault when one is available,
+with a permission-restricted local credential file as the WSL fallback. To end
+the session:
 
 ```bash
-python ImageTracker.py \
-  --directory "/mnt/d/Pictures/Camera Uploads" \
-  --cutoff-date "2026-01-01" \
-  --force
+imagetracker auth logout
 ```
 
-Manual location tagging remains in the separate root utility:
+## Add and synchronize a Local source
+
+Register a folder once, then synchronize it by name, source ID, or local path:
 
 ```bash
-python tag_location.py --gps 40.0,-74.0 --category "Example" --dry-run
+imagetracker source add "/mnt/d/Pictures/Camera Uploads" \
+  --name "Camera Uploads"
+
+imagetracker source list
+imagetracker sync "Camera Uploads" --dry-run
+imagetracker sync "Camera Uploads"
+imagetracker status
 ```
 
-Useful tagging options are `--radius-meters`, `--dry-run`, and
-`--where-category-is-null`. Manual categories remain authoritative.
+`--dry-run` scans and hashes without sending a manifest. A normal sync saves
+manifest batches locally before sending them, so rerunning the command resumes
+unacknowledged work after a network failure or interruption. Unchanged files
+reuse the local hash/metadata cache. Deletions are emitted only after the
+scanner completes a reliable read of the whole source.
 
-## Configuration
+Useful operating commands:
 
-Copy `.env.example` only for legacy/local development and fill in values
-without committing `.env`. Prefer project-scoped MySQL names:
+```bash
+imagetracker sync "Camera Uploads" --watch
+imagetracker sync "Camera Uploads" --force-rehash
+imagetracker status --follow
+imagetracker source set-mode "Camera Uploads" Local
+imagetracker source remove "Camera Uploads"
+```
 
-- `IMAGETRACKER_MYSQL_HOST`
-- `IMAGETRACKER_MYSQL_PORT`
-- `IMAGETRACKER_MYSQL_USER`
-- `IMAGETRACKER_MYSQL_PASSWORD`
-- `IMAGETRACKER_MYSQL_DATABASE=ImageTracker`
+Local cache, source bindings, and manifest outbox state are isolated by the
+active Cognito account. If a manifest entry needs attention, the CLI
+quarantines that entry without replaying the same broken batch forever:
 
-The service foundation accepts only the `ImageTracker` database scope. Cloud
-credentials are represented by SSM parameter names rather than plaintext
-provider keys in repository configuration.
+```bash
+imagetracker outbox list
+imagetracker outbox discard BATCH_ID
+```
 
-Optional legacy enrichments still use:
+Discarding a failed batch releases its rejected revision so a later sync can
+submit it with a fresh idempotency key. A partial sync exits with code `5`.
+Use `--force-rehash` when file bytes may have changed while size and modified
+time were deliberately preserved.
 
-- `OPENAI_API_KEY` and `OPENAI_VISION_MODEL`
-- `GOOGLE_MAPS_API_KEY`
-- `LOCATION_NORMALIZATION_RULES_PATH`
+Browse the Local metadata visible on this device and inspect processing work:
+
+```bash
+imagetracker media list
+imagetracker media search "birthday"
+imagetracker media show MEDIA_ASSET_ID
+imagetracker jobs list
+imagetracker jobs retry JOB_ID
+```
+
+Use `--json` on configure, doctor, auth status, source add/list, sync, status,
+and legacy commands when scripting. `source remove` unregisters the source and
+does not delete files from disk.
+
+## Inspect legacy data safely
+
+The Phase 1 legacy commands connect only to the `ImageTracker` database and use
+read-only transactions. The recommended deployed configuration resolves the
+database credential from SSM without printing it:
+
+```bash
+export IMAGETRACKER_DB_SECRET_PARAMETER=/imagetracker/prod/mysql
+
+imagetracker legacy audit
+imagetracker legacy migrate --dry-run --limit 500
+imagetracker legacy migrate --dry-run --limit 500 --save-checkpoint
+imagetracker legacy migrate --dry-run --after-id 500 --limit 500
+```
+
+The preview reports the next legacy ID for the following batch. The optional
+checkpoint is local and preview-only; it never represents a MySQL migration
+write. Actual legacy migration writes remain disabled in this slice.
+`IMAGETRACKER_ADMIN_MYSQL_DSN`, `MYSQL_DSN`, or scoped `MYSQL_*`
+variables are supported for local administration, but the database name must
+resolve exactly to `ImageTracker`.
+
+The root `ImageTracker.py` importer remains available for its existing legacy
+workflow, but it is not called by the new CLI or shell playground. Its writes
+are separate from the Phase 1 legacy migration preview.
+
+## Architecture boundaries
+
+- `contracts/v1/openapi.json`: versioned REST/JSON contract for native clients
+  and the CLI.
+- `services/api`: FastAPI routes, Cognito claim boundary, problem responses,
+  and AWS Lambda adapter.
+- `services/domain` and `services/data`: transaction-scoped domain logic,
+  repositories, SQLAlchemy mappings, durable idempotency, and MySQL access.
+- `cli/imagetracker_cli`: configuration, authentication, Local scanner,
+  SQLite state/outbox, sync, status, and legacy inspection.
+- `infra`: isolated, low-cost AWS Serverless foundation.
+- `migrations/007_CreateMediaAppTables.sql` through the additive hardening
+  migrations: PascalCase media schema beside the unchanged legacy table.
+- `apps/ios`, `apps/android`, and `apps/windows`: native-client boundaries for
+  later delivery phases.
+
+The Windows client will be a packaged native WinUI 3 app whose visual identity
+is derived from Nektron Write and Nektron Mail. Product aesthetics and UX are
+release criteria, not a later polish pass.
 
 ## Compatibility invariants
 
@@ -138,6 +223,8 @@ Optional legacy enrichments still use:
 - Preserve PascalCase MySQL table and column names.
 - Keep `ImageAsset` readable and unchanged while the additive media model is
   introduced.
-- Use exact per-user SHA-256 deduplication in the new model; do not use path
-  hashes as durable content identity.
-- Do not upload Local-mode originals or previews to permanent S3 storage.
+- Use exact per-user SHA-256 deduplication; never use a path hash as durable
+  content identity.
+- Keep one occurrence per source path even when multiple paths contain the
+  same exact bytes.
+- Never upload Local-mode originals or previews to permanent S3 storage.

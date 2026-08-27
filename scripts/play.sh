@@ -6,13 +6,13 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
     cat <<'EOF'
-ImageTracker Phase 0 playground
+ImageTracker developer playground
 
 Usage: ./scripts/play.sh <command> [arguments]
 
 Commands:
   setup          Create/update the ignored Python environment
-  cli [args...]  Run CLI help/version/doctor or forward CLI arguments
+  cli [args...]  Run or forward ImageTracker CLI commands
   test           Run tests, contract validation, and pip checks
   api            Call the FastAPI health route in memory
   aws            Verify stack status and the protected HTTP boundary
@@ -21,7 +21,8 @@ Commands:
   check          Run cli doctor, tests, local API, AWS, and DB checks
   help           Show this help
 
-No command in this toolkit deploys AWS resources or runs the legacy importer.
+No command in this toolkit deploys AWS resources, applies database migrations,
+or runs the legacy importer.
 EOF
 }
 

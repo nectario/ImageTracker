@@ -1183,6 +1183,8 @@ class ExifGpsExtractor:
 
         if latitude is None or longitude is None:
             return None
+        if not (-90.0 <= latitude <= 90.0) or not (-180.0 <= longitude <= 180.0):
+            return None
 
         return GpsCoordinates(latitude=latitude, longitude=longitude, altitude=altitude)
 
@@ -1232,6 +1234,7 @@ class ExifCaptureDateTimeExtractor:
         self._tag_offset_time_original: Optional[int] = None
         self._tag_offset_time_digitized: Optional[int] = None
         self._tag_offset_time: Optional[int] = None
+        self._exif_ifd_tag_id: Optional[int] = None
 
         try:
             try:
@@ -1250,6 +1253,8 @@ class ExifCaptureDateTimeExtractor:
             self._tag_offset_time_original = self._tag_id_by_name(ExifTags, "OffsetTimeOriginal")
             self._tag_offset_time_digitized = self._tag_id_by_name(ExifTags, "OffsetTimeDigitized")
             self._tag_offset_time = self._tag_id_by_name(ExifTags, "OffsetTime")
+            ifd_type = getattr(ExifTags, "IFD", None)
+            self._exif_ifd_tag_id = int(getattr(ifd_type, "Exif", 34665))
             self._pil_available = self._tag_date_time_original is not None or self._tag_date_time is not None
         except Exception:
             self._pil_available = False
@@ -1271,53 +1276,61 @@ class ExifCaptureDateTimeExtractor:
         try:
             with self._image_module.open(io.BytesIO(content_bytes)) as image:
                 exif = image.getexif()
+                exif_ifd = self._load_exif_ifd(exif)
         except Exception:
             return None
 
         if not exif:
             return None
 
-        date_time_raw = self._first_exif_value(
-            exif,
-            (
-                self._tag_date_time_original,
-                self._tag_date_time_digitized,
-                self._tag_date_time,
-            ),
+        sources = tuple(source for source in (exif_ifd, exif) if source is not None)
+        candidates = (
+            (self._tag_date_time_original, self._tag_offset_time_original),
+            (self._tag_date_time_digitized, self._tag_offset_time_digitized),
+            (self._tag_date_time, self._tag_offset_time),
         )
-        local_datetime = _parse_exif_datetime(date_time_raw)
-        if not local_datetime:
+        for date_tag_id, offset_tag_id in candidates:
+            if date_tag_id is None:
+                continue
+            for source in sources:
+                local_datetime = _parse_exif_datetime(source.get(date_tag_id))
+                if local_datetime is None:
+                    continue
+
+                offset_raw = source.get(offset_tag_id) if offset_tag_id is not None else None
+                if offset_raw is None and offset_tag_id is not None:
+                    offset_raw = self._first_exif_value(sources, offset_tag_id)
+                utc_offset_minutes = _parse_utc_offset_minutes(offset_raw)
+                time_zone = _format_utc_offset(utc_offset_minutes)
+                utc_datetime = (
+                    local_datetime - timedelta(minutes=utc_offset_minutes)
+                    if utc_offset_minutes is not None
+                    else None
+                )
+                return CaptureDateTimeInfo(
+                    local_datetime=local_datetime,
+                    time_zone=time_zone,
+                    utc_offset_minutes=utc_offset_minutes,
+                    utc_datetime=utc_datetime,
+                )
+        return None
+
+    def _load_exif_ifd(self, exif: Any) -> Optional[Any]:
+        if self._exif_ifd_tag_id is None:
             return None
-
-        offset_raw = self._first_exif_value(
-            exif,
-            (
-                self._tag_offset_time_original,
-                self._tag_offset_time_digitized,
-                self._tag_offset_time,
-            ),
-        )
-        utc_offset_minutes = _parse_utc_offset_minutes(offset_raw)
-        time_zone = _format_utc_offset(utc_offset_minutes) if utc_offset_minutes is not None else None
-        utc_datetime = (
-            local_datetime - timedelta(minutes=utc_offset_minutes)
-            if utc_offset_minutes is not None
-            else None
-        )
-
-        return CaptureDateTimeInfo(
-            local_datetime=local_datetime,
-            time_zone=time_zone,
-            utc_offset_minutes=utc_offset_minutes,
-            utc_datetime=utc_datetime,
-        )
+        get_ifd = getattr(exif, "get_ifd", None)
+        if not callable(get_ifd):
+            return None
+        try:
+            result = get_ifd(self._exif_ifd_tag_id)
+        except Exception:
+            return None
+        return result if hasattr(result, "get") else None
 
     @staticmethod
-    def _first_exif_value(exif: Any, tag_ids: tuple[Optional[int], ...]) -> Any:
-        for tag_id in tag_ids:
-            if tag_id is None:
-                continue
-            value = exif.get(tag_id)
+    def _first_exif_value(sources: tuple[Any, ...], tag_id: int) -> Any:
+        for source in sources:
+            value = source.get(tag_id)
             if value is not None:
                 return value
         return None
@@ -1417,6 +1430,8 @@ def _parse_utc_offset_minutes(value: Any) -> Optional[int]:
     sign = -1 if match.group(1) == "-" else 1
     hours = int(match.group(2))
     minutes = int(match.group(3))
+    if hours > 14 or minutes > 59 or (hours == 14 and minutes != 0):
+        return None
     return sign * (hours * 60 + minutes)
 
 
@@ -1431,9 +1446,18 @@ def _format_utc_offset(offset_minutes: Optional[int]) -> Optional[str]:
     return f"UTC{sign}{hours:02d}:{minutes:02d}"
 
 
+def _get_local_timezone():
+    try:
+        from tzlocal import get_localzone
+
+        return get_localzone()
+    except Exception:
+        return datetime.now().astimezone().tzinfo
+
+
 def _derive_local_capture_datetime(fallback_utc: datetime) -> CaptureDateTimeInfo:
     aware_utc = fallback_utc.replace(tzinfo=timezone.utc)
-    local_tz = datetime.now().astimezone().tzinfo
+    local_tz = _get_local_timezone()
     aware_local = aware_utc.astimezone(local_tz)
     local_datetime = aware_local.replace(tzinfo=None)
 
@@ -1467,13 +1491,13 @@ def parse_cutoff_date(value: str) -> datetime:
     if len(text) == 10:
         local_date = date.fromisoformat(text)
         local_datetime = datetime.combine(local_date, time.min)
-        local_tz = datetime.now().astimezone().tzinfo
+        local_tz = _get_local_timezone()
         aware_local = local_datetime.replace(tzinfo=local_tz)
         return aware_local.astimezone(timezone.utc).replace(tzinfo=None)
 
     parsed = datetime.fromisoformat(text)
     if parsed.tzinfo is None:
-        local_tz = datetime.now().astimezone().tzinfo
+        local_tz = _get_local_timezone()
         parsed = parsed.replace(tzinfo=local_tz)
 
     return parsed.astimezone(timezone.utc).replace(tzinfo=None)
@@ -1694,8 +1718,8 @@ class LocalPhotoSyncService:
                     time_value=capture_date_time.local_datetime.time().replace(microsecond=0),
                     time_zone=capture_date_time.time_zone,
                     utc_offset_minutes=capture_date_time.utc_offset_minutes,
-                    date_time_utc=capture_date_time.utc_datetime or file_modified_utc,
-                    taken_datetime_utc=capture_date_time.utc_datetime or file_modified_utc,
+                    date_time_utc=capture_date_time.utc_datetime,
+                    taken_datetime_utc=capture_date_time.utc_datetime,
                     latitude=latitude,
                     longitude=longitude,
                     altitude=altitude,
@@ -1831,16 +1855,13 @@ class LocalPhotoSyncService:
             resolved_offset = extracted.utc_offset_minutes
             resolved_tz = extracted.time_zone or _format_utc_offset(resolved_offset)
             resolved_utc = extracted.utc_datetime
-            if resolved_utc is None:
-                resolved_utc = (
-                    self._as_datetime(existing, "DateTimeUtc")
-                    if existing
-                    else None
-                ) or (
-                    self._as_datetime(existing, "TakenDateTimeUtc")
-                    if existing
-                    else None
-                ) or fallback_utc
+            if resolved_offset is None and existing:
+                resolved_offset = self._as_int(existing, "UtcOffsetMinutes")
+                resolved_tz = self._as_text(existing, "TimeZone") or _format_utc_offset(
+                    resolved_offset
+                )
+            if resolved_utc is None and resolved_offset is not None:
+                resolved_utc = extracted.local_datetime - timedelta(minutes=resolved_offset)
 
             return CaptureDateTimeInfo(
                 local_datetime=extracted.local_datetime,
@@ -1852,13 +1873,18 @@ class LocalPhotoSyncService:
         if existing:
             existing_local = self._as_datetime(existing, "DateTime")
             if existing_local:
+                existing_offset = self._as_int(existing, "UtcOffsetMinutes")
+                existing_utc = self._as_datetime(existing, "DateTimeUtc") or self._as_datetime(
+                    existing,
+                    "TakenDateTimeUtc",
+                )
+                if existing_utc is None and existing_offset is not None:
+                    existing_utc = existing_local - timedelta(minutes=existing_offset)
                 return CaptureDateTimeInfo(
                     local_datetime=existing_local,
                     time_zone=self._as_text(existing, "TimeZone"),
-                    utc_offset_minutes=self._as_int(existing, "UtcOffsetMinutes"),
-                    utc_datetime=self._as_datetime(existing, "DateTimeUtc")
-                    or self._as_datetime(existing, "TakenDateTimeUtc")
-                    or fallback_utc,
+                    utc_offset_minutes=existing_offset,
+                    utc_datetime=existing_utc,
                 )
 
         return _derive_local_capture_datetime(fallback_utc)
@@ -1870,17 +1896,25 @@ class LocalPhotoSyncService:
         latitude: Optional[float],
         longitude: Optional[float],
     ) -> tuple[CaptureDateTimeInfo, bool]:
-        if capture.time_zone and capture.utc_offset_minutes is not None:
-            return capture, False
-        if capture.utc_datetime is None:
-            return capture, False
+        if capture.utc_offset_minutes is not None:
+            corrected_utc = capture.local_datetime - timedelta(
+                minutes=capture.utc_offset_minutes
+            )
+            if capture.time_zone:
+                return CaptureDateTimeInfo(
+                    local_datetime=capture.local_datetime,
+                    time_zone=capture.time_zone,
+                    utc_offset_minutes=capture.utc_offset_minutes,
+                    utc_datetime=corrected_utc,
+                ), False
         if latitude is None or longitude is None:
             return capture, False
 
+        timestamp_hint = capture.utc_datetime or capture.local_datetime
         timezone_resolution = self._resolve_timezone(
             latitude=latitude,
             longitude=longitude,
-            timestamp_utc=capture.utc_datetime,
+            timestamp_utc=timestamp_hint,
         )
         if not timezone_resolution:
             return capture, False
@@ -1889,7 +1923,8 @@ class LocalPhotoSyncService:
             local_datetime=capture.local_datetime,
             time_zone=timezone_resolution.time_zone_id,
             utc_offset_minutes=timezone_resolution.utc_offset_minutes,
-            utc_datetime=capture.utc_datetime,
+            utc_datetime=capture.local_datetime
+            - timedelta(minutes=timezone_resolution.utc_offset_minutes),
         )
         return updated, True
 

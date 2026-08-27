@@ -4,6 +4,9 @@ import json
 from asyncio import run
 from datetime import datetime
 from pathlib import Path
+import subprocess
+import sys
+import zipfile
 
 import httpx
 import pytest
@@ -42,7 +45,7 @@ def test_health_endpoint_is_stable_and_does_not_require_secrets():
     payload = response.json()
     assert payload["status"] == "Ok"
     assert payload["service"] == "imagetracker-api"
-    assert payload["version"] == "0.2.0"
+    assert payload["version"] == "0.3.0"
     assert set(payload) == {"status", "service", "version", "timeUtc"}
     assert datetime.fromisoformat(payload["timeUtc"].replace("Z", "+00:00")).tzinfo is not None
 
@@ -97,3 +100,51 @@ def test_cli_doctor_json_is_non_secret(monkeypatch):
     assert payload["api_configured"] is True
     assert "must-not-appear" not in result.stdout
     get_settings.cache_clear()
+
+
+def test_lambda_packaging_keeps_runtime_files_at_archive_root():
+    root = Path(__file__).resolve().parents[1]
+    package = json.loads((root / "infra" / "package.json").read_text(encoding="utf-8"))
+    assert "--package .build/.serverless" in package["scripts"]["package"]
+    deploy_script = package["scripts"]["deploy"]
+    assert "serverless package" in deploy_script
+    assert "validate_foundation.py" in deploy_script
+    assert "deploy_packaged.py" in deploy_script
+    assert deploy_script.count("--package .build/.serverless") == 1
+
+    deploy_helper = (root / "infra" / "scripts" / "deploy_packaged.py").read_text(
+        encoding="utf-8"
+    )
+    assert "str(CONFIG_PATH.resolve())" in deploy_helper
+    assert "str(PACKAGE_ROOT.resolve())" in deploy_helper
+
+    validator = (root / "infra" / "scripts" / "validate_foundation.py").read_text(
+        encoding="utf-8"
+    )
+    assert '"services/api/handler.py"' in validator
+    assert '"services/data/certs/us-east-2-bundle.pem"' in validator
+    assert 'name.startswith(".build/")' in validator
+
+
+def test_python_wheel_includes_the_rds_trust_bundle(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "wheel",
+            "--no-deps",
+            "--no-build-isolation",
+            "--wheel-dir",
+            str(tmp_path),
+            str(root),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    wheels = list(tmp_path.glob("imagetracker-*.whl"))
+    assert len(wheels) == 1
+    with zipfile.ZipFile(wheels[0]) as archive:
+        assert "services/data/certs/us-east-2-bundle.pem" in archive.namelist()

@@ -13,6 +13,7 @@ import pytest
 from ImageTracker import (
     CaptionResult,
     CaptureDateTimeInfo,
+    ExifCaptureDateTimeExtractor,
     ExifGpsExtractor,
     GpsCoordinates,
     LocationNormalizationRule,
@@ -21,6 +22,7 @@ from ImageTracker import (
     Settings,
     TimeZoneResolution,
     _drive_item_id_for_path,
+    _parse_utc_offset_minutes,
     load_location_normalization_rules,
     parse_cutoff_date,
 )
@@ -359,6 +361,20 @@ def set_file_mtime(path: Path, dt_utc: datetime) -> None:
 def test_parse_cutoff_date_accepts_date_only():
     cutoff = parse_cutoff_date("2026-02-01")
     assert isinstance(cutoff, datetime)
+
+
+def test_parse_cutoff_date_uses_historical_dst_offset(monkeypatch):
+    from zoneinfo import ZoneInfo
+    import ImageTracker as image_tracker_module
+
+    monkeypatch.setattr(
+        image_tracker_module,
+        "_get_local_timezone",
+        lambda: ZoneInfo("America/New_York"),
+    )
+
+    assert parse_cutoff_date("2026-02-01") == datetime(2026, 2, 1, 5, 0, 0)
+    assert parse_cutoff_date("2026-07-01") == datetime(2026, 7, 1, 4, 0, 0)
 
 
 def test_load_location_normalization_rules_from_json(tmp_path: Path):
@@ -711,6 +727,67 @@ def test_timezone_enrichment_runs_for_gps_rows_when_capture_offset_missing(tmp_p
     assert payload.time_zone == "America/New_York"
     assert payload.utc_offset_minutes == -300
     assert payload.date_time_utc == datetime(2026, 2, 23, 22, 45, 42)
+
+
+def test_timezone_enrichment_derives_utc_from_local_time_when_exif_has_no_offset(tmp_path: Path):
+    photo = tmp_path / "IMG_9011.JPG"
+    cutoff_utc = datetime(2026, 2, 20, 0, 0, 0)
+    set_file_mtime(photo, cutoff_utc + timedelta(days=90))
+
+    service, image_repo = build_service(
+        gps_extractor=FakeGpsExtractor(
+            GpsCoordinates(latitude=40.7, longitude=-74.0, altitude=None)
+        ),
+        capture_datetime_extractor=FakeCaptureDateTimeExtractor(
+            CaptureDateTimeInfo(
+                local_datetime=datetime(2026, 2, 23, 17, 45, 42),
+                time_zone=None,
+                utc_offset_minutes=None,
+                utc_datetime=None,
+            )
+        ),
+        time_zone_resolver=FakeTimeZoneResolver(
+            TimeZoneResolution(time_zone_id="America/New_York", utc_offset_minutes=-300)
+        ),
+    )
+
+    result = service.run_sync(directory=tmp_path, cutoff_utc=cutoff_utc, force=False)
+
+    assert result.timezone_enriched_count == 1
+    payload = image_repo.upserts[0]
+    assert payload.date_time == datetime(2026, 2, 23, 17, 45, 42)
+    assert payload.date_time_utc == datetime(2026, 2, 23, 22, 45, 42)
+    assert payload.date_time_utc != datetime(2026, 5, 21, 0, 0, 0)
+
+
+def test_exif_capture_datetime_reads_standard_exif_sub_ifd():
+    from PIL import ExifTags, Image
+    import io
+
+    image = Image.new("RGB", (2, 2))
+    exif = Image.Exif()
+    exif_ifd = exif.get_ifd(ExifTags.IFD.Exif)
+    exif_ifd[36867] = "2026:02:23 17:45:42"
+    exif_ifd[36881] = "-05:00"
+    exif[ExifTags.Base.ExifOffset] = exif_ifd
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", exif=exif)
+
+    result = ExifCaptureDateTimeExtractor().extract(
+        buffer.getvalue(),
+        mime_type="image/jpeg",
+        file_name="nested-exif.jpg",
+    )
+
+    assert result is not None
+    assert result.local_datetime == datetime(2026, 2, 23, 17, 45, 42)
+    assert result.utc_offset_minutes == -300
+    assert result.utc_datetime == datetime(2026, 2, 23, 22, 45, 42)
+
+
+@pytest.mark.parametrize("value", ["+14:01", "+15:00", "-99:00", "+05:60"])
+def test_exif_utc_offset_rejects_impossible_values(value: str):
+    assert _parse_utc_offset_minutes(value) is None
 
 
 def test_exif_gps_extractor_reads_gps_ifd_when_gpsinfo_is_offset():

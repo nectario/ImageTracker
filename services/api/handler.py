@@ -11,6 +11,6 @@ _adapter = Mangum(app, lifespan="off")
 
 
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
-    """AWS Lambda entry point used by the Phase 0 serverless stack."""
+    """AWS Lambda entry point for the ImageTracker HTTP API."""
 
     return _adapter(event, context)
