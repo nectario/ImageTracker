@@ -22,6 +22,8 @@ REQUIRED_MARKERS = {
     "device context CORS header": "- X-ImageTracker-Device-Id",
     "Cognito user pool": "Type: AWS::Cognito::UserPool",
     "case-insensitive email sign-in": "CaseSensitive: false",
+    "verified custom email sender": "From: ImageTracker <info@nektron.ai>",
+    "Cognito developer email delivery": "EmailSendingAccount: DEVELOPER",
     "Cognito JWT authorizer": "type: jwt",
     "private media bucket": "PublicAccessBlockConfiguration:",
     "SSE-S3": "SSEAlgorithm: AES256",
@@ -94,6 +96,17 @@ def _validate_packaged_template(path: Path) -> list[str]:
     user_pool = resources.get("ImageTrackerUserPoolV2", {}).get("Properties", {})
     if user_pool.get("UsernameConfiguration", {}).get("CaseSensitive") is not False:
         failures.append("Cognito email usernames must be case-insensitive")
+    email_configuration = user_pool.get("EmailConfiguration", {})
+    if email_configuration.get("EmailSendingAccount") != "DEVELOPER":
+        failures.append("Cognito must use the verified Amazon SES sender")
+    if email_configuration.get("From") != "ImageTracker <info@nektron.ai>":
+        failures.append("Cognito From address is not ImageTracker <info@nektron.ai>")
+    if email_configuration.get("ReplyToEmailAddress") != "info@nektron.ai":
+        failures.append("Cognito Reply-To address is not info@nektron.ai")
+    if "identity/info@nektron.ai" not in json.dumps(
+        email_configuration.get("SourceArn")
+    ):
+        failures.append("Cognito SES SourceArn is not scoped to info@nektron.ai")
 
     for logical_id in (
         "RetrySchedule",

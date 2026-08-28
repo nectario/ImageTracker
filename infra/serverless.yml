@@ -210,6 +210,20 @@ resources:
             AttributeDataType: String
             Mutable: true
             Required: true
+        EmailConfiguration:
+          EmailSendingAccount: DEVELOPER
+          From: ImageTracker <info@nektron.ai>
+          ReplyToEmailAddress: info@nektron.ai
+          SourceArn:
+            Fn::Join:
+              - ''
+              - - 'arn:'
+                - Ref: AWS::Partition
+                - ':ses:'
+                - Ref: AWS::Region
+                - ':'
+                - Ref: AWS::AccountId
+                - ':identity/info@nektron.ai'
         VerificationMessageTemplate:
           DefaultEmailOption: CONFIRM_WITH_CODE
           EmailSubject: Your ImageTracker verification code

@@ -19,7 +19,8 @@ The current implementation and verification ledger is in
 ## What works now
 
 - Cognito email/password sign-up, one-time email confirmation, login, session
-  status, token refresh, and logout.
+  status, token refresh, and logout. Verification messages are sent as
+  `ImageTracker <info@nektron.ai>`.
 - Device registration and Local folder source creation, listing, update, and
   removal.
 - Recursive photo and video discovery with exact filenames and local locators.

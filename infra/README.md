@@ -9,7 +9,8 @@ Nothing here deploys automatically.
 - A Python 3.12 Lambda behind an API Gateway HTTP API. `GET /v1/health` is
   protected by the Cognito JWT authorizer.
 - A Cognito email/password user pool and public native-app client. MFA is off;
-  email confirmation uses one code and refresh tokens last 365 days.
+  email confirmation uses one code, refresh tokens last 365 days, and messages
+  are sent through the verified SES identity `ImageTracker <info@nektron.ai>`.
 - One private, SSE-S3 media bucket. Incomplete multipart uploads expire after
   seven days, Local-mode staging objects after one day, and trash after 30 days.
   Remote originals transition to S3 Intelligent-Tiering.
