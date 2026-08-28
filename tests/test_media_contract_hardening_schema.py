@@ -56,3 +56,25 @@ def test_legacy_map_foreign_keys_include_user_ownership():
     assert "ADD CONSTRAINT `Fk_LegacyImageAssetMap_User_MediaAsset`" in sql
     assert "ADD CONSTRAINT `Fk_LegacyImageAssetMap_User_MediaOccurrence`" in sql
     assert "ALGORITHM=COPY" in sql
+
+
+def test_provider_circuit_is_an_atomic_additive_migration():
+    sql = _migration("012_AddProviderCircuit.sql")
+    statements = _split_sql_statements(sql)
+
+    assert len(statements) == 1
+    assert "`CircuitState` VARCHAR(16) NOT NULL DEFAULT 'Closed'" in sql
+    assert "`CircuitOpenedAtUtc` DATETIME(6) NULL" in sql
+    assert "`CircuitFailureCode` VARCHAR(64) NULL" in sql
+    assert "ALGORITHM=INSTANT" in sql
+
+
+def test_international_address_capacity_is_an_atomic_migration():
+    sql = _migration("013_WidenLocationProviderFields.sql")
+
+    assert len(_split_sql_statements(sql)) == 1
+    assert "`ProviderPlaceId` VARCHAR(500) NULL" in sql
+    assert "`PostalCode` VARCHAR(50) NULL" in sql
+    # Crossing VARCHAR(255) can change the length-byte representation; COPY is
+    # the portable MySQL algorithm, and this new table is empty before rollout.
+    assert "ALGORITHM=COPY" in sql

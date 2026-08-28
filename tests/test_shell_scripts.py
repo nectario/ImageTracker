@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -15,6 +16,8 @@ EXPECTED_SCRIPTS = {
     "package-infra.sh",
     "play.sh",
     "setup.sh",
+    "store-openai-key.sh",
+    "migrate-db.sh",
     "test.sh",
 }
 
@@ -27,10 +30,8 @@ def test_shell_scripts_parse_as_bash():
         subprocess.run(["bash", "-n", str(path)], check=True)
 
 
-def test_playground_has_no_deploy_or_importer_execution_path():
-    executable_text = "\n".join(
-        path.read_text(encoding="utf-8") for path in SCRIPTS.glob("*.sh")
-    )
+def test_playground_has_no_deploy_migration_or_importer_execution_path():
+    executable_text = (SCRIPTS / "play.sh").read_text(encoding="utf-8")
 
     assert "serverless deploy" not in executable_text
     assert "npm run deploy" not in executable_text
@@ -47,5 +48,35 @@ def test_playground_help_is_available_without_environment_setup():
     )
 
     assert "ImageTracker developer playground" in result.stdout
-    assert "No command in this toolkit deploys AWS resources" in result.stdout
-    assert "applies database migrations" in result.stdout
+    assert "No `play.sh` command" in result.stdout
+    assert "excluded from this playground" in result.stdout
+
+
+def test_migration_wrapper_is_explicit_and_never_runs_legacy_importer():
+    text = (SCRIPTS / "migrate-db.sh").read_text(encoding="utf-8")
+    assert "migrate_enrichment.py" in text
+    assert '"$@"' in text
+    assert "ImageTracker.py" not in text
+
+
+def test_store_openai_key_updates_env_without_printing_secret(tmp_path: Path):
+    env_file = tmp_path / ".env"
+    env_file.write_text("EXISTING=value\nOPENAI_API_KEY=old\n", encoding="utf-8")
+    secret = "sk-test-must-not-appear"
+    result = subprocess.run(
+        ["bash", str(SCRIPTS / "store-openai-key.sh")],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "OPENAI_API_KEY": secret,
+            "IMAGETRACKER_ENV_FILE": str(env_file),
+        },
+    )
+
+    assert secret not in result.stdout
+    assert secret not in result.stderr
+    assert env_file.read_text(encoding="utf-8") == (
+        f"EXISTING=value\nOPENAI_API_KEY={secret}\n"
+    )

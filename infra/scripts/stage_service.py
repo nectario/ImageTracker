@@ -1,4 +1,4 @@
-"""Stage the shared ImageTracker API beside the Serverless configuration.
+"""Stage the shared ImageTracker services beside the Serverless configuration.
 
 Serverless Framework resolves handler paths relative to the service directory.
 The application code remains owned by ``services``; this script creates an
@@ -20,6 +20,8 @@ INFRA_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_ROOT = INFRA_ROOT.parent
 SERVICES_ROOT = REPOSITORY_ROOT / "services"
 API_SOURCE_ROOT = SERVICES_ROOT / "api"
+WORKER_SOURCE_ROOT = SERVICES_ROOT / "worker"
+NORMALIZATION_RULES_PATH = REPOSITORY_ROOT / "location_normalization_rules.json"
 BUILD_ROOT = INFRA_ROOT / ".build"
 
 
@@ -27,20 +29,29 @@ def _validate_paths() -> None:
     if BUILD_ROOT.resolve().parent != INFRA_ROOT.resolve() or BUILD_ROOT.name != ".build":
         raise RuntimeError(f"Unsafe build directory: {BUILD_ROOT}")
 
-    handler_path = API_SOURCE_ROOT / "handler.py"
-    if not handler_path.is_file():
-        raise FileNotFoundError(
-            f"Shared API handler not found at {handler_path}. "
-            "Create services/api before packaging the infrastructure."
-        )
-
-    tree = ast.parse(handler_path.read_text(encoding="utf-8"), filename=str(handler_path))
-    exports_handler = any(
-        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "handler"
-        for node in tree.body
+    handler_paths = (
+        API_SOURCE_ROOT / "handler.py",
+        WORKER_SOURCE_ROOT / "handler.py",
     )
-    if not exports_handler:
-        raise ValueError(f"{handler_path} must export handler(event, context)")
+    for handler_path in handler_paths:
+        if not handler_path.is_file():
+            raise FileNotFoundError(
+                f"Shared Lambda handler not found at {handler_path}. "
+                "Create the services/api and services/worker handlers before packaging."
+            )
+
+        tree = ast.parse(handler_path.read_text(encoding="utf-8"), filename=str(handler_path))
+        exports_handler = any(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "handler"
+            for node in tree.body
+        )
+        if not exports_handler:
+            raise ValueError(f"{handler_path} must export handler(event, context)")
+
+    if not NORMALIZATION_RULES_PATH.is_file():
+        raise FileNotFoundError(
+            f"Location normalization rules not found at {NORMALIZATION_RULES_PATH}."
+        )
 
     requirements_path = API_SOURCE_ROOT / "requirements.txt"
     if not requirements_path.is_file():
@@ -75,6 +86,10 @@ def _replace_build_tree() -> None:
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache"),
     )
     shutil.copy2(INFRA_ROOT / "serverless.yml", BUILD_ROOT / "serverless.yml")
+    shutil.copy2(
+        NORMALIZATION_RULES_PATH,
+        BUILD_ROOT / NORMALIZATION_RULES_PATH.name,
+    )
 
 
 def _install_runtime_dependencies() -> None:

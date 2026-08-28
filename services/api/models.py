@@ -134,6 +134,36 @@ class ProcessingJobType(StringEnum):
     LEGACY_MIGRATION = "LegacyMigration"
 
 
+class UploadPurpose(StringEnum):
+    ORIGINAL = "Original"
+    PREVIEW = "Preview"
+    TEMPORARY_PROCESSING = "TemporaryProcessing"
+
+
+class UploadDisposition(StringEnum):
+    UPLOAD_REQUIRED = "UploadRequired"
+    ALREADY_STORED = "AlreadyStored"
+    LOCAL_ONLY = "LocalOnly"
+    LEASE_HELD = "LeaseHeld"
+    DEFERRED = "Deferred"
+
+
+class UploadStrategy(StringEnum):
+    NONE = "None"
+    SINGLE_PART = "SinglePart"
+    MULTIPART = "Multipart"
+
+
+class UploadSessionStatusValue(StringEnum):
+    PREPARING = "Preparing"
+    UPLOADING = "Uploading"
+    COMPLETING = "Completing"
+    COMPLETED = "Completed"
+    CANCELLED = "Cancelled"
+    EXPIRED = "Expired"
+    FAILED = "Failed"
+
+
 class FailureClass(StringEnum):
     TRANSIENT = "Transient"
     AUTHENTICATION = "Authentication"
@@ -360,6 +390,7 @@ class ManifestEntryResult(ApiModel):
     occurrence_id: UUID | None = None
     media_asset_id: UUID | None = None
     upload_required: bool
+    description_job_id: UUID | None = None
     error_code: str | None = None
     error_message: str | None = None
 
@@ -382,6 +413,100 @@ class ManifestResponse(ApiModel):
     results: list[ManifestEntryResult]
 
 
+class UploadPlanRequest(ApiModel):
+    source_id: UUID
+    occurrence_id: UUID
+    asset_content_sha256: str = Field(pattern=r"^[A-Fa-f0-9]{64}$")
+    object_sha256: str = Field(pattern=r"^[A-Fa-f0-9]{64}$")
+    file_name: str = Field(min_length=1, max_length=512)
+    media_type: MediaType
+    object_mime_type: str = Field(min_length=1, max_length=255)
+    object_byte_size: int = Field(ge=1)
+    purpose: UploadPurpose
+    processing_job_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def require_temporary_job(self) -> "UploadPlanRequest":
+        if (
+            self.purpose == UploadPurpose.TEMPORARY_PROCESSING
+            and self.processing_job_id is None
+        ):
+            raise ValueError("processingJobId is required for TemporaryProcessing")
+        return self
+
+
+class SignedUploadRequest(ApiModel):
+    url: str
+    method: Literal["PUT"]
+    headers: dict[str, str]
+    expires_at_utc: datetime
+
+
+class MultipartUploadPlan(ApiModel):
+    provider_upload_id: str
+    part_size_bytes: int = Field(ge=5_242_880)
+    checksum_algorithm: Literal["SHA256"]
+    checksum_type: Literal["COMPOSITE"]
+
+
+class UploadPlan(ApiModel):
+    disposition: UploadDisposition
+    strategy: UploadStrategy
+    media_asset_id: UUID
+    occurrence_id: UUID
+    upload_session_id: UUID | None = None
+    expires_at_utc: datetime | None = None
+    deduplicated: bool
+    retry_after_seconds: int | None = Field(default=None, ge=1)
+    single_part: SignedUploadRequest | None = None
+    multipart: MultipartUploadPlan | None = None
+
+
+class CompletedUploadPart(ApiModel):
+    part_number: int = Field(ge=1, le=10_000)
+    etag: str = Field(min_length=1, max_length=255)
+    checksum_sha256: str = Field(
+        min_length=44, max_length=44, pattern=r"^[A-Za-z0-9+/]{43}=$"
+    )
+
+
+class UploadSessionStatus(ApiModel):
+    upload_session_id: UUID
+    strategy: UploadStrategy
+    status: UploadSessionStatusValue
+    expected_byte_size: int = Field(ge=1)
+    uploaded_byte_size: int = Field(ge=0)
+    uploaded_parts: list[CompletedUploadPart]
+    expires_at_utc: datetime | None = None
+
+
+class UploadPartChecksum(ApiModel):
+    part_number: int = Field(ge=1, le=10_000)
+    checksum_sha256: str = Field(
+        min_length=44, max_length=44, pattern=r"^[A-Za-z0-9+/]{43}=$"
+    )
+
+
+class UploadPartSigningRequest(ApiModel):
+    parts: list[UploadPartChecksum] = Field(min_length=1, max_length=100)
+
+
+class UploadCompleteRequest(ApiModel):
+    object_sha256: str = Field(pattern=r"^[A-Fa-f0-9]{64}$")
+    etag: str | None = Field(default=None, max_length=255)
+    parts: list[CompletedUploadPart] = Field(default_factory=list)
+
+
+class UploadCancelRequest(ApiModel):
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class UploadCompleteResponse(ApiModel):
+    media_asset_id: UUID
+    storage_state: StorageState
+    processing_jobs: list[UUID]
+
+
 class TemporalMetadata(ApiModel):
     captured_at_local: str | None = None
     captured_at_utc: datetime | None = None
@@ -395,9 +520,15 @@ class LocationSummary(ApiModel):
     latitude: float | None = Field(default=None, ge=-90, le=90)
     longitude: float | None = Field(default=None, ge=-180, le=180)
     display_name: str | None = None
+    street_address: str | None = None
+    neighborhood: str | None = None
     city: str | None = None
+    county: str | None = None
     state: str | None = None
+    postal_code: str | None = None
+    country: str | None = None
     country_code: str | None = Field(default=None, min_length=2, max_length=2)
+    provider: str | None = None
 
 
 class MediaAssetSummary(ApiModel):
@@ -464,6 +595,7 @@ class MediaLocation(ApiModel):
     horizontal_accuracy_meters: float | None = Field(default=None, ge=0)
     display_name: str | None = None
     street_address: str | None = None
+    original_street_number: str | None = None
     neighborhood: str | None = None
     city: str | None = None
     county: str | None = None
@@ -471,6 +603,10 @@ class MediaLocation(ApiModel):
     postal_code: str | None = None
     country: str | None = None
     country_code: str | None = Field(default=None, min_length=2, max_length=2)
+    provider: str | None = None
+    provider_place_id: str | None = None
+    normalization_rule_version: str | None = None
+    provider_updated_at_utc: datetime | None = None
     provenance: list[FieldProvenance]
 
 
@@ -537,6 +673,15 @@ class ProcessingJob(ApiModel):
     started_at_utc: datetime | None = None
     completed_at_utc: datetime | None = None
     updated_at_utc: datetime
+
+
+class JobCancelRequest(ApiModel):
+    reason: Literal[
+        "UnsupportedPhoto",
+        "SourceUnavailable",
+        "SourceChanged",
+        "UserSkipped",
+    ]
 
 
 class ProcessingJobPage(ApiModel):

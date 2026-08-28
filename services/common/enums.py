@@ -54,6 +54,7 @@ class EnrichmentStatus(_StringEnum):
 
 
 class ProcessingJobStatus(_StringEnum):
+    PREPARING = "Preparing"
     QUEUED = "Queued"
     RUNNING = "Running"
     SUCCEEDED = "Succeeded"

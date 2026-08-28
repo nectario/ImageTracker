@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+from copy import deepcopy
+import base64
 from dataclasses import fields, is_dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+import hashlib
+import logging
 import re
 from typing import Any, Callable, Mapping, Sequence, TypeVar
+from urllib.parse import urlsplit
 from uuid import UUID
+from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from services.data.database import transaction_scope
@@ -21,6 +28,7 @@ from services.data.models import (
     MediaTranscript,
     MediaTranscriptSegment,
     ProcessingJob,
+    UploadSession,
     UserAccount,
     utc_now,
 )
@@ -39,6 +47,7 @@ from services.domain.models import (
     DeviceRecord,
     DeviceRegistration,
     FieldProvenance,
+    JobDispatcher,
     JobQuery,
     JobRecord,
     ManifestCommand,
@@ -61,9 +70,30 @@ from services.domain.models import (
     SourceRecord,
     SourceUpdate,
     SyncSettings,
+    SignedUploadRequestRecord,
+    TemporaryObjectStore,
     TranscriptRecord,
     TranscriptSegmentRecord,
+    UploadCompleteCommand,
+    UploadCompleteRecord,
+    UploadPlanCommand,
+    UploadPlanRecord,
+    UploadSessionRecord,
     UserRecord,
+)
+from services.enrichment.models import (
+    AMAZON_LOCATION_PROVIDER,
+    GeocodeResolution,
+    ProviderFailureClass,
+    ReverseGeocodeResult,
+)
+from services.enrichment.normalization import (
+    LocationNormalizationRuleset,
+    LocationNormalizer,
+)
+from services.enrichment.openai_scene import (
+    SCENE_DESCRIPTION_PROMPT_VERSION,
+    SceneDescriptionResult,
 )
 from services.domain.repositories import (
     AccountRepository,
@@ -72,13 +102,49 @@ from services.domain.repositories import (
     DeviceRepository,
     IdempotencyRepository,
     JobRepository,
+    LocationRepository,
     OccurrenceRepository,
+    ProviderUsageRepository,
     SourceRepository,
+    UploadRepository,
+)
+from services.worker.contracts import (
+    DescriptionCleanupDecision,
+    DescriptionFailureOutcome,
+    DescriptionJob,
+    DescriptionJobFailure,
+    GeocodeJob,
+    GeocodeJobFailure,
 )
 
 
 T = TypeVar("T")
+logger = logging.getLogger(__name__)
 HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+GEOCODE_PROVIDER = AMAZON_LOCATION_PROVIDER
+DEFAULT_GEOCODE_REUSE_RADIUS_METERS = 5.0
+GEOCODE_LEASE_SECONDS = 300
+DESCRIPTION_LEASE_SECONDS = 900
+DISPATCH_RECOVERY_DELAY = timedelta(minutes=5)
+DESCRIPTION_PROVIDER = "OpenAI"
+SCENE_PREVIEW_MIME_TYPE = "image/jpeg"
+SCENE_PREVIEW_MAX_BYTES = 25 * 1024 * 1024
+SCENE_PREVIEW_EXTENSIONS = (
+    ".avif",
+    ".bmp",
+    ".gif",
+    ".heic",
+    ".heif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".tif",
+    ".tiff",
+    ".webp",
+)
+RAW_PHOTO_EXTENSIONS = (".arw", ".cr2", ".cr3", ".dng", ".nef", ".rw2")
+TEMPORARY_UPLOAD_LEASE = timedelta(days=1)
+TEMPORARY_UPLOAD_URL_LIFETIME = timedelta(minutes=15)
 
 
 def _utc(value: datetime | None) -> datetime | None:
@@ -99,6 +165,15 @@ def _db_datetime(value: datetime | None) -> datetime | None:
 
 def _uuid(value: str) -> UUID:
     return UUID(value)
+
+
+def _coordinate_revision(latitude: Decimal, longitude: Decimal) -> str:
+    coordinate = f"{latitude:.6f},{longitude:.6f}"
+    return hashlib.sha256(coordinate.encode("ascii")).hexdigest()
+
+
+def _lease_hash(lease_owner: str) -> str:
+    return hashlib.sha256(lease_owner.encode("utf-8")).hexdigest()
 
 
 def _json_value(value: Any) -> Any:
@@ -158,15 +233,66 @@ class Phase1DomainService:
         clock: Callable[[], datetime] = utc_now,
         trash_retention_days: int = 30,
         idempotency_hours: int = 24,
+        job_dispatcher: JobDispatcher | None = None,
+        temporary_object_store: TemporaryObjectStore | None = None,
+        scene_description_model: str = "gpt-5.6-sol",
+        scene_description_detail: str = "high",
+        scene_description_service_tier: str = "flex",
+        scene_description_max_words: int = 24,
+        scene_description_monthly_call_limit: int = 1_000,
+        geocode_reuse_radius_meters: float = DEFAULT_GEOCODE_REUSE_RADIUS_METERS,
+        location_normalizer: LocationNormalizer | None = None,
     ) -> None:
+        if not 0 <= geocode_reuse_radius_meters <= 100:
+            raise ValueError("The geocode reuse radius must be between 0 and 100 meters")
+        if scene_description_monthly_call_limit < 0:
+            raise ValueError("The scene-description monthly limit cannot be negative")
+        if not scene_description_model or len(scene_description_model) > 128:
+            raise ValueError("The scene-description model identity is invalid")
+        if scene_description_detail not in {"low", "high"}:
+            raise ValueError("The scene-description detail is invalid")
+        if scene_description_service_tier not in {"auto", "default", "flex"}:
+            raise ValueError("The scene-description service tier is invalid")
+        if not 8 <= scene_description_max_words <= 24:
+            raise ValueError("The scene-description word limit is invalid")
         self._session_factory = session_factory
         self._cursor = cursor_codec or CursorCodec()
         self._clock = clock
         self._trash_retention = timedelta(days=trash_retention_days)
         self._idempotency_retention = timedelta(hours=idempotency_hours)
+        self._job_dispatcher = job_dispatcher
+        self._temporary_object_store = temporary_object_store
+        self._scene_description_model = scene_description_model
+        self._scene_description_detail = scene_description_detail
+        self._scene_description_service_tier = scene_description_service_tier
+        self._scene_description_max_words = scene_description_max_words
+        self._scene_description_monthly_call_limit = (
+            scene_description_monthly_call_limit
+        )
+        self._geocode_reuse_radius_meters = geocode_reuse_radius_meters
+        self._location_normalizer = location_normalizer or LocationNormalizer(
+            LocationNormalizationRuleset(rules=(), version="none")
+        )
 
     def _now(self) -> datetime:
         return _db_datetime(self._clock()) or utc_now()
+
+    def _dispatch_after_commit(
+        self, *, job_ids: tuple[UUID, ...], job_type: str
+    ) -> None:
+        if not job_ids or self._job_dispatcher is None:
+            return
+        try:
+            self._job_dispatcher.dispatch(job_ids=job_ids, job_type=job_type)
+        except Exception as exc:
+            # The DB job is already committed and the enabled recovery sweep
+            # will republish it. Never leak an SDK message or queue URL.
+            logger.warning(
+                "Deferred processing dispatch jobType=%s count=%s errorType=%s",
+                job_type,
+                len(job_ids),
+                type(exc).__name__,
+            )
 
     def _account(self, session: Session, user_id: UUID | str) -> UserAccount:
         return AccountRepository(session).require_by_public_id(user_id)
@@ -526,6 +652,7 @@ class Phase1DomainService:
             raise ConflictError(
                 "InvalidManifestSize", "A manifest must contain between 1 and 500 entries"
             )
+        geocode_job_ids: list[UUID] = []
         with transaction_scope(self._session_factory) as session:
             account = self._account(session, user_id)
 
@@ -576,6 +703,7 @@ class Phase1DomainService:
                                     source=source,
                                     entry=entry,
                                     now=now,
+                                    geocode_job_ids=geocode_job_ids,
                                 )
                         except (ConflictError, ValueError) as exc:
                             result = ManifestEntryResult(
@@ -624,13 +752,17 @@ class Phase1DomainService:
                     200,
                 )
 
-            return self._mutation(
+            result = self._mutation(
                 session=session,
                 account=account,
                 context=context,
                 action=action,
                 replay_decoder=self._manifest_from_json,
             )
+        self._dispatch_after_commit(
+            job_ids=tuple(geocode_job_ids), job_type="Geocode"
+        )
+        return result
 
     def _manifest_upsert(
         self,
@@ -640,6 +772,7 @@ class Phase1DomainService:
         source: MediaSource,
         entry: ManifestUpsert,
         now: datetime,
+        geocode_job_ids: list[UUID],
     ) -> ManifestEntryResult:
         if entry.byte_size <= 0:
             raise ConflictError("InvalidByteSize", "Media byte size must be positive")
@@ -741,6 +874,18 @@ class Phase1DomainService:
                     change_type="Upsert",
                     now=now,
                 )
+            description_job_id = (
+                self._ensure_description_job(
+                    session=session,
+                    account=account,
+                    asset=linked_asset,
+                    source=source,
+                    file_name=entry.file_name,
+                    now=now,
+                )
+                if linked_asset is not None
+                else None
+            )
             return ManifestEntryResult(
                 source_item_id=entry.source_item_id,
                 outcome="CreatedOccurrence" if occurrence_created else (
@@ -755,6 +900,7 @@ class Phase1DomainService:
                     and source.storage_mode == "Remote"
                     and linked_asset.storage_state != "RemoteAvailable"
                 ),
+                description_job_id=description_job_id,
             )
 
         content_hash = entry.content_sha256.lower()
@@ -900,13 +1046,24 @@ class Phase1DomainService:
                 source_id=source.id,
             )
         if entry.location is not None:
-            self._upsert_location(
+            geocode_job_id = self._upsert_location(
                 session=session,
                 account=account,
                 asset=asset,
+                source=source,
                 entry=entry,
                 now=now,
             )
+            if geocode_job_id is not None:
+                geocode_job_ids.append(geocode_job_id)
+        description_job_id = self._ensure_description_job(
+            session=session,
+            account=account,
+            asset=asset,
+            source=source,
+            file_name=entry.file_name,
+            now=now,
+        )
         if not existing_unchanged:
             ChangeRepository(session).add(
                 user_id=account.id,
@@ -938,6 +1095,7 @@ class Phase1DomainService:
                 source.storage_mode == "Remote"
                 and asset.storage_state != "RemoteAvailable"
             ),
+            description_job_id=description_job_id,
         )
 
     def _manifest_delete(
@@ -1068,17 +1226,38 @@ class Phase1DomainService:
         session: Session,
         account: UserAccount,
         asset: MediaAsset,
+        source: MediaSource,
         entry: ManifestUpsert,
         now: datetime,
-    ) -> None:
+    ) -> UUID | None:
         assert entry.location is not None
-        location = session.scalar(
-            select(MediaLocation).where(
-                MediaLocation.user_id == account.id,
-                MediaLocation.media_asset_id == asset.id,
+        latitude = entry.location.latitude
+        longitude = entry.location.longitude
+        if not latitude.is_finite() or not Decimal("-90") <= latitude <= Decimal("90"):
+            raise ConflictError("InvalidLatitude", "Latitude must be between -90 and 90")
+        if not longitude.is_finite() or not Decimal("-180") <= longitude <= Decimal("180"):
+            raise ConflictError(
+                "InvalidLongitude", "Longitude must be between -180 and 180"
             )
+
+        repository = LocationRepository(session)
+        location = repository.by_asset(user_id=account.id, asset_id=asset.id)
+        reusable = repository.resolved_nearby(
+            user_id=account.id,
+            latitude=latitude,
+            longitude=longitude,
+            radius_meters=self._geocode_reuse_radius_meters,
         )
-        source = next(
+        if reusable is not None:
+            reusable_result = self._reverse_geocode_result(reusable)
+            if (
+                reusable_result.resolution is not None
+                and not self._location_normalizer.can_reuse(
+                    reusable_result.resolution
+                )
+            ):
+                reusable = None
+        location_source = next(
             (
                 item.source
                 for item in entry.provenance
@@ -1094,13 +1273,577 @@ class Phase1DomainService:
                 updated_at_utc=now,
             )
             session.add(location)
-        location.latitude = entry.location.latitude
-        location.longitude = entry.location.longitude
+        location.latitude = latitude
+        location.longitude = longitude
         location.altitude_meters = entry.location.altitude_meters
         location.accuracy_meters = entry.location.horizontal_accuracy_meters
-        location.location_source = source
+        location.location_source = location_source
         location.updated_at_utc = now
+        if reusable is not None:
+            normalized = self._location_normalizer.normalize_result(
+                self._reverse_geocode_result(reusable)
+            )
+            self._apply_geocode_result(location, result=normalized, now=now)
+            self._apply_geocode_timezone(
+                session,
+                user_id=account.id,
+                asset_id=asset.id,
+                result=normalized,
+                now=now,
+            )
+        else:
+            self._clear_resolved_location(location)
         session.flush()
+        if reusable is not None:
+            return None
+        return self._ensure_geocode_job(
+            session=session,
+            account=account,
+            asset=asset,
+            source=source,
+            location=location,
+            now=now,
+        )
+
+    @staticmethod
+    def _copy_resolved_location(source: MediaLocation, target: MediaLocation) -> None:
+        for attribute in (
+            "location_display_name",
+            "street_address",
+            "original_street_number",
+            "neighborhood",
+            "city",
+            "county",
+            "state",
+            "postal_code",
+            "country",
+            "country_code",
+            "provider",
+            "provider_place_id",
+            "normalization_rule_version",
+            "confidence",
+            "provider_updated_at_utc",
+        ):
+            setattr(target, attribute, getattr(source, attribute))
+        target.raw_provider_json = deepcopy(source.raw_provider_json)
+
+    @staticmethod
+    def _clear_resolved_location(location: MediaLocation) -> None:
+        for attribute in (
+            "location_display_name",
+            "street_address",
+            "original_street_number",
+            "neighborhood",
+            "city",
+            "county",
+            "state",
+            "postal_code",
+            "country",
+            "country_code",
+            "provider",
+            "provider_place_id",
+            "normalization_rule_version",
+            "confidence",
+            "raw_provider_json",
+            "provider_updated_at_utc",
+        ):
+            setattr(location, attribute, None)
+
+    def _ensure_geocode_job(
+        self,
+        *,
+        session: Session,
+        account: UserAccount,
+        asset: MediaAsset,
+        source: MediaSource,
+        location: MediaLocation,
+        now: datetime,
+    ) -> UUID | None:
+        assert location.latitude is not None and location.longitude is not None
+        revision = _coordinate_revision(location.latitude, location.longitude)
+        idempotency_key = f"geocode:{asset.public_id}:{revision}"
+        repository = JobRepository(session)
+        existing = repository.by_idempotency_key(
+            user_id=account.id, idempotency_key=idempotency_key
+        )
+        if existing is not None:
+            if existing.status in {
+                "Succeeded",
+                "Failed",
+                "Cancelled",
+                "DeferredQuota",
+            }:
+                self._settle_provider_reservation(
+                    session, job=existing, now=now, consumed=False
+                )
+                existing.status = "Queued"
+                existing.attempt_count = 0
+                existing.next_attempt_at_utc = now
+                existing.lease_token_hash = None
+                existing.lease_expires_at_utc = None
+                existing.failure_class = None
+                existing.failure_code = None
+                existing.failure_message = None
+                existing.started_at_utc = None
+                existing.completed_at_utc = None
+                existing.request_json = {
+                    "latitude": f"{location.latitude:.6f}",
+                    "longitude": f"{location.longitude:.6f}",
+                    "coordinateRevision": revision,
+                    "locationPublicId": location.public_id,
+                }
+                existing.updated_at_utc = now
+                ChangeRepository(session).add(
+                    user_id=account.id,
+                    source_id=source.id,
+                    asset_id=asset.id,
+                    entity_type="ProcessingJob",
+                    entity_id=existing.id,
+                    entity_public_id=existing.public_id,
+                    change_type="Upsert",
+                    now=now,
+                )
+                return _uuid(existing.public_id)
+            return None
+        job = ProcessingJob(
+            user_id=account.id,
+            media_asset_id=asset.id,
+            media_source_id=source.id,
+            idempotency_key=idempotency_key,
+            job_type="Geocode",
+            status="Queued",
+            provider=GEOCODE_PROVIDER,
+            attempt_count=0,
+            max_attempts=5,
+            next_attempt_at_utc=now,
+            request_json={
+                "latitude": f"{location.latitude:.6f}",
+                "longitude": f"{location.longitude:.6f}",
+                "coordinateRevision": revision,
+                "locationPublicId": location.public_id,
+            },
+            created_at_utc=now,
+            updated_at_utc=now,
+        )
+        session.add(job)
+        session.flush()
+        ChangeRepository(session).add(
+            user_id=account.id,
+            source_id=source.id,
+            asset_id=asset.id,
+            entity_type="ProcessingJob",
+            entity_id=job.id,
+            entity_public_id=job.public_id,
+            change_type="Upsert",
+            now=now,
+        )
+        return _uuid(job.public_id)
+
+    def _ensure_description_job(
+        self,
+        *,
+        session: Session,
+        account: UserAccount,
+        asset: MediaAsset,
+        source: MediaSource,
+        file_name: str,
+        now: datetime,
+    ) -> UUID | None:
+        """Return the one staging-gated scene-description job for a photo."""
+
+        normalized_name = file_name.casefold()
+        if (
+            asset.media_type != "Photo"
+            or normalized_name.endswith(RAW_PHOTO_EXTENSIONS)
+            or not normalized_name.endswith(SCENE_PREVIEW_EXTENSIONS)
+        ):
+            return None
+        current = AssetRepository(session).current_description(
+            user_id=account.id, asset_id=asset.id
+        )
+        if (
+            current is not None
+            and current.status == "Succeeded"
+            and current.is_current == 1
+            and bool(current.description and current.description.strip())
+        ):
+            return None
+
+        idempotency_key = f"description:{asset.public_id}"
+        repository = JobRepository(session)
+        existing = repository.by_idempotency_key(
+            user_id=account.id, idempotency_key=idempotency_key
+        )
+        if existing is not None:
+            request = (
+                dict(existing.request_json)
+                if isinstance(existing.request_json, dict)
+                else {}
+            )
+            configured = {
+                "model": self._scene_description_model,
+                "promptVersion": SCENE_DESCRIPTION_PROMPT_VERSION,
+                "detail": self._scene_description_detail,
+                "serviceTier": self._scene_description_service_tier,
+                "maxWords": self._scene_description_max_words,
+                "monthlyCallLimit": self._scene_description_monthly_call_limit,
+            }
+            configuration_changed = any(
+                request.get(key) != value for key, value in configured.items()
+            )
+            request.update(configured)
+            request["assetRevision"] = asset.content_sha256.lower()
+            request["sourceId"] = source.public_id
+            existing.request_json = request
+            if (
+                existing.status != "Running"
+                and configuration_changed
+                and asset.lifecycle_state == "Active"
+            ):
+                existing.status = "Preparing"
+                existing.next_attempt_at_utc = None
+                existing.lease_token_hash = None
+                existing.lease_expires_at_utc = None
+                existing.failure_class = None
+                existing.failure_code = None
+                existing.failure_message = None
+                existing.started_at_utc = None
+                existing.completed_at_utc = None
+                existing.updated_at_utc = now
+            return _uuid(existing.public_id)
+
+        job = ProcessingJob(
+            user_id=account.id,
+            media_asset_id=asset.id,
+            media_source_id=source.id,
+            idempotency_key=idempotency_key,
+            job_type="Description",
+            status="Preparing",
+            provider=DESCRIPTION_PROVIDER,
+            attempt_count=0,
+            max_attempts=5,
+            next_attempt_at_utc=None,
+            request_json={
+                "assetRevision": asset.content_sha256.lower(),
+                "sourceId": source.public_id,
+                "model": self._scene_description_model,
+                "promptVersion": SCENE_DESCRIPTION_PROMPT_VERSION,
+                "detail": self._scene_description_detail,
+                "serviceTier": self._scene_description_service_tier,
+                "maxWords": self._scene_description_max_words,
+                "monthlyCallLimit": self._scene_description_monthly_call_limit,
+            },
+            created_at_utc=now,
+            updated_at_utc=now,
+        )
+        session.add(job)
+        session.flush()
+        ChangeRepository(session).add(
+            user_id=account.id,
+            source_id=source.id,
+            asset_id=asset.id,
+            entity_type="ProcessingJob",
+            entity_id=job.id,
+            entity_public_id=job.public_id,
+            change_type="Upsert",
+            now=now,
+        )
+        return _uuid(job.public_id)
+
+    def _require_temporary_object_store(self) -> TemporaryObjectStore:
+        if self._temporary_object_store is None:
+            raise ConflictError(
+                "TemporaryProcessingUnavailable",
+                "Temporary scene processing is not configured",
+            )
+        return self._temporary_object_store
+
+    def _validate_temporary_upload_command(
+        self, command: UploadPlanCommand, *, asset: MediaAsset
+    ) -> None:
+        asset_hash = command.asset_content_sha256.lower()
+        object_hash = command.object_sha256.lower()
+        if not HEX_SHA256.fullmatch(asset_hash) or asset_hash != asset.content_sha256.lower():
+            raise ConflictError(
+                "AssetHashMismatch", "The asset content hash does not match this photo"
+            )
+        if not HEX_SHA256.fullmatch(object_hash):
+            raise ConflictError(
+                "InvalidObjectHash",
+                "Object SHA-256 must contain 64 hexadecimal characters",
+            )
+        if command.media_type != "Photo" or asset.media_type != "Photo":
+            raise ConflictError(
+                "ScenePreviewRequiresPhoto",
+                "Scene descriptions currently accept photos only",
+            )
+        if self._normalized_mime(command.object_mime_type) != SCENE_PREVIEW_MIME_TYPE:
+            raise ConflictError(
+                "ScenePreviewRequiresJpeg",
+                "The temporary scene preview must be a JPEG image",
+            )
+        if (
+            command.object_byte_size <= 0
+            or command.object_byte_size > SCENE_PREVIEW_MAX_BYTES
+        ):
+            raise ConflictError(
+                "ScenePreviewSizeInvalid",
+                "The temporary scene preview has an invalid byte size",
+            )
+        if not command.file_name or len(command.file_name) > 512:
+            raise ConflictError("InvalidFileName", "The preview file name is invalid")
+        if asset.lifecycle_state != "Active":
+            raise ConflictError("MediaNotActive", "The media asset is not active")
+        self._assert_local_asset_has_no_remote_locator(asset)
+
+    @staticmethod
+    def _validate_prepared_upload(
+        prepared: Any,
+        *,
+        checksum_base64: str,
+        byte_size: int,
+        now: datetime,
+        session_expires_at: datetime,
+    ) -> None:
+        if not prepared.bucket or len(prepared.bucket) > 63:
+            raise ConflictError(
+                "InvalidStagingTarget", "The temporary object target is invalid"
+            )
+        if not prepared.object_key or len(prepared.object_key) > 1024:
+            raise ConflictError(
+                "InvalidStagingTarget", "The temporary object target is invalid"
+            )
+        parsed = urlsplit(prepared.url)
+        if parsed.scheme != "https" or not parsed.netloc or parsed.username is not None:
+            raise ConflictError(
+                "InvalidStagingTarget", "The temporary upload URL is invalid"
+            )
+        headers = {str(key).lower(): str(value) for key, value in prepared.headers.items()}
+        if (
+            headers.get("x-amz-checksum-sha256") != checksum_base64
+            or headers.get("content-type", "").casefold() != SCENE_PREVIEW_MIME_TYPE
+            or headers.get("content-length") != str(byte_size)
+        ):
+            raise ConflictError(
+                "UnboundStagingUpload",
+                "The temporary upload is not bound to its exact metadata",
+            )
+        expires = _db_datetime(prepared.expires_at_utc)
+        if expires is None or expires <= now or expires > session_expires_at:
+            raise ConflictError(
+                "InvalidStagingExpiry", "The temporary upload expiry is invalid"
+            )
+
+    @staticmethod
+    def _normalized_mime(value: str) -> str:
+        return value.split(";", 1)[0].strip().casefold()
+
+    @staticmethod
+    def _assert_local_asset_has_no_remote_locator(asset: MediaAsset) -> None:
+        remote_values = (
+            asset.s3_bucket,
+            asset.original_s3_object_key,
+            asset.original_s3_version_id,
+            asset.original_s3_etag,
+            asset.original_s3_checksum_algorithm,
+            asset.original_s3_checksum_type,
+            asset.original_s3_checksum_value,
+            asset.preview_s3_object_key,
+            asset.preview_s3_checksum_algorithm,
+            asset.preview_s3_checksum_type,
+            asset.preview_s3_checksum_value,
+        )
+        if asset.storage_state != "LocalOnly" or any(
+            value is not None for value in remote_values
+        ):
+            raise ConflictError(
+                "LocalAssetRemoteLocatorUnexpected",
+                "Local media cannot use a durable remote object locator",
+            )
+
+    @staticmethod
+    def _require_temporary_single_part(upload: UploadSession) -> None:
+        if (
+            upload.object_purpose != "TemporaryProcessing"
+            or upload.upload_kind != "SinglePart"
+            or upload.s3_upload_id is not None
+            or upload.part_size_bytes is not None
+        ):
+            raise ConflictError(
+                "UploadSessionNotSupported",
+                "Only single-part temporary scene uploads are available",
+            )
+
+    @staticmethod
+    def _job_for_upload_session(
+        *, session: Session, account: UserAccount, upload: UploadSession
+    ) -> ProcessingJob:
+        metadata = upload.parts_json if isinstance(upload.parts_json, dict) else {}
+        job_public_id = metadata.get("processingJobId")
+        if not isinstance(job_public_id, str):
+            raise ConflictError(
+                "UploadSessionInvalid", "The upload session has no processing job"
+            )
+        job = JobRepository(session).require(
+            user_id=account.id, job_public_id=job_public_id
+        )
+        if job.job_type != "Description" or job.media_asset_id != upload.media_asset_id:
+            raise ConflictError(
+                "UploadSessionInvalid",
+                "The upload session processing job does not match its photo",
+            )
+        return job
+
+    def _reserve_description_provider_request(
+        self,
+        *,
+        session: Session,
+        account: UserAccount,
+        job: ProcessingJob,
+        now: datetime,
+    ) -> bool:
+        request = dict(job.request_json) if isinstance(job.request_json, dict) else {}
+        existing = request.get("providerUsageReservation")
+        usage_month = date(now.year, now.month, 1)
+        if isinstance(existing, dict) and existing.get("state") == "Reserved":
+            if (
+                existing.get("provider") == DESCRIPTION_PROVIDER
+                and existing.get("usageMonth") == usage_month.isoformat()
+                and existing.get("unitType") == "Request"
+                and existing.get("units") == "1"
+            ):
+                usage = ProviderUsageRepository(session).get(
+                    user_id=account.id,
+                    provider=DESCRIPTION_PROVIDER,
+                    usage_month=usage_month,
+                    unit_type="Request",
+                    for_update=True,
+                )
+                if usage is not None and usage.circuit_state == "Open":
+                    request["quotaBlockReason"] = "CircuitOpen"
+                    job.request_json = request
+                    return False
+                request.pop("quotaBlockReason", None)
+                job.request_json = request
+                return usage is not None
+            self._release_description_provider_request(
+                session=session, job=job, now=now
+            )
+            request = dict(job.request_json or {})
+
+        limit = Decimal(self._scene_description_monthly_call_limit)
+        usage = ProviderUsageRepository(session).get_or_create(
+            user_id=account.id,
+            provider=DESCRIPTION_PROVIDER,
+            usage_month=usage_month,
+            unit_type="Request",
+            hard_limit_units=limit,
+            now=now,
+        )
+        usage.hard_limit_units = limit
+        if usage.circuit_state == "Open":
+            request["quotaBlockReason"] = "CircuitOpen"
+            job.request_json = request
+            usage.updated_at_utc = now
+            session.flush()
+            return False
+        request.pop("quotaBlockReason", None)
+        if (
+            self._scene_description_monthly_call_limit == 0
+            or usage.processed_units + usage.reserved_units + Decimal("1") > limit
+        ):
+            usage.updated_at_utc = now
+            session.flush()
+            return False
+        usage.reserved_units += Decimal("1")
+        usage.updated_at_utc = now
+        request["providerUsageReservation"] = {
+            "provider": DESCRIPTION_PROVIDER,
+            "usageMonth": usage_month.isoformat(),
+            "unitType": "Request",
+            "units": "1",
+            "state": "Reserved",
+        }
+        job.request_json = request
+        job.updated_at_utc = now
+        session.flush()
+        return True
+
+    @staticmethod
+    def _release_description_provider_request(
+        *, session: Session, job: ProcessingJob, now: datetime
+    ) -> None:
+        request = dict(job.request_json) if isinstance(job.request_json, dict) else {}
+        reservation = request.get("providerUsageReservation")
+        if not isinstance(reservation, dict) or reservation.get("state") != "Reserved":
+            return
+        try:
+            usage_month = date.fromisoformat(str(reservation["usageMonth"]))
+            units = Decimal(str(reservation.get("units", "1")))
+        except (KeyError, ValueError):
+            return
+        usage = ProviderUsageRepository(session).get(
+            user_id=job.user_id,
+            provider=str(reservation.get("provider") or DESCRIPTION_PROVIDER),
+            usage_month=usage_month,
+            unit_type=str(reservation.get("unitType") or "Request"),
+            for_update=True,
+        )
+        if usage is not None:
+            usage.reserved_units -= min(usage.reserved_units, max(Decimal("0"), units))
+            usage.updated_at_utc = now
+        reservation = dict(reservation)
+        reservation["state"] = "Released"
+        reservation["releasedAtUtc"] = (_utc(now) or now).isoformat()
+        request["providerUsageReservation"] = reservation
+        job.request_json = request
+        job.updated_at_utc = now
+
+    def _expire_temporary_uploads(
+        self,
+        *,
+        session: Session,
+        account: UserAccount,
+        repository: UploadRepository,
+        store: TemporaryObjectStore,
+        now: datetime,
+    ) -> None:
+        for upload in repository.expired_active_for_user(
+            user_id=account.id, now=now
+        ):
+            self._require_temporary_single_part(upload)
+            store.delete_object(
+                bucket=upload.s3_bucket, object_key=upload.s3_object_key
+            )
+            job = self._job_for_upload_session(
+                session=session, account=account, upload=upload
+            )
+            if job.status == "Preparing":
+                self._release_description_provider_request(
+                    session=session, job=job, now=now
+                )
+            upload.status = "Expired"
+            upload.active_lease_marker = None
+            upload.failure_code = "UploadLeaseExpired"
+            upload.updated_at_utc = now
+        session.flush()
+
+    @staticmethod
+    def _first_of_next_month(now: datetime) -> datetime:
+        year = now.year + 1 if now.month == 12 else now.year
+        month = 1 if now.month == 12 else now.month + 1
+        return datetime(year, month, 1)
+
+    @staticmethod
+    def _upload_session_record(upload: UploadSession) -> UploadSessionRecord:
+        return UploadSessionRecord(
+            upload_session_id=_uuid(upload.public_id),
+            strategy="SinglePart",
+            status=upload.status,
+            expected_byte_size=upload.expected_byte_size,
+            uploaded_byte_size=upload.uploaded_byte_size,
+            expires_at_utc=_utc(upload.expires_at_utc),
+        )
 
     def _delete_occurrence(
         self,
@@ -1170,6 +1913,12 @@ class Phase1DomainService:
         asset.trashed_at_utc = now
         asset.purge_after_utc = now + self._trash_retention
         asset.updated_at_utc = now
+        self._cancel_asset_processing(
+            session=session,
+            account=account,
+            asset=asset,
+            now=now,
+        )
         ChangeRepository(session).add(
             user_id=account.id,
             device_id=device_id,
@@ -1181,6 +1930,77 @@ class Phase1DomainService:
             change_type="Delete",
             now=now,
         )
+
+    def _cancel_asset_processing(
+        self,
+        *,
+        session: Session,
+        account: UserAccount,
+        asset: MediaAsset,
+        now: datetime,
+    ) -> None:
+        jobs = list(
+            session.scalars(
+                select(ProcessingJob)
+                .where(
+                    ProcessingJob.user_id == account.id,
+                    ProcessingJob.media_asset_id == asset.id,
+                    ProcessingJob.status.in_(
+                        ("Preparing", "Queued", "Running", "DeferredQuota")
+                    ),
+                )
+                .with_for_update()
+            )
+        )
+        for job in jobs:
+            self._settle_provider_reservation(
+                session,
+                job=job,
+                now=now,
+                consumed=job.status == "Running",
+            )
+            job.status = "Cancelled"
+            job.next_attempt_at_utc = None
+            job.lease_token_hash = None
+            job.lease_expires_at_utc = None
+            job.failure_class = "InvalidMedia"
+            job.failure_code = "MediaTrashed"
+            job.failure_message = "Processing stopped because the media was removed."
+            job.completed_at_utc = now
+            job.updated_at_utc = now
+            self._add_job_change(session, job=job, now=now)
+
+        uploads = list(
+            session.scalars(
+                select(UploadSession)
+                .where(
+                    UploadSession.user_id == account.id,
+                    UploadSession.media_asset_id == asset.id,
+                    UploadSession.object_purpose == "TemporaryProcessing",
+                    UploadSession.status.in_(
+                        ("Preparing", "Uploading", "Completing", "Completed")
+                    ),
+                )
+                .with_for_update()
+            )
+        )
+        for upload in uploads:
+            if self._temporary_object_store is not None:
+                try:
+                    self._temporary_object_store.delete_object(
+                        bucket=upload.s3_bucket,
+                        object_key=upload.s3_object_key,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Deferred trashed preview cleanup uploadId=%s errorType=%s",
+                        upload.public_id,
+                        type(exc).__name__,
+                    )
+            upload.status = "Cancelled"
+            upload.active_lease_marker = None
+            upload.failure_code = "MediaTrashed"
+            upload.updated_at_utc = now
 
     @staticmethod
     def _asset_public_id(
@@ -1386,6 +2206,571 @@ class Phase1DomainService:
                 provenance=self._provenance(asset.metadata_json),
             )
 
+    async def create_upload_plan(
+        self,
+        user_id: UUID,
+        command: UploadPlanCommand,
+        context: MutationContext,
+    ) -> MutationResult[UploadPlanRecord]:
+        with transaction_scope(self._session_factory) as session:
+            account = self._account(session, user_id)
+
+            def action() -> tuple[UploadPlanRecord, int]:
+                store = self._require_temporary_object_store()
+                if command.purpose != "TemporaryProcessing":
+                    raise ConflictError(
+                        "UploadPurposeNotSupported",
+                        "Only temporary scene-processing uploads are available",
+                    )
+                if command.processing_job_id is None:
+                    raise ConflictError(
+                        "ProcessingJobRequired",
+                        "A scene-description processing job is required",
+                    )
+                source = SourceRepository(session).require(
+                    user_id=account.id, source_public_id=command.source_id
+                )
+                if source.storage_mode != "Local":
+                    raise ConflictError(
+                        "TemporaryUploadRequiresLocalSource",
+                        "This staging flow is available only for Local sources",
+                    )
+                occurrence = OccurrenceRepository(session).require(
+                    user_id=account.id,
+                    occurrence_public_id=command.occurrence_id,
+                    source_id=source.id,
+                )
+                if (
+                    occurrence.media_asset_id is None
+                    or occurrence.deletion_state != "Active"
+                    or occurrence.availability_state == "Unavailable"
+                ):
+                    raise ConflictError(
+                        "OccurrenceUnavailable",
+                        "The local media occurrence is not available",
+                    )
+                asset = session.scalar(
+                    select(MediaAsset).where(
+                        MediaAsset.user_id == account.id,
+                        MediaAsset.id == occurrence.media_asset_id,
+                    )
+                )
+                if asset is None:
+                    raise NotFoundError("MediaNotFound", "The media asset was not found")
+                self._validate_temporary_upload_command(command, asset=asset)
+                job = JobRepository(session).require(
+                    user_id=account.id, job_public_id=command.processing_job_id
+                )
+                if job.media_asset_id != asset.id or job.job_type != "Description":
+                    raise ConflictError(
+                        "ProcessingJobMismatch",
+                        "The processing job does not match this photo",
+                    )
+                now = self._now()
+                if (
+                    job.status == "DeferredQuota"
+                    and job.next_attempt_at_utc is not None
+                    and job.next_attempt_at_utc <= now
+                ):
+                    self._settle_provider_reservation(
+                        session, job=job, now=now, consumed=False
+                    )
+                    job.status = "Preparing"
+                    job.attempt_count = 0
+                    job.next_attempt_at_utc = None
+                    job.failure_class = None
+                    job.failure_code = None
+                    job.failure_message = None
+                    job.completed_at_utc = None
+                    job.updated_at_utc = now
+                if job.status != "Preparing":
+                    raise ConflictError(
+                        "ProcessingJobNotPreparing",
+                        "The scene-description job is not waiting for a preview",
+                    )
+                current = AssetRepository(session).current_description(
+                    user_id=account.id, asset_id=asset.id
+                )
+                if (
+                    current is not None
+                    and current.status == "Succeeded"
+                    and current.is_current == 1
+                    and bool(current.description and current.description.strip())
+                ):
+                    raise ConflictError(
+                        "DescriptionAlreadyAvailable",
+                        "This photo already has a current scene description",
+                    )
+
+                repository = UploadRepository(session)
+                self._expire_temporary_uploads(
+                    session=session,
+                    account=account,
+                    repository=repository,
+                    store=store,
+                    now=now,
+                )
+                active = repository.active_for_asset(
+                    user_id=account.id,
+                    asset_id=asset.id,
+                    object_purpose="TemporaryProcessing",
+                    for_update=True,
+                )
+                if active is not None:
+                    if active.lease_owner != job.public_id:
+                        raise ConflictError(
+                            "UploadLeaseHeld",
+                            "Another temporary-processing lease is active for this photo",
+                        )
+                    return (
+                        UploadPlanRecord(
+                            disposition="LeaseHeld",
+                            strategy="SinglePart",
+                            media_asset_id=_uuid(asset.public_id),
+                            occurrence_id=_uuid(occurrence.public_id),
+                            upload_session_id=_uuid(active.public_id),
+                            expires_at_utc=_utc(active.expires_at_utc),
+                            deduplicated=(
+                                OccurrenceRepository(session).active_count_for_asset(
+                                    user_id=account.id, asset_id=asset.id
+                                )
+                                > 1
+                            ),
+                            retry_after_seconds=max(
+                                1,
+                                min(
+                                    900,
+                                    int((active.expires_at_utc - now).total_seconds()),
+                                ),
+                            ),
+                        ),
+                        200,
+                    )
+
+                if not self._reserve_description_provider_request(
+                    session=session,
+                    account=account,
+                    job=job,
+                    now=now,
+                ):
+                    retry_at = self._first_of_next_month(now)
+                    request_json = (
+                        job.request_json
+                        if isinstance(job.request_json, dict)
+                        else {}
+                    )
+                    circuit_open = (
+                        request_json.get("quotaBlockReason") == "CircuitOpen"
+                    )
+                    job.status = "DeferredQuota"
+                    job.next_attempt_at_utc = retry_at
+                    job.failure_class = "Quota"
+                    job.failure_code = (
+                        "ProviderCircuitOpen"
+                        if circuit_open
+                        else "MonthlySceneDescriptionLimitReached"
+                    )
+                    job.failure_message = (
+                        "Scene description is paused after a provider credential or quota failure."
+                        if circuit_open
+                        else "Scene description is waiting for the monthly provider quota."
+                    )
+                    job.lease_token_hash = None
+                    job.lease_expires_at_utc = None
+                    job.completed_at_utc = None
+                    job.updated_at_utc = now
+                    ChangeRepository(session).add(
+                        user_id=account.id,
+                        source_id=job.media_source_id,
+                        asset_id=job.media_asset_id,
+                        entity_type="ProcessingJob",
+                        entity_id=job.id,
+                        entity_public_id=job.public_id,
+                        change_type="Upsert",
+                        now=now,
+                    )
+                    session.flush()
+                    return (
+                        UploadPlanRecord(
+                            disposition="Deferred",
+                            strategy="None",
+                            media_asset_id=_uuid(asset.public_id),
+                            occurrence_id=_uuid(occurrence.public_id),
+                            upload_session_id=None,
+                            expires_at_utc=None,
+                            deduplicated=(
+                                OccurrenceRepository(session).active_count_for_asset(
+                                    user_id=account.id, asset_id=asset.id
+                                )
+                                > 1
+                            ),
+                            retry_after_seconds=max(
+                                1, int((retry_at - now).total_seconds())
+                            ),
+                        ),
+                        200,
+                    )
+
+                upload_session_id = uuid4()
+                object_expires_at = now + TEMPORARY_UPLOAD_LEASE
+                url_expires_at = now + TEMPORARY_UPLOAD_URL_LIFETIME
+                checksum_base64 = base64.b64encode(
+                    bytes.fromhex(command.object_sha256.lower())
+                ).decode("ascii")
+                prepared = store.create_presigned_put(
+                    user_id=_uuid(account.public_id),
+                    media_asset_id=_uuid(asset.public_id),
+                    upload_session_id=upload_session_id,
+                    checksum_sha256_base64=checksum_base64,
+                    content_type=SCENE_PREVIEW_MIME_TYPE,
+                    content_length=command.object_byte_size,
+                    url_expires_at_utc=_utc(url_expires_at) or url_expires_at,
+                    object_expires_at_utc=_utc(object_expires_at) or object_expires_at,
+                )
+                self._validate_prepared_upload(
+                    prepared,
+                    checksum_base64=checksum_base64,
+                    byte_size=command.object_byte_size,
+                    now=now,
+                    session_expires_at=object_expires_at,
+                )
+                upload = UploadSession(
+                    public_id=str(upload_session_id),
+                    user_id=account.id,
+                    media_asset_id=asset.id,
+                    media_occurrence_id=occurrence.id,
+                    idempotency_key=context.idempotency_key,
+                    object_purpose="TemporaryProcessing",
+                    upload_kind="SinglePart",
+                    status="Uploading",
+                    active_lease_marker=1,
+                    lease_token_hash=hashlib.sha256(
+                        f"{upload_session_id}:{context.request_id}".encode("ascii")
+                    ).hexdigest(),
+                    lease_owner=job.public_id,
+                    s3_bucket=prepared.bucket,
+                    s3_object_key=prepared.object_key,
+                    checksum_sha256=command.object_sha256.lower(),
+                    s3_checksum_algorithm="SHA256",
+                    s3_checksum_type="FULL_OBJECT",
+                    s3_checksum_value=checksum_base64,
+                    expected_byte_size=command.object_byte_size,
+                    uploaded_byte_size=0,
+                    parts_json={
+                        "contentType": SCENE_PREVIEW_MIME_TYPE,
+                        "processingJobId": job.public_id,
+                        "sourceId": source.public_id,
+                        "occurrenceId": occurrence.public_id,
+                        "fileName": command.file_name,
+                    },
+                    expires_at_utc=object_expires_at,
+                    created_at_utc=now,
+                    updated_at_utc=now,
+                )
+                session.add(upload)
+                session.flush()
+                return (
+                    UploadPlanRecord(
+                        disposition="UploadRequired",
+                        strategy="SinglePart",
+                        media_asset_id=_uuid(asset.public_id),
+                        occurrence_id=_uuid(occurrence.public_id),
+                        upload_session_id=upload_session_id,
+                        expires_at_utc=_utc(object_expires_at),
+                        deduplicated=(
+                            OccurrenceRepository(session).active_count_for_asset(
+                                user_id=account.id, asset_id=asset.id
+                            )
+                            > 1
+                        ),
+                        single_part=SignedUploadRequestRecord(
+                            url=prepared.url,
+                            method="PUT",
+                            headers=dict(prepared.headers),
+                            expires_at_utc=_utc(prepared.expires_at_utc)
+                            or prepared.expires_at_utc,
+                        ),
+                    ),
+                    200,
+                )
+
+            return self._mutation(
+                session=session,
+                account=account,
+                context=context,
+                action=action,
+                replay_decoder=self._upload_plan_from_json,
+            )
+
+    async def get_upload_session(
+        self, user_id: UUID, upload_session_id: UUID
+    ) -> UploadSessionRecord:
+        with transaction_scope(self._session_factory) as session:
+            account = self._account(session, user_id)
+            upload = UploadRepository(session).require(
+                user_id=account.id,
+                upload_public_id=upload_session_id,
+                for_update=True,
+            )
+            self._require_temporary_single_part(upload)
+            now = self._now()
+            if (
+                upload.active_lease_marker == 1
+                and upload.status in {"Preparing", "Uploading", "Completing"}
+                and upload.expires_at_utc <= now
+            ):
+                store = self._require_temporary_object_store()
+                store.delete_object(
+                    bucket=upload.s3_bucket, object_key=upload.s3_object_key
+                )
+                job = self._job_for_upload_session(
+                    session=session, account=account, upload=upload
+                )
+                if job.status == "Preparing":
+                    self._release_description_provider_request(
+                        session=session, job=job, now=now
+                    )
+                upload.status = "Expired"
+                upload.active_lease_marker = None
+                upload.failure_code = "UploadLeaseExpired"
+                upload.updated_at_utc = now
+                session.flush()
+            return self._upload_session_record(upload)
+
+    async def complete_upload(
+        self,
+        user_id: UUID,
+        upload_session_id: UUID,
+        command: UploadCompleteCommand,
+        context: MutationContext,
+    ) -> MutationResult[UploadCompleteRecord]:
+        dispatch_job_ids: list[UUID] = []
+        with transaction_scope(self._session_factory) as session:
+            account = self._account(session, user_id)
+
+            def action() -> tuple[UploadCompleteRecord, int]:
+                store = self._require_temporary_object_store()
+                upload = UploadRepository(session).require(
+                    user_id=account.id,
+                    upload_public_id=upload_session_id,
+                    for_update=True,
+                )
+                self._require_temporary_single_part(upload)
+                if command.parts:
+                    raise ConflictError(
+                        "MultipartNotSupported",
+                        "Temporary scene previews must use a single PUT",
+                    )
+                if not HEX_SHA256.fullmatch(command.object_sha256.lower()):
+                    raise ConflictError(
+                        "InvalidObjectHash",
+                        "Object SHA-256 must contain 64 hexadecimal characters",
+                    )
+                if command.object_sha256.lower() != upload.checksum_sha256.lower():
+                    raise ConflictError(
+                        "ObjectHashMismatch",
+                        "The completed object does not match the planned preview",
+                    )
+                asset = session.scalar(
+                    select(MediaAsset).where(
+                        MediaAsset.user_id == account.id,
+                        MediaAsset.id == upload.media_asset_id,
+                    )
+                )
+                if asset is None:
+                    raise NotFoundError("MediaNotFound", "The media asset was not found")
+                job = self._job_for_upload_session(
+                    session=session, account=account, upload=upload
+                )
+                if upload.status == "Completed":
+                    return (
+                        UploadCompleteRecord(
+                            media_asset_id=_uuid(asset.public_id),
+                            storage_state=asset.storage_state,
+                            processing_jobs=(_uuid(job.public_id),),
+                        ),
+                        200,
+                    )
+                if upload.status != "Uploading" or upload.active_lease_marker != 1:
+                    raise ConflictError(
+                        "UploadNotCompletable",
+                        "The upload session cannot be completed",
+                    )
+                now = self._now()
+                if upload.expires_at_utc <= now:
+                    raise ConflictError(
+                        "UploadLeaseExpired", "The temporary upload lease has expired"
+                    )
+                if job.status != "Preparing":
+                    raise ConflictError(
+                        "ProcessingJobNotPreparing",
+                        "The scene-description job is not waiting for a preview",
+                    )
+                metadata = store.head_object(
+                    bucket=upload.s3_bucket, object_key=upload.s3_object_key
+                )
+                if metadata is None:
+                    raise ConflictError(
+                        "UploadedObjectNotFound",
+                        "The temporary preview has not been uploaded",
+                    )
+                if metadata.byte_size != upload.expected_byte_size:
+                    raise ConflictError(
+                        "UploadedObjectSizeMismatch",
+                        "The uploaded preview size does not match the plan",
+                    )
+                if self._normalized_mime(metadata.content_type) != SCENE_PREVIEW_MIME_TYPE:
+                    raise ConflictError(
+                        "UploadedObjectTypeMismatch",
+                        "The uploaded preview is not a JPEG image",
+                    )
+                if metadata.checksum_sha256_hex.lower() != upload.checksum_sha256.lower():
+                    raise ConflictError(
+                        "UploadedObjectChecksumMismatch",
+                        "The uploaded preview checksum does not match the plan",
+                    )
+                self._assert_local_asset_has_no_remote_locator(asset)
+
+                upload.status = "Completed"
+                upload.active_lease_marker = None
+                upload.uploaded_byte_size = metadata.byte_size
+                upload.completed_at_utc = now
+                upload.failure_code = None
+                upload.updated_at_utc = now
+                request_json = (
+                    dict(job.request_json) if isinstance(job.request_json, dict) else {}
+                )
+                parts = upload.parts_json if isinstance(upload.parts_json, dict) else {}
+                request_json.update(
+                    {
+                        "assetRevision": asset.content_sha256.lower(),
+                        "stagingBucket": upload.s3_bucket,
+                        "stagingObjectKey": upload.s3_object_key,
+                        "previewSha256": upload.checksum_sha256.lower(),
+                        "previewChecksumSha256": upload.s3_checksum_value,
+                        "previewByteSize": upload.expected_byte_size,
+                        "previewMimeType": SCENE_PREVIEW_MIME_TYPE,
+                        "uploadSessionId": upload.public_id,
+                        "sourceId": parts.get("sourceId"),
+                        "occurrenceId": parts.get("occurrenceId"),
+                    }
+                )
+                job.request_json = request_json
+                job.status = "Queued"
+                job.next_attempt_at_utc = now
+                job.lease_token_hash = None
+                job.lease_expires_at_utc = None
+                job.failure_class = None
+                job.failure_code = None
+                job.failure_message = None
+                job.started_at_utc = None
+                job.completed_at_utc = None
+                job.updated_at_utc = now
+                ChangeRepository(session).add(
+                    user_id=account.id,
+                    source_id=job.media_source_id,
+                    asset_id=asset.id,
+                    entity_type="ProcessingJob",
+                    entity_id=job.id,
+                    entity_public_id=job.public_id,
+                    change_type="Upsert",
+                    now=now,
+                )
+                session.flush()
+                dispatch_job_ids.append(_uuid(job.public_id))
+                return (
+                    UploadCompleteRecord(
+                        media_asset_id=_uuid(asset.public_id),
+                        storage_state="LocalOnly",
+                        processing_jobs=(_uuid(job.public_id),),
+                    ),
+                    200,
+                )
+
+            result = self._mutation(
+                session=session,
+                account=account,
+                context=context,
+                action=action,
+                replay_decoder=self._upload_complete_from_json,
+            )
+        self._dispatch_after_commit(
+            job_ids=tuple(dispatch_job_ids), job_type="Description"
+        )
+        return result
+
+    async def cancel_upload(
+        self,
+        user_id: UUID,
+        upload_session_id: UUID,
+        context: MutationContext,
+    ) -> MutationResult[None]:
+        with transaction_scope(self._session_factory) as session:
+            account = self._account(session, user_id)
+
+            def action() -> tuple[None, int]:
+                store = self._require_temporary_object_store()
+                upload = UploadRepository(session).require(
+                    user_id=account.id,
+                    upload_public_id=upload_session_id,
+                    for_update=True,
+                )
+                self._require_temporary_single_part(upload)
+                if upload.status == "Completed":
+                    raise ConflictError(
+                        "UploadAlreadyCompleted",
+                        "A completed scene preview cannot be cancelled",
+                    )
+                if upload.status == "Cancelled":
+                    return None, 204
+                job = self._job_for_upload_session(
+                    session=session, account=account, upload=upload
+                )
+                if job.status != "Preparing":
+                    raise ConflictError(
+                        "ProcessingJobAlreadyQueued",
+                        "The scene-description job has already been queued",
+                    )
+                store.delete_object(
+                    bucket=upload.s3_bucket, object_key=upload.s3_object_key
+                )
+                now = self._now()
+                upload.status = "Cancelled"
+                upload.active_lease_marker = None
+                upload.failure_code = "CancelledByClient"
+                upload.updated_at_utc = now
+                request_json = (
+                    dict(job.request_json) if isinstance(job.request_json, dict) else {}
+                )
+                for key in (
+                    "stagingBucket",
+                    "stagingObjectKey",
+                    "previewSha256",
+                    "previewChecksumSha256",
+                    "previewByteSize",
+                    "previewMimeType",
+                    "uploadSessionId",
+                    "occurrenceId",
+                ):
+                    request_json.pop(key, None)
+                job.request_json = request_json
+                job.status = "Preparing"
+                job.next_attempt_at_utc = None
+                job.updated_at_utc = now
+                self._release_description_provider_request(
+                    session=session, job=job, now=now
+                )
+                session.flush()
+                return None, 204
+
+            return self._mutation(
+                session=session,
+                account=account,
+                context=context,
+                action=action,
+                replay_decoder=lambda _: None,
+            )
+
     async def list_jobs(self, user_id: UUID, query: JobQuery) -> Page[JobRecord]:
         _require_page_limit(query.limit)
         after_id = _decode_single_id(self._cursor, query.cursor, kind="jobs")
@@ -1431,6 +2816,7 @@ class Phase1DomainService:
         job_id: UUID,
         context: MutationContext,
     ) -> MutationResult[JobRecord]:
+        dispatch_jobs: list[tuple[UUID, str]] = []
         with transaction_scope(self._session_factory) as session:
             account = self._account(session, user_id)
 
@@ -1438,18 +2824,52 @@ class Phase1DomainService:
                 job = JobRepository(session).require(
                     user_id=account.id, job_public_id=job_id
                 )
-                if job.status != "Failed":
+                retryable_cancel = (
+                    job.job_type == "Description"
+                    and job.status == "Cancelled"
+                    and job.failure_code
+                    in {
+                        "UnsupportedPhoto",
+                        "SourceChanged",
+                        "SourceUnavailable",
+                        "UserSkipped",
+                    }
+                )
+                if job.status not in {"Failed", "DeferredQuota"} and not retryable_cancel:
                     raise RetryNotAllowedError(
-                        "JobRetryNotAllowed", "Only failed jobs can be manually retried"
+                        "JobRetryNotAllowed",
+                        "Only failed, quota-deferred, or explicitly skipped scene jobs can be retried",
                     )
-                if job.attempt_count >= job.max_attempts:
+                if job.status == "Failed" and job.attempt_count >= job.max_attempts:
                     raise RetryNotAllowedError(
                         "JobAttemptsExhausted",
                         "This job has exhausted its configured retry attempts",
                     )
                 now = self._now()
-                job.status = "Queued"
-                job.next_attempt_at_utc = now
+                description_requires_restage = job.job_type == "Description"
+                circuit_recovery = self._provider_circuit_is_open(
+                    session, job=job, now=now
+                )
+                if job.status == "DeferredQuota":
+                    job.attempt_count = 0
+                if circuit_recovery:
+                    self._close_provider_circuit(
+                        session, job=job, now=now
+                    )
+                    dispatch_jobs.extend(
+                        self._promote_circuit_deferred_jobs(
+                            session,
+                            job=job,
+                            now=now,
+                        )
+                    )
+                if description_requires_restage:
+                    self._settle_provider_reservation(
+                        session, job=job, now=now, consumed=False
+                    )
+                    self._clear_description_staging_request(job)
+                job.status = "Preparing" if description_requires_restage else "Queued"
+                job.next_attempt_at_utc = None if description_requires_restage else now
                 job.lease_token_hash = None
                 job.lease_expires_at_utc = None
                 job.failure_class = None
@@ -1468,7 +2888,121 @@ class Phase1DomainService:
                     change_type="Upsert",
                     now=now,
                 )
+                if not description_requires_restage:
+                    dispatch_jobs.append((_uuid(job.public_id), job.job_type))
                 return self._job_record(session, account.id, job), 202
+
+            result = self._mutation(
+                session=session,
+                account=account,
+                context=context,
+                action=action,
+                replay_decoder=self._job_from_json,
+            )
+        for dispatched_job_id, dispatched_job_type in dispatch_jobs:
+            self._dispatch_after_commit(
+                job_ids=(dispatched_job_id,), job_type=dispatched_job_type
+            )
+        return result
+
+    async def cancel_job(
+        self,
+        user_id: UUID,
+        job_id: UUID,
+        reason: str,
+        context: MutationContext,
+    ) -> MutationResult[JobRecord]:
+        messages = {
+            "UnsupportedPhoto": "Scene description is unavailable for this photo format.",
+            "SourceUnavailable": "Scene description was skipped because the source photo is unavailable.",
+            "SourceChanged": "Scene description was superseded because the source photo changed.",
+            "UserSkipped": "Scene description was skipped on this device.",
+        }
+        if reason not in messages:
+            raise ValueError("The processing cancellation reason is invalid")
+        with transaction_scope(self._session_factory) as session:
+            account = self._account(session, user_id)
+
+            def action() -> tuple[JobRecord, int]:
+                job = session.scalar(
+                    select(ProcessingJob)
+                    .where(
+                        ProcessingJob.user_id == account.id,
+                        ProcessingJob.public_id == str(job_id),
+                    )
+                    .with_for_update()
+                )
+                if job is None:
+                    raise NotFoundError(
+                        "JobNotFound", "The processing job was not found"
+                    )
+                if job.job_type != "Description":
+                    raise ConflictError(
+                        "JobCancellationNotAllowed",
+                        "Only scene-description preparation can be skipped",
+                    )
+                if job.status == "Succeeded":
+                    raise ConflictError(
+                        "JobCancellationNotAllowed",
+                        "A completed scene description cannot be skipped",
+                    )
+                if job.status == "Cancelled":
+                    return self._job_record(session, account.id, job), 200
+                now = self._now()
+                self._settle_provider_reservation(
+                    session,
+                    job=job,
+                    now=now,
+                    consumed=job.status == "Running",
+                )
+                uploads = list(
+                    session.scalars(
+                        select(UploadSession)
+                        .where(
+                            UploadSession.user_id == account.id,
+                            UploadSession.media_asset_id == job.media_asset_id,
+                            UploadSession.object_purpose == "TemporaryProcessing",
+                            UploadSession.status.in_(
+                                (
+                                    "Preparing",
+                                    "Uploading",
+                                    "Completing",
+                                    "Completed",
+                                )
+                            ),
+                        )
+                        .with_for_update()
+                    )
+                )
+                for upload in uploads:
+                    if self._temporary_object_store is not None:
+                        try:
+                            self._temporary_object_store.delete_object(
+                                bucket=upload.s3_bucket,
+                                object_key=upload.s3_object_key,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Deferred cancelled preview cleanup uploadId=%s errorType=%s",
+                                upload.public_id,
+                                type(exc).__name__,
+                            )
+                    upload.status = "Cancelled"
+                    upload.active_lease_marker = None
+                    upload.failure_code = reason
+                    upload.updated_at_utc = now
+                job.status = "Cancelled"
+                job.next_attempt_at_utc = None
+                job.lease_token_hash = None
+                job.lease_expires_at_utc = None
+                job.failure_class = "InvalidMedia"
+                job.failure_code = reason
+                job.failure_message = messages[reason]
+                job.completed_at_utc = now
+                job.updated_at_utc = now
+                self._add_job_change(session, job=job, now=now)
+                session.flush()
+                return self._job_record(session, account.id, job), 200
 
             return self._mutation(
                 session=session,
@@ -1477,6 +3011,1566 @@ class Phase1DomainService:
                 action=action,
                 replay_decoder=self._job_from_json,
             )
+
+    def redispatch_due_jobs(self, *, limit: int = 100) -> int:
+        """Recover durable jobs independently of their original SQS delivery."""
+
+        if isinstance(limit, bool) or not 1 <= limit <= 500:
+            raise ValueError("The due-job sweep limit must be from 1 through 500")
+        if self._job_dispatcher is None:
+            return 0
+        now = self._now()
+        stale_before = now - DISPATCH_RECOVERY_DELAY
+        dispatch: dict[str, list[UUID]] = {"Geocode": [], "Description": []}
+        with transaction_scope(self._session_factory) as session:
+            jobs = list(
+                session.scalars(
+                    select(ProcessingJob)
+                    .where(
+                        ProcessingJob.job_type.in_(("Geocode", "Description")),
+                        or_(
+                            and_(
+                                ProcessingJob.status == "Queued",
+                                ProcessingJob.next_attempt_at_utc.is_not(None),
+                                ProcessingJob.next_attempt_at_utc <= now,
+                                ProcessingJob.updated_at_utc <= stale_before,
+                            ),
+                            and_(
+                                ProcessingJob.status == "Running",
+                                ProcessingJob.lease_expires_at_utc.is_not(None),
+                                ProcessingJob.lease_expires_at_utc <= now,
+                            ),
+                            and_(
+                                ProcessingJob.status == "DeferredQuota",
+                                ProcessingJob.next_attempt_at_utc.is_not(None),
+                                ProcessingJob.next_attempt_at_utc <= now,
+                            ),
+                        ),
+                    )
+                    .order_by(
+                        ProcessingJob.next_attempt_at_utc.asc(),
+                        ProcessingJob.id.asc(),
+                    )
+                    .limit(limit)
+                    .with_for_update()
+                )
+            )
+            for job in jobs:
+                original_status = job.status
+                if original_status == "Running":
+                    # The provider may already have accepted this attempt.
+                    self._settle_provider_reservation(
+                        session, job=job, now=now, consumed=True
+                    )
+                elif original_status == "DeferredQuota":
+                    self._settle_provider_reservation(
+                        session, job=job, now=now, consumed=False
+                    )
+                    job.attempt_count = 0
+
+                if (
+                    original_status != "DeferredQuota"
+                    and job.attempt_count >= job.max_attempts
+                ):
+                    job.status = "Failed"
+                    job.next_attempt_at_utc = None
+                    job.lease_token_hash = None
+                    job.lease_expires_at_utc = None
+                    job.failure_class = "Internal"
+                    job.failure_code = "AttemptsExhausted"
+                    job.failure_message = "Processing exhausted its retry attempts."
+                    job.completed_at_utc = now
+                    job.updated_at_utc = now
+                    self._add_job_change(session, job=job, now=now)
+                    continue
+
+                job.lease_token_hash = None
+                job.lease_expires_at_utc = None
+                job.failure_class = None
+                job.failure_code = None
+                job.failure_message = None
+                job.completed_at_utc = None
+                job.updated_at_utc = now
+                if (
+                    original_status == "DeferredQuota"
+                    and job.job_type == "Description"
+                ):
+                    self._clear_description_staging_request(job)
+                    job.status = "Preparing"
+                    job.next_attempt_at_utc = None
+                else:
+                    job.status = "Queued"
+                    job.next_attempt_at_utc = now
+                    dispatch[job.job_type].append(_uuid(job.public_id))
+                self._add_job_change(session, job=job, now=now)
+            session.flush()
+
+        for job_type in ("Geocode", "Description"):
+            job_ids = dispatch[job_type]
+            if job_ids:
+                self._job_dispatcher.dispatch(
+                    job_ids=tuple(job_ids), job_type=job_type
+                )
+        return sum(len(job_ids) for job_ids in dispatch.values())
+
+    @staticmethod
+    def _clear_description_staging_request(job: ProcessingJob) -> None:
+        request = dict(job.request_json) if isinstance(job.request_json, dict) else {}
+        for key in (
+            "stagingBucket",
+            "stagingObjectKey",
+            "previewSha256",
+            "previewChecksumSha256",
+            "previewByteSize",
+            "previewMimeType",
+            "uploadSessionId",
+            "occurrenceId",
+        ):
+            request.pop(key, None)
+        job.request_json = request
+
+    def _promote_circuit_deferred_jobs(
+        self,
+        session: Session,
+        *,
+        job: ProcessingJob,
+        now: datetime,
+    ) -> list[tuple[UUID, str]]:
+        if not job.provider:
+            return []
+        promoted_dispatch: list[tuple[UUID, str]] = []
+        rows = list(
+            session.scalars(
+                select(ProcessingJob)
+                .where(
+                    ProcessingJob.user_id == job.user_id,
+                    ProcessingJob.provider == job.provider,
+                    ProcessingJob.status == "DeferredQuota",
+                    ProcessingJob.failure_code == "ProviderCircuitOpen",
+                    ProcessingJob.id != job.id,
+                )
+                .order_by(ProcessingJob.id.asc())
+                .limit(100)
+                .with_for_update()
+            )
+        )
+        for deferred in rows:
+            deferred.attempt_count = 0
+            deferred.lease_token_hash = None
+            deferred.lease_expires_at_utc = None
+            deferred.failure_class = None
+            deferred.failure_code = None
+            deferred.failure_message = None
+            deferred.completed_at_utc = None
+            deferred.updated_at_utc = now
+            request = (
+                dict(deferred.request_json)
+                if isinstance(deferred.request_json, dict)
+                else {}
+            )
+            request.pop("quotaBlockReason", None)
+            deferred.request_json = request
+            if deferred.job_type == "Description":
+                self._clear_description_staging_request(deferred)
+                deferred.status = "Preparing"
+                deferred.next_attempt_at_utc = None
+            else:
+                deferred.status = "Queued"
+                deferred.next_attempt_at_utc = now
+                promoted_dispatch.append(
+                    (_uuid(deferred.public_id), deferred.job_type)
+                )
+            self._add_job_change(session, job=deferred, now=now)
+        session.execute(
+            update(ProcessingJob)
+            .where(
+                ProcessingJob.user_id == job.user_id,
+                ProcessingJob.provider == job.provider,
+                ProcessingJob.status == "DeferredQuota",
+                ProcessingJob.failure_code == "ProviderCircuitOpen",
+                ProcessingJob.id != job.id,
+            )
+            .values(next_attempt_at_utc=now, updated_at_utc=now)
+        )
+        return promoted_dispatch
+
+    def claim_description_job(
+        self, *, job_id: UUID, message_id: str
+    ) -> DescriptionJob | None:
+        if not message_id or len(message_id) > 1024:
+            return None
+        with transaction_scope(self._session_factory) as session:
+            job = JobRepository(session).by_public_id(
+                job_public_id=job_id, for_update=True
+            )
+            if job is None or job.job_type != "Description":
+                return None
+            now = self._now()
+            request = job.request_json if isinstance(job.request_json, dict) else {}
+            try:
+                asset_revision = str(request["assetRevision"]).lower()
+                staging_bucket = str(request["stagingBucket"])
+                staging_object_key = str(request["stagingObjectKey"])
+                preview_sha256 = str(request["previewSha256"]).lower()
+                preview_byte_size = int(request["previewByteSize"])
+                preview_mime_type = str(request["previewMimeType"])
+                upload_session_id = UUID(str(request["uploadSessionId"]))
+                model = str(request["model"])
+                prompt_version = str(request["promptVersion"])
+                detail = str(request["detail"])
+                service_tier = str(request["serviceTier"])
+                max_words = int(request["maxWords"])
+                monthly_call_limit = int(request["monthlyCallLimit"])
+            except (KeyError, TypeError, ValueError):
+                self._fail_invalid_description_job(job, now=now)
+                self._settle_provider_reservation(
+                    session, job=job, now=now, consumed=False
+                )
+                return None
+            if (
+                not HEX_SHA256.fullmatch(asset_revision)
+                or not HEX_SHA256.fullmatch(preview_sha256)
+                or not staging_bucket
+                or len(staging_bucket) > 63
+                or not staging_object_key
+                or len(staging_object_key) > 1024
+                or preview_byte_size <= 0
+                or preview_byte_size > SCENE_PREVIEW_MAX_BYTES
+                or self._normalized_mime(preview_mime_type)
+                != SCENE_PREVIEW_MIME_TYPE
+                or not model
+                or len(model) > 128
+                or not prompt_version
+                or len(prompt_version) > 64
+                or detail not in {"low", "high"}
+                or service_tier not in {"auto", "default", "flex"}
+                or not 8 <= max_words <= 24
+                or monthly_call_limit < 0
+            ):
+                self._fail_invalid_description_job(job, now=now)
+                self._settle_provider_reservation(
+                    session, job=job, now=now, consumed=False
+                )
+                return None
+            asset = session.scalar(
+                select(MediaAsset).where(
+                    MediaAsset.user_id == job.user_id,
+                    MediaAsset.id == job.media_asset_id,
+                )
+            )
+            try:
+                upload = UploadRepository(session).require(
+                    user_id=job.user_id, upload_public_id=upload_session_id
+                )
+            except NotFoundError:
+                self._fail_stale_description_job(job, now=now)
+                self._settle_provider_reservation(
+                    session, job=job, now=now, consumed=False
+                )
+                return None
+            if (
+                asset is None
+                or asset.lifecycle_state != "Active"
+                or asset.media_type != "Photo"
+                or asset.content_sha256.lower() != asset_revision
+                or asset.storage_state != "LocalOnly"
+                or asset.s3_bucket is not None
+                or upload.media_asset_id != job.media_asset_id
+                or upload.status != "Completed"
+                or upload.object_purpose != "TemporaryProcessing"
+                or upload.upload_kind != "SinglePart"
+                or upload.s3_bucket != staging_bucket
+                or upload.s3_object_key != staging_object_key
+                or upload.checksum_sha256.lower() != preview_sha256
+                or upload.expected_byte_size != preview_byte_size
+            ):
+                self._fail_stale_description_job(job, now=now)
+                self._settle_provider_reservation(
+                    session, job=job, now=now, consumed=False
+                )
+                return None
+            current = AssetRepository(session).current_description(
+                user_id=job.user_id, asset_id=job.media_asset_id
+            )
+            if (
+                current is not None
+                and current.status == "Succeeded"
+                and current.is_current == 1
+                and bool(current.description and current.description.strip())
+            ):
+                self._settle_provider_reservation(
+                    session, job=job, now=now, consumed=False
+                )
+                self._finish_description_job(job, status="Succeeded", now=now)
+                return None
+
+            requested_lease_hash = _lease_hash(message_id)
+            same_active_lease = (
+                job.status == "Running"
+                and job.lease_token_hash == requested_lease_hash
+                and job.lease_expires_at_utc is not None
+                and job.lease_expires_at_utc > now
+            )
+            if not same_active_lease:
+                expired_running_lease = (
+                    job.status == "Running"
+                    and (
+                        job.lease_expires_at_utc is None
+                        or job.lease_expires_at_utc <= now
+                    )
+                )
+                if job.status != "Queued" and not expired_running_lease:
+                    return None
+                if job.next_attempt_at_utc is not None and job.next_attempt_at_utc > now:
+                    return None
+                if job.attempt_count >= job.max_attempts:
+                    self._settle_provider_reservation(
+                        session, job=job, now=now, consumed=False
+                    )
+                    job.status = "Failed"
+                    job.failure_class = "Internal"
+                    job.failure_code = "AttemptsExhausted"
+                    job.failure_message = (
+                        "Scene description exhausted its retry attempts."
+                    )
+                    job.completed_at_utc = now
+                    job.updated_at_utc = now
+                    return None
+                job.status = "Running"
+                job.attempt_count += 1
+                job.lease_token_hash = requested_lease_hash
+                job.lease_expires_at_utc = now + timedelta(
+                    seconds=DESCRIPTION_LEASE_SECONDS
+                )
+                job.started_at_utc = job.started_at_utc or now
+                job.completed_at_utc = None
+                job.failure_class = None
+                job.failure_code = None
+                job.failure_message = None
+                job.updated_at_utc = now
+                session.flush()
+            return DescriptionJob(
+                job_id=_uuid(job.public_id),
+                user_id=job.user_id,
+                media_asset_id=job.media_asset_id,
+                asset_revision=asset_revision,
+                staging_bucket=staging_bucket,
+                staging_object_key=staging_object_key,
+                preview_sha256=preview_sha256,
+                preview_byte_size=preview_byte_size,
+                preview_mime_type=SCENE_PREVIEW_MIME_TYPE,
+                model=model,
+                prompt_version=prompt_version,
+                detail=detail,
+                service_tier=service_tier,
+                max_words=max_words,
+                monthly_call_limit=monthly_call_limit,
+                lease_owner=message_id,
+                attempt_count=job.attempt_count,
+                max_attempts=job.max_attempts,
+            )
+
+    def reserve_description_provider_call(
+        self,
+        *,
+        job: DescriptionJob,
+        provider: str,
+        monthly_limit: int,
+    ) -> bool:
+        if not provider or len(provider) > 64 or monthly_limit < 0:
+            raise ValueError("The scene-description provider limit is invalid")
+        with transaction_scope(self._session_factory) as session:
+            session.execute(
+                select(UserAccount.id)
+                .where(UserAccount.id == job.user_id)
+                .with_for_update()
+            )
+            claimed = self._claimed_description_job(session, claim=job)
+            if claimed is None:
+                return False
+            stored_job, _, _ = claimed
+            if stored_job.provider != provider:
+                raise ValueError("The provider does not match the claimed job")
+            request = dict(stored_job.request_json or {})
+            existing = request.get("providerUsageReservation")
+            now = self._now()
+            usage_month = date(now.year, now.month, 1)
+            if isinstance(existing, dict) and existing.get("state") == "Reserved":
+                current_reservation = (
+                    existing.get("provider") == provider
+                    and existing.get("unitType") == "Request"
+                    and existing.get("units") == "1"
+                    and existing.get("usageMonth") == usage_month.isoformat()
+                )
+                if current_reservation:
+                    usage = ProviderUsageRepository(session).get(
+                        user_id=stored_job.user_id,
+                        provider=provider,
+                        usage_month=usage_month,
+                        unit_type="Request",
+                        for_update=True,
+                    )
+                    if usage is not None and usage.circuit_state == "Open":
+                        request["quotaBlockReason"] = "CircuitOpen"
+                        stored_job.request_json = request
+                        return False
+                    request.pop("quotaBlockReason", None)
+                    stored_job.request_json = request
+                    return usage is not None
+                self._settle_provider_reservation(
+                    session, job=stored_job, now=now, consumed=False
+                )
+                request = dict(stored_job.request_json or {})
+            limit = Decimal(monthly_limit)
+            usage = ProviderUsageRepository(session).get_or_create(
+                user_id=stored_job.user_id,
+                provider=provider,
+                usage_month=usage_month,
+                unit_type="Request",
+                hard_limit_units=limit,
+                now=now,
+            )
+            usage.hard_limit_units = limit
+            if usage.circuit_state == "Open":
+                request["quotaBlockReason"] = "CircuitOpen"
+                stored_job.request_json = request
+                usage.updated_at_utc = now
+                return False
+            request.pop("quotaBlockReason", None)
+            if monthly_limit == 0 or (
+                usage.processed_units + usage.reserved_units + Decimal("1") > limit
+            ):
+                usage.updated_at_utc = now
+                return False
+            usage.reserved_units += Decimal("1")
+            usage.updated_at_utc = now
+            request["providerUsageReservation"] = {
+                "provider": provider,
+                "usageMonth": usage_month.isoformat(),
+                "unitType": "Request",
+                "units": "1",
+                "state": "Reserved",
+            }
+            stored_job.request_json = request
+            stored_job.updated_at_utc = now
+            session.flush()
+            return True
+
+    def consume_description_provider_call(
+        self,
+        *,
+        job: DescriptionJob,
+        provider: str,
+    ) -> bool:
+        """Conservatively charge a scene request before opening the network call."""
+
+        with transaction_scope(self._session_factory) as session:
+            claimed = self._claimed_description_job(session, claim=job)
+            if claimed is None:
+                return False
+            stored_job, _, _ = claimed
+            if stored_job.provider != provider:
+                raise ValueError("The provider does not match the claimed job")
+            request = stored_job.request_json if isinstance(stored_job.request_json, dict) else {}
+            reservation = request.get("providerUsageReservation")
+            if (
+                not isinstance(reservation, dict)
+                or reservation.get("state") != "Reserved"
+                or reservation.get("provider") != provider
+            ):
+                return False
+            now = self._now()
+            self._settle_provider_reservation(
+                session, job=stored_job, now=now, consumed=True
+            )
+            stored_job.updated_at_utc = now
+            session.flush()
+            return True
+
+    def complete_description(
+        self, *, job: DescriptionJob, result: SceneDescriptionResult
+    ) -> DescriptionCleanupDecision:
+        with transaction_scope(self._session_factory) as session:
+            claimed = self._claimed_description_job(session, claim=job)
+            if claimed is None:
+                return DescriptionCleanupDecision.RETAIN
+            stored_job, asset, _ = claimed
+            request = dict(stored_job.request_json or {})
+            if (
+                result.provider != stored_job.provider
+                or result.model != job.model
+                or result.prompt_version != job.prompt_version
+                or not result.description.strip()
+            ):
+                now = self._now()
+                self._settle_provider_reservation(
+                    session, job=stored_job, now=now, consumed=True
+                )
+                stored_job.status = "Failed"
+                stored_job.next_attempt_at_utc = None
+                stored_job.lease_token_hash = None
+                stored_job.lease_expires_at_utc = None
+                stored_job.failure_class = "Internal"
+                stored_job.failure_code = "InvalidSceneDescriptionResult"
+                stored_job.failure_message = (
+                    "The scene-description provider returned an invalid result."
+                )
+                stored_job.completed_at_utc = now
+                stored_job.updated_at_utc = now
+                self._add_job_change(session, job=stored_job, now=now)
+                return DescriptionCleanupDecision.DELETE
+            now = self._now()
+            for current in session.scalars(
+                select(MediaDescription).where(
+                    MediaDescription.user_id == stored_job.user_id,
+                    MediaDescription.media_asset_id == stored_job.media_asset_id,
+                    MediaDescription.is_current == 1,
+                )
+            ):
+                current.is_current = 0
+                current.updated_at_utc = now
+            description = MediaDescription(
+                user_id=stored_job.user_id,
+                media_asset_id=stored_job.media_asset_id,
+                description=result.description,
+                language_code="en",
+                provider=result.provider,
+                model=result.model,
+                prompt_version=result.prompt_version,
+                status="Succeeded",
+                is_current=1,
+                requested_at_utc=stored_job.created_at_utc,
+                completed_at_utc=now,
+                created_at_utc=now,
+                updated_at_utc=now,
+            )
+            session.add(description)
+            session.flush()
+            if isinstance(result.usage, dict):
+                request["providerUsage"] = deepcopy(result.usage)
+                stored_job.request_json = request
+            self._settle_provider_reservation(
+                session, job=stored_job, now=now, consumed=True
+            )
+            self._finish_description_job(stored_job, status="Succeeded", now=now)
+            asset.last_processed_at_utc = now
+            asset.updated_at_utc = now
+            ChangeRepository(session).add(
+                user_id=stored_job.user_id,
+                source_id=stored_job.media_source_id,
+                asset_id=stored_job.media_asset_id,
+                entity_type="MediaDescription",
+                entity_id=description.id,
+                entity_public_id=description.public_id,
+                change_type="Upsert",
+                now=now,
+            )
+            self._add_job_change(session, job=stored_job, now=now)
+            return DescriptionCleanupDecision.DELETE
+
+    def fail_description(
+        self,
+        *,
+        job: DescriptionJob,
+        failure: DescriptionJobFailure,
+        provider_called: bool = True,
+    ) -> DescriptionFailureOutcome:
+        with transaction_scope(self._session_factory) as session:
+            claimed = self._claimed_description_job(session, claim=job)
+            if claimed is None:
+                return DescriptionFailureOutcome(
+                    retry_requested=False,
+                    cleanup=DescriptionCleanupDecision.RETAIN,
+                )
+            stored_job, _, _ = claimed
+            now = self._now()
+            self._settle_provider_reservation(
+                session, job=stored_job, now=now, consumed=provider_called
+            )
+            if provider_called and failure.failure_class in {
+                ProviderFailureClass.AUTHENTICATION,
+                ProviderFailureClass.QUOTA,
+            }:
+                self._open_provider_circuit(
+                    session, job=stored_job, now=now, failure_code=failure.code
+                )
+            should_retry = (
+                failure.retryable and stored_job.attempt_count < stored_job.max_attempts
+            )
+            stored_job.status = "Queued" if should_retry else "Failed"
+            stored_job.next_attempt_at_utc = now if should_retry else None
+            stored_job.failure_class = str(failure.failure_class.value)[:32]
+            stored_job.failure_code = failure.code[:64]
+            stored_job.failure_message = failure.user_message
+            stored_job.lease_token_hash = None
+            stored_job.lease_expires_at_utc = None
+            stored_job.completed_at_utc = None if should_retry else now
+            stored_job.updated_at_utc = now
+            self._add_job_change(session, job=stored_job, now=now)
+            return DescriptionFailureOutcome(
+                retry_requested=should_retry,
+                cleanup=(
+                    DescriptionCleanupDecision.RETAIN
+                    if should_retry
+                    else DescriptionCleanupDecision.DELETE
+                ),
+            )
+
+    def defer_description_quota(
+        self,
+        *,
+        job: DescriptionJob,
+        failure: DescriptionJobFailure,
+        provider_called: bool = False,
+    ) -> DescriptionCleanupDecision:
+        with transaction_scope(self._session_factory) as session:
+            claimed = self._claimed_description_job(session, claim=job)
+            if claimed is None:
+                return DescriptionCleanupDecision.RETAIN
+            stored_job, _, _ = claimed
+            now = self._now()
+            self._settle_provider_reservation(
+                session, job=stored_job, now=now, consumed=provider_called
+            )
+            if provider_called:
+                self._open_provider_circuit(
+                    session, job=stored_job, now=now, failure_code=failure.code
+                )
+            request = (
+                stored_job.request_json
+                if isinstance(stored_job.request_json, dict)
+                else {}
+            )
+            circuit_open = (
+                not provider_called
+                and request.get("quotaBlockReason") == "CircuitOpen"
+            )
+            stored_job.status = "DeferredQuota"
+            stored_job.next_attempt_at_utc = self._first_of_next_month(now)
+            stored_job.failure_class = str(failure.failure_class.value)[:32]
+            stored_job.failure_code = (
+                "ProviderCircuitOpen" if circuit_open else failure.code[:64]
+            )
+            stored_job.failure_message = (
+                "Scene description is paused after a provider credential or quota failure."
+                if circuit_open
+                else failure.user_message
+            )
+            stored_job.lease_token_hash = None
+            stored_job.lease_expires_at_utc = None
+            stored_job.completed_at_utc = None
+            stored_job.updated_at_utc = now
+            self._add_job_change(session, job=stored_job, now=now)
+            return DescriptionCleanupDecision.DELETE
+
+    def _claimed_description_job(
+        self, session: Session, *, claim: DescriptionJob
+    ) -> tuple[ProcessingJob, MediaAsset, UploadSession] | None:
+        now = self._now()
+        stored_job = session.scalar(
+            select(ProcessingJob)
+            .where(
+                ProcessingJob.public_id == str(claim.job_id),
+                ProcessingJob.user_id == claim.user_id,
+                ProcessingJob.media_asset_id == claim.media_asset_id,
+                ProcessingJob.job_type == "Description",
+            )
+            .with_for_update()
+        )
+        if (
+            stored_job is None
+            or stored_job.status != "Running"
+            or stored_job.lease_token_hash != _lease_hash(claim.lease_owner)
+            or stored_job.lease_expires_at_utc is None
+            or stored_job.lease_expires_at_utc <= now
+        ):
+            return None
+        request = stored_job.request_json if isinstance(stored_job.request_json, dict) else {}
+        try:
+            upload_session_id = str(UUID(str(request["uploadSessionId"])))
+            request_values = (
+                str(request["assetRevision"]).lower(),
+                str(request["stagingBucket"]),
+                str(request["stagingObjectKey"]),
+                str(request["previewSha256"]).lower(),
+                int(request["previewByteSize"]),
+                self._normalized_mime(str(request["previewMimeType"])),
+                str(request["model"]),
+                str(request["promptVersion"]),
+                str(request["detail"]),
+                str(request["serviceTier"]),
+                int(request["maxWords"]),
+                int(request["monthlyCallLimit"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        claim_values = (
+            claim.asset_revision,
+            claim.staging_bucket,
+            claim.staging_object_key,
+            claim.preview_sha256,
+            claim.preview_byte_size,
+            self._normalized_mime(claim.preview_mime_type),
+            claim.model,
+            claim.prompt_version,
+            claim.detail,
+            claim.service_tier,
+            claim.max_words,
+            claim.monthly_call_limit,
+        )
+        if request_values != claim_values:
+            return None
+        asset = session.scalar(
+            select(MediaAsset).where(
+                MediaAsset.user_id == stored_job.user_id,
+                MediaAsset.id == stored_job.media_asset_id,
+                MediaAsset.content_sha256 == claim.asset_revision,
+                MediaAsset.lifecycle_state == "Active",
+                MediaAsset.storage_state == "LocalOnly",
+            )
+        )
+        upload = session.scalar(
+            select(UploadSession).where(
+                UploadSession.user_id == stored_job.user_id,
+                UploadSession.public_id == upload_session_id,
+                UploadSession.media_asset_id == stored_job.media_asset_id,
+                UploadSession.object_purpose == "TemporaryProcessing",
+                UploadSession.upload_kind == "SinglePart",
+                UploadSession.status == "Completed",
+            )
+        )
+        if (
+            asset is None
+            or asset.s3_bucket is not None
+            or asset.original_s3_object_key is not None
+            or asset.preview_s3_object_key is not None
+            or upload is None
+            or upload.s3_bucket != claim.staging_bucket
+            or upload.s3_object_key != claim.staging_object_key
+            or upload.checksum_sha256.lower() != claim.preview_sha256
+            or upload.expected_byte_size != claim.preview_byte_size
+        ):
+            return None
+        return stored_job, asset, upload
+
+    @staticmethod
+    def _finish_description_job(
+        job: ProcessingJob, *, status: str, now: datetime
+    ) -> None:
+        job.status = status
+        job.next_attempt_at_utc = None
+        job.lease_token_hash = None
+        job.lease_expires_at_utc = None
+        job.failure_class = None
+        job.failure_code = None
+        job.failure_message = None
+        job.completed_at_utc = now
+        job.updated_at_utc = now
+
+    @staticmethod
+    def _fail_invalid_description_job(
+        job: ProcessingJob, *, now: datetime
+    ) -> None:
+        job.status = "Failed"
+        job.next_attempt_at_utc = None
+        job.lease_token_hash = None
+        job.lease_expires_at_utc = None
+        job.failure_class = "Internal"
+        job.failure_code = "InvalidJobPayload"
+        job.failure_message = "Scene description could not read its job payload."
+        job.completed_at_utc = now
+        job.updated_at_utc = now
+
+    @staticmethod
+    def _fail_stale_description_job(
+        job: ProcessingJob, *, now: datetime
+    ) -> None:
+        job.status = "Cancelled"
+        job.next_attempt_at_utc = None
+        job.lease_token_hash = None
+        job.lease_expires_at_utc = None
+        job.failure_class = "InvalidMedia"
+        job.failure_code = "StaleScenePreview"
+        job.failure_message = "Scene description was superseded by newer media data."
+        job.completed_at_utc = now
+        job.updated_at_utc = now
+
+    def claim_geocode_job(
+        self, *, job_id: UUID, message_id: str
+    ) -> GeocodeJob | None:
+        """Atomically lease a queued geocode job to one SQS delivery.
+
+        A missing job is an expected orphan-message outcome because dispatch occurs
+        just before the creating transaction commits. Duplicate or stale messages
+        are likewise acknowledged by returning ``None``.
+        """
+
+        if not message_id or len(message_id) > 1024:
+            return None
+        with transaction_scope(self._session_factory) as session:
+            repository = JobRepository(session)
+            job = repository.by_public_id(job_public_id=job_id, for_update=True)
+            if job is None or job.job_type != "Geocode":
+                return None
+            now = self._now()
+            request = job.request_json if isinstance(job.request_json, dict) else {}
+            try:
+                latitude = Decimal(str(request["latitude"]))
+                longitude = Decimal(str(request["longitude"]))
+                revision = str(request["coordinateRevision"])
+            except (KeyError, TypeError, ValueError):
+                self._fail_invalid_geocode_job(job, now=now)
+                return None
+            if (
+                not latitude.is_finite()
+                or not longitude.is_finite()
+                or not Decimal("-90") <= latitude <= Decimal("90")
+                or not Decimal("-180") <= longitude <= Decimal("180")
+                or revision != _coordinate_revision(latitude, longitude)
+            ):
+                self._fail_invalid_geocode_job(job, now=now)
+                return None
+            location = LocationRepository(session).by_asset(
+                user_id=job.user_id, asset_id=job.media_asset_id
+            )
+            asset_active = session.scalar(
+                select(MediaAsset.lifecycle_state).where(
+                    MediaAsset.user_id == job.user_id,
+                    MediaAsset.id == job.media_asset_id,
+                )
+            )
+            if (
+                asset_active != "Active"
+                or
+                location is None
+                or location.latitude is None
+                or location.longitude is None
+                or _coordinate_revision(location.latitude, location.longitude) != revision
+            ):
+                self._settle_provider_reservation(
+                    session, job=job, now=now, consumed=True
+                )
+                self._cancel_stale_geocode_job(job, now=now)
+                return None
+
+            requested_lease_hash = _lease_hash(message_id)
+            same_active_lease = (
+                job.status == "Running"
+                and job.lease_token_hash == requested_lease_hash
+                and job.lease_expires_at_utc is not None
+                and job.lease_expires_at_utc > now
+            )
+            if not same_active_lease:
+                expired_running_lease = (
+                    job.status == "Running"
+                    and (
+                        job.lease_expires_at_utc is None
+                        or job.lease_expires_at_utc <= now
+                    )
+                )
+                if job.status != "Queued" and not expired_running_lease:
+                    return None
+                if job.next_attempt_at_utc is not None and job.next_attempt_at_utc > now:
+                    return None
+                if job.attempt_count >= job.max_attempts:
+                    self._settle_provider_reservation(
+                        session, job=job, now=now, consumed=True
+                    )
+                    job.status = "Failed"
+                    job.failure_class = "Internal"
+                    job.failure_code = "AttemptsExhausted"
+                    job.failure_message = "Location enrichment exhausted its retry attempts."
+                    job.completed_at_utc = now
+                    job.updated_at_utc = now
+                    return None
+                job.status = "Running"
+                job.attempt_count += 1
+                job.lease_token_hash = requested_lease_hash
+                job.lease_expires_at_utc = now + timedelta(
+                    seconds=GEOCODE_LEASE_SECONDS
+                )
+                job.started_at_utc = job.started_at_utc or now
+                job.completed_at_utc = None
+                job.failure_class = None
+                job.failure_code = None
+                job.failure_message = None
+                job.updated_at_utc = now
+                session.flush()
+            return GeocodeJob(
+                job_id=_uuid(job.public_id),
+                user_id=job.user_id,
+                media_asset_id=job.media_asset_id,
+                latitude=float(latitude),
+                longitude=float(longitude),
+                attempt_count=job.attempt_count,
+                max_attempts=job.max_attempts,
+                coordinate_revision=revision,
+                lease_owner=message_id,
+            )
+
+    def find_reusable_location(
+        self, *, job: GeocodeJob, radius_meters: float
+    ) -> ReverseGeocodeResult | None:
+        if radius_meters < 0 or radius_meters > 100:
+            raise ValueError("The geocode reuse radius must be between 0 and 100 meters")
+        with transaction_scope(self._session_factory) as session:
+            claimed = self._claimed_geocode_job(session, claim=job)
+            if claimed is None:
+                return None
+            stored_job, current_location = claimed
+            reusable = LocationRepository(session).resolved_nearby(
+                user_id=stored_job.user_id,
+                latitude=current_location.latitude,
+                longitude=current_location.longitude,
+                radius_meters=radius_meters,
+                exclude_asset_id=stored_job.media_asset_id,
+            )
+            if reusable is None:
+                return None
+            reusable_result = self._reverse_geocode_result(reusable)
+            if (
+                reusable_result.resolution is not None
+                and not self._location_normalizer.can_reuse(
+                    reusable_result.resolution
+                )
+            ):
+                return None
+            request = dict(stored_job.request_json or {})
+            request["reuseLocationPublicId"] = reusable.public_id
+            stored_job.request_json = request
+            stored_job.updated_at_utc = self._now()
+            session.flush()
+            return reusable_result
+
+    def reserve_provider_call(
+        self,
+        *,
+        job: GeocodeJob,
+        provider: str,
+        monthly_limit: int,
+    ) -> bool:
+        if not provider or len(provider) > 64:
+            raise ValueError("The geocode provider identity is invalid")
+        if monthly_limit < 0:
+            raise ValueError("The monthly provider limit cannot be negative")
+        with transaction_scope(self._session_factory) as session:
+            # Serialize creation of the per-user/month counter without requiring
+            # an external lock or allowing two first calls to overrun the cap.
+            session.execute(
+                select(UserAccount.id)
+                .where(UserAccount.id == job.user_id)
+                .with_for_update()
+            )
+            claimed = self._claimed_geocode_job(session, claim=job)
+            if claimed is None:
+                return False
+            stored_job, _ = claimed
+            if stored_job.provider != provider:
+                raise ValueError("The provider does not match the claimed job")
+            request = dict(stored_job.request_json or {})
+            existing_reservation = request.get("providerUsageReservation")
+            now = self._now()
+            usage_month = date(now.year, now.month, 1)
+            if (
+                isinstance(existing_reservation, dict)
+                and existing_reservation.get("state") == "Reserved"
+            ):
+                current_reservation = (
+                    existing_reservation.get("provider") == provider
+                    and existing_reservation.get("usageMonth")
+                    == usage_month.isoformat()
+                    and existing_reservation.get("unitType") == "Request"
+                    and existing_reservation.get("units") == "1"
+                )
+                if current_reservation:
+                    usage = ProviderUsageRepository(session).get(
+                        user_id=stored_job.user_id,
+                        provider=provider,
+                        usage_month=usage_month,
+                        unit_type="Request",
+                        for_update=True,
+                    )
+                    if usage is not None and usage.circuit_state == "Open":
+                        request["quotaBlockReason"] = "CircuitOpen"
+                        stored_job.request_json = request
+                        return False
+                    request.pop("quotaBlockReason", None)
+                    stored_job.request_json = request
+                    return usage is not None
+                self._settle_provider_reservation(
+                    session, job=stored_job, now=now, consumed=False
+                )
+                request = dict(stored_job.request_json or {})
+            limit = Decimal(monthly_limit)
+            usage = ProviderUsageRepository(session).get_or_create(
+                user_id=stored_job.user_id,
+                provider=provider,
+                usage_month=usage_month,
+                unit_type="Request",
+                hard_limit_units=limit,
+                now=now,
+            )
+            usage.hard_limit_units = limit
+            used_or_reserved = usage.processed_units + usage.reserved_units
+            if usage.circuit_state == "Open":
+                request["quotaBlockReason"] = "CircuitOpen"
+                stored_job.request_json = request
+                usage.updated_at_utc = now
+                session.flush()
+                return False
+            request.pop("quotaBlockReason", None)
+            if (
+                monthly_limit == 0
+                or used_or_reserved + Decimal("1") > limit
+            ):
+                usage.updated_at_utc = now
+                session.flush()
+                return False
+            usage.reserved_units += Decimal("1")
+            usage.updated_at_utc = now
+            request["providerUsageReservation"] = {
+                "provider": provider,
+                "usageMonth": usage_month.isoformat(),
+                "unitType": "Request",
+                "units": "1",
+                "state": "Reserved",
+            }
+            stored_job.request_json = request
+            stored_job.updated_at_utc = now
+            session.flush()
+            return True
+
+    def consume_provider_call(
+        self,
+        *,
+        job: GeocodeJob,
+        provider: str,
+    ) -> bool:
+        """Conservatively charge a geocode request before opening the network call."""
+
+        with transaction_scope(self._session_factory) as session:
+            claimed = self._claimed_geocode_job(session, claim=job)
+            if claimed is None:
+                return False
+            stored_job, _ = claimed
+            if stored_job.provider != provider:
+                raise ValueError("The provider does not match the claimed job")
+            request = stored_job.request_json if isinstance(stored_job.request_json, dict) else {}
+            reservation = request.get("providerUsageReservation")
+            if (
+                not isinstance(reservation, dict)
+                or reservation.get("state") != "Reserved"
+                or reservation.get("provider") != provider
+            ):
+                return False
+            now = self._now()
+            self._settle_provider_reservation(
+                session, job=stored_job, now=now, consumed=True
+            )
+            stored_job.updated_at_utc = now
+            session.flush()
+            return True
+
+    def complete_geocode(
+        self,
+        *,
+        job: GeocodeJob,
+        result: ReverseGeocodeResult,
+        reused: bool,
+    ) -> None:
+        with transaction_scope(self._session_factory) as session:
+            claimed = self._claimed_geocode_job(session, claim=job)
+            if claimed is None:
+                return
+            stored_job, location = claimed
+            now = self._now()
+            self._apply_geocode_result(location, result=result, now=now)
+            self._apply_geocode_timezone(
+                session,
+                user_id=stored_job.user_id,
+                asset_id=stored_job.media_asset_id,
+                result=result,
+                now=now,
+            )
+            location.updated_at_utc = now
+            self._settle_provider_reservation(
+                session, job=stored_job, now=now, consumed=not reused
+            )
+            self._finish_geocode_job(stored_job, status="Succeeded", now=now)
+            session.flush()
+            self._add_geocode_changes(session, job=stored_job, location=location, now=now)
+
+    def fail_geocode(
+        self, *, job: GeocodeJob, failure: GeocodeJobFailure
+    ) -> bool:
+        with transaction_scope(self._session_factory) as session:
+            claimed = self._claimed_geocode_job(session, claim=job)
+            if claimed is None:
+                return False
+            stored_job, _ = claimed
+            now = self._now()
+            self._settle_provider_reservation(
+                session, job=stored_job, now=now, consumed=True
+            )
+            if failure.failure_class in {
+                ProviderFailureClass.AUTHENTICATION,
+                ProviderFailureClass.QUOTA,
+            }:
+                self._open_provider_circuit(
+                    session, job=stored_job, now=now, failure_code=failure.code
+                )
+            should_retry = failure.retryable and stored_job.attempt_count < stored_job.max_attempts
+            stored_job.status = "Queued" if should_retry else "Failed"
+            stored_job.next_attempt_at_utc = now if should_retry else None
+            stored_job.failure_class = str(failure.failure_class.value)[:32]
+            stored_job.failure_code = failure.code[:64]
+            stored_job.failure_message = failure.user_message
+            stored_job.lease_token_hash = None
+            stored_job.lease_expires_at_utc = None
+            stored_job.completed_at_utc = None if should_retry else now
+            stored_job.updated_at_utc = now
+            session.flush()
+            self._add_job_change(session, job=stored_job, now=now)
+            return should_retry
+
+    def defer_geocode_quota(
+        self,
+        *,
+        job: GeocodeJob,
+        failure: GeocodeJobFailure,
+        provider_called: bool,
+    ) -> None:
+        with transaction_scope(self._session_factory) as session:
+            claimed = self._claimed_geocode_job(session, claim=job)
+            if claimed is None:
+                return
+            stored_job, _ = claimed
+            now = self._now()
+            self._settle_provider_reservation(
+                session, job=stored_job, now=now, consumed=provider_called
+            )
+            if provider_called:
+                self._open_provider_circuit(
+                    session, job=stored_job, now=now, failure_code=failure.code
+                )
+            request = (
+                stored_job.request_json
+                if isinstance(stored_job.request_json, dict)
+                else {}
+            )
+            circuit_open = (
+                not provider_called
+                and request.get("quotaBlockReason") == "CircuitOpen"
+            )
+            next_year = now.year + 1 if now.month == 12 else now.year
+            next_month = 1 if now.month == 12 else now.month + 1
+            stored_job.status = "DeferredQuota"
+            stored_job.next_attempt_at_utc = datetime(next_year, next_month, 1)
+            stored_job.failure_class = str(failure.failure_class.value)[:32]
+            stored_job.failure_code = (
+                "ProviderCircuitOpen" if circuit_open else failure.code[:64]
+            )
+            stored_job.failure_message = (
+                "Location enrichment is paused after a provider credential or quota failure."
+                if circuit_open
+                else failure.user_message
+            )
+            stored_job.lease_token_hash = None
+            stored_job.lease_expires_at_utc = None
+            stored_job.completed_at_utc = None
+            stored_job.updated_at_utc = now
+            session.flush()
+            self._add_job_change(session, job=stored_job, now=now)
+
+    def _claimed_geocode_job(
+        self, session: Session, *, claim: GeocodeJob
+    ) -> tuple[ProcessingJob, MediaLocation] | None:
+        now = self._now()
+        stored_job = session.scalar(
+            select(ProcessingJob)
+            .where(
+                ProcessingJob.public_id == str(claim.job_id),
+                ProcessingJob.user_id == claim.user_id,
+                ProcessingJob.media_asset_id == claim.media_asset_id,
+                ProcessingJob.job_type == "Geocode",
+            )
+            .with_for_update()
+        )
+        if (
+            stored_job is None
+            or stored_job.status != "Running"
+            or stored_job.lease_token_hash != _lease_hash(claim.lease_owner)
+            or stored_job.lease_expires_at_utc is None
+            or stored_job.lease_expires_at_utc <= now
+        ):
+            return None
+        request = stored_job.request_json if isinstance(stored_job.request_json, dict) else {}
+        if request.get("coordinateRevision") != claim.coordinate_revision:
+            return None
+        location = LocationRepository(session).by_asset(
+            user_id=stored_job.user_id, asset_id=stored_job.media_asset_id
+        )
+        asset_active = session.scalar(
+            select(MediaAsset.lifecycle_state).where(
+                MediaAsset.user_id == stored_job.user_id,
+                MediaAsset.id == stored_job.media_asset_id,
+            )
+        )
+        if (
+            asset_active != "Active"
+            or
+            location is None
+            or location.latitude is None
+            or location.longitude is None
+            or _coordinate_revision(location.latitude, location.longitude)
+            != claim.coordinate_revision
+        ):
+            self._settle_provider_reservation(
+                session, job=stored_job, now=now, consumed=True
+            )
+            self._cancel_stale_geocode_job(stored_job, now=now)
+            session.flush()
+            self._add_job_change(session, job=stored_job, now=now)
+            return None
+        return stored_job, location
+
+    @staticmethod
+    def _apply_geocode_result(
+        location: MediaLocation, *, result: ReverseGeocodeResult, now: datetime
+    ) -> None:
+        resolution = result.resolution
+        location.provider = result.provider
+        location.provider_updated_at_utc = (
+            _db_datetime(result.provider_updated_at_utc) or now
+        )
+        location.raw_provider_json = deepcopy(dict(result.raw_provider_json))
+        if resolution is None:
+            for attribute in (
+                "location_display_name",
+                "street_address",
+                "original_street_number",
+                "neighborhood",
+                "city",
+                "county",
+                "state",
+                "postal_code",
+                "country",
+                "country_code",
+                "provider_place_id",
+                "normalization_rule_version",
+                "confidence",
+            ):
+                setattr(location, attribute, None)
+            return
+        location.location_display_name = resolution.location_display_name
+        location.street_address = resolution.street_address
+        location.original_street_number = resolution.original_street_number
+        location.neighborhood = resolution.neighborhood
+        location.city = resolution.city
+        location.county = resolution.county
+        location.state = resolution.state
+        location.postal_code = resolution.postal_code
+        location.country = resolution.country
+        location.country_code = resolution.country_code
+        location.provider = resolution.provider
+        location.provider_place_id = resolution.provider_place_id
+        location.normalization_rule_version = resolution.normalization_rule_version
+        # Address-match certainty is not the same thing as EXIF GPS certainty.
+        # Keep this unset until the API exposes a dedicated address-confidence field.
+        location.confidence = None
+
+    @staticmethod
+    def _reverse_geocode_result(location: MediaLocation) -> ReverseGeocodeResult:
+        raw = deepcopy(location.raw_provider_json) or {}
+        original = (
+            raw.get("OriginalAddress")
+            if isinstance(raw.get("OriginalAddress"), dict)
+            else None
+        )
+
+        def original_text(key: str, fallback: str | None) -> str | None:
+            if original is None:
+                return fallback
+            value = original.get(key)
+            return str(value) if isinstance(value, str) and value else fallback
+
+        provider_status = str(
+            raw.get("ProviderStatus") or raw.get("status") or "OK"
+        )
+        has_address = any(
+            (
+                original_text("DisplayName", location.location_display_name),
+                original_text("StreetAddress", location.street_address),
+                original_text("City", location.city),
+                original_text("State", location.state),
+                original_text("Country", location.country),
+            )
+        )
+        resolution = None
+        if has_address:
+            resolution = GeocodeResolution(
+                location_display_name=original_text(
+                    "DisplayName", location.location_display_name
+                )
+                or "",
+                street_address=original_text(
+                    "StreetAddress", location.street_address
+                ),
+                original_street_number=original_text(
+                    "StreetNumber", location.original_street_number
+                ),
+                neighborhood=original_text(
+                    "Neighborhood", location.neighborhood
+                ),
+                city=original_text("City", location.city),
+                county=original_text("County", location.county),
+                state=original_text("State", location.state),
+                postal_code=original_text("PostalCode", location.postal_code),
+                country=original_text("Country", location.country),
+                country_code=original_text(
+                    "CountryCode", location.country_code
+                ),
+                provider=location.provider or GEOCODE_PROVIDER,
+                provider_place_id=location.provider_place_id,
+                raw_provider_json=deepcopy(raw),
+                normalization_rule_version=(
+                    None
+                    if original is not None
+                    else location.normalization_rule_version
+                ),
+                time_zone_id=(
+                    str((raw.get("TimeZone") or {}).get("Name"))
+                    if isinstance(raw.get("TimeZone"), dict)
+                    and (raw.get("TimeZone") or {}).get("Name")
+                    else None
+                ),
+            )
+        return ReverseGeocodeResult(
+            provider=location.provider or GEOCODE_PROVIDER,
+            provider_status=provider_status,
+            resolution=resolution,
+            raw_provider_json=raw,
+            provider_updated_at_utc=_utc(location.provider_updated_at_utc),
+        )
+
+    @staticmethod
+    def _apply_geocode_timezone(
+        session: Session,
+        *,
+        user_id: int,
+        asset_id: int,
+        result: ReverseGeocodeResult,
+        now: datetime,
+    ) -> None:
+        resolution = result.resolution
+        if resolution is None or not resolution.time_zone_id:
+            return
+        asset = session.scalar(
+            select(MediaAsset).where(
+                MediaAsset.user_id == user_id,
+                MediaAsset.id == asset_id,
+            )
+        )
+        if asset is None:
+            return
+        changed = False
+        if not asset.time_zone:
+            asset.time_zone = resolution.time_zone_id
+            changed = True
+        if asset.capture_datetime_local is not None:
+            try:
+                aware_local = asset.capture_datetime_local.replace(
+                    tzinfo=ZoneInfo(asset.time_zone or resolution.time_zone_id)
+                )
+            except (ValueError, ZoneInfoNotFoundError):
+                aware_local = None
+            if aware_local is not None:
+                offset = aware_local.utcoffset()
+                if asset.utc_offset_minutes is None and offset is not None:
+                    asset.utc_offset_minutes = int(offset.total_seconds() // 60)
+                    changed = True
+                if asset.capture_datetime_utc is None:
+                    asset.capture_datetime_utc = aware_local.astimezone(
+                        timezone.utc
+                    ).replace(tzinfo=None)
+                    changed = True
+        if changed:
+            asset.updated_at_utc = now
+
+    def _settle_provider_reservation(
+        self,
+        session: Session,
+        *,
+        job: ProcessingJob,
+        now: datetime,
+        consumed: bool,
+    ) -> None:
+        request = dict(job.request_json or {})
+        reservation = request.get("providerUsageReservation")
+        if not isinstance(reservation, dict) or reservation.get("state") != "Reserved":
+            return
+        try:
+            usage_month = date.fromisoformat(str(reservation["usageMonth"]))
+            provider = str(reservation["provider"])
+            unit_type = str(reservation["unitType"])
+            units = Decimal(str(reservation.get("units", "1")))
+        except (KeyError, ValueError):
+            request.pop("providerUsageReservation", None)
+            job.request_json = request
+            return
+        usage = ProviderUsageRepository(session).get(
+            user_id=job.user_id,
+            provider=provider,
+            usage_month=usage_month,
+            unit_type=unit_type,
+            for_update=True,
+        )
+        if usage is not None:
+            released = min(usage.reserved_units, units)
+            usage.reserved_units -= released
+            if consumed:
+                usage.processed_units += released
+            usage.updated_at_utc = now
+        request.pop("providerUsageReservation", None)
+        job.request_json = request
+
+    @staticmethod
+    def _open_provider_circuit(
+        session: Session,
+        *,
+        job: ProcessingJob,
+        now: datetime,
+        failure_code: str,
+    ) -> None:
+        if not job.provider:
+            return
+        usage = ProviderUsageRepository(session).get(
+            user_id=job.user_id,
+            provider=job.provider,
+            usage_month=date(now.year, now.month, 1),
+            unit_type="Request",
+            for_update=True,
+        )
+        if usage is None:
+            return
+        usage.circuit_state = "Open"
+        usage.circuit_opened_at_utc = now
+        usage.circuit_failure_code = failure_code[:64]
+        usage.updated_at_utc = now
+
+    @staticmethod
+    def _provider_circuit_is_open(
+        session: Session,
+        *,
+        job: ProcessingJob,
+        now: datetime,
+    ) -> bool:
+        if not job.provider:
+            return False
+        usage = ProviderUsageRepository(session).get(
+            user_id=job.user_id,
+            provider=job.provider,
+            usage_month=date(now.year, now.month, 1),
+            unit_type="Request",
+            for_update=True,
+        )
+        return usage is not None and usage.circuit_state == "Open"
+
+    @staticmethod
+    def _close_provider_circuit(
+        session: Session,
+        *,
+        job: ProcessingJob,
+        now: datetime,
+    ) -> None:
+        if not job.provider:
+            return
+        usage = ProviderUsageRepository(session).get(
+            user_id=job.user_id,
+            provider=job.provider,
+            usage_month=date(now.year, now.month, 1),
+            unit_type="Request",
+            for_update=True,
+        )
+        if usage is None:
+            return
+        usage.circuit_state = "Closed"
+        usage.circuit_opened_at_utc = None
+        usage.circuit_failure_code = None
+        usage.updated_at_utc = now
+
+    @staticmethod
+    def _finish_geocode_job(
+        job: ProcessingJob, *, status: str, now: datetime
+    ) -> None:
+        job.status = status
+        job.next_attempt_at_utc = None
+        job.lease_token_hash = None
+        job.lease_expires_at_utc = None
+        job.failure_class = None
+        job.failure_code = None
+        job.failure_message = None
+        job.completed_at_utc = now
+        job.updated_at_utc = now
+
+    @staticmethod
+    def _cancel_stale_geocode_job(job: ProcessingJob, *, now: datetime) -> None:
+        job.status = "Cancelled"
+        job.next_attempt_at_utc = None
+        job.lease_token_hash = None
+        job.lease_expires_at_utc = None
+        job.failure_class = "InvalidMedia"
+        job.failure_code = "StaleCoordinates"
+        job.failure_message = "Location enrichment was superseded by newer GPS data."
+        job.completed_at_utc = now
+        job.updated_at_utc = now
+
+    @staticmethod
+    def _fail_invalid_geocode_job(job: ProcessingJob, *, now: datetime) -> None:
+        job.status = "Failed"
+        job.next_attempt_at_utc = None
+        job.lease_token_hash = None
+        job.lease_expires_at_utc = None
+        job.failure_class = "Internal"
+        job.failure_code = "InvalidJobPayload"
+        job.failure_message = "Location enrichment could not read its job payload."
+        job.completed_at_utc = now
+        job.updated_at_utc = now
+
+    @staticmethod
+    def _add_job_change(
+        session: Session, *, job: ProcessingJob, now: datetime
+    ) -> None:
+        ChangeRepository(session).add(
+            user_id=job.user_id,
+            source_id=job.media_source_id,
+            asset_id=job.media_asset_id,
+            entity_type="ProcessingJob",
+            entity_id=job.id,
+            entity_public_id=job.public_id,
+            change_type="Upsert",
+            now=now,
+        )
+
+    def _add_geocode_changes(
+        self,
+        session: Session,
+        *,
+        job: ProcessingJob,
+        location: MediaLocation,
+        now: datetime,
+    ) -> None:
+        ChangeRepository(session).add(
+            user_id=job.user_id,
+            source_id=job.media_source_id,
+            asset_id=job.media_asset_id,
+            entity_type="MediaLocation",
+            entity_id=location.id,
+            entity_public_id=location.public_id,
+            change_type="Upsert",
+            now=now,
+        )
+        self._add_job_change(session, job=job, now=now)
 
     def _optional_source_id(
         self, session: Session, user_id: int, source_public_id: UUID | None
@@ -1701,13 +4795,7 @@ class Phase1DomainService:
                 highlight = asset.media_type
             elif self._location_contains(location, needle):
                 matched_field = "Location"
-                highlight = (
-                    location.location_display_name
-                    or location.street_address
-                    or location.city
-                    if location is not None
-                    else None
-                )
+                highlight = self._location_highlight(location, needle)
             else:
                 matched_field = "Date"
                 highlight = str(
@@ -1743,6 +4831,32 @@ class Phase1DomainService:
         )
 
     @staticmethod
+    def _location_highlight(
+        location: MediaLocation | None, needle: str
+    ) -> str | None:
+        if location is None:
+            return None
+        values = (
+            location.street_address,
+            location.neighborhood,
+            location.city,
+            location.county,
+            location.state,
+            location.postal_code,
+            location.country,
+            location.country_code,
+            location.location_display_name,
+        )
+        return next(
+            (
+                value
+                for value in values
+                if value is not None and needle in value.casefold()
+            ),
+            location.street_address or location.location_display_name,
+        )
+
+    @staticmethod
     def _user_facing_state(
         session: Session, user_id: int, asset: MediaAsset
     ) -> str:
@@ -1762,6 +4876,8 @@ class Phase1DomainService:
             return "WaitingForMonthlyQuota"
         if "Failed" in statuses:
             return "NeedsAttention"
+        if "Preparing" in statuses:
+            return "Preparing"
         if statuses.intersection({"Queued", "Running"}):
             return "Processing"
         return "Ready"
@@ -1821,6 +4937,11 @@ class Phase1DomainService:
             country=location.country,
             country_code=location.country_code,
             provenance=provenance,
+            original_street_number=location.original_street_number,
+            provider=location.provider,
+            provider_place_id=location.provider_place_id,
+            normalization_rule_version=location.normalization_rule_version,
+            provider_updated_at_utc=_utc(location.provider_updated_at_utc),
         )
 
     @staticmethod
@@ -1917,6 +5038,7 @@ class Phase1DomainService:
             job_type=job.job_type,
             status=job.status,
             state={
+                "Preparing": "Preparing",
                 "Queued": "Processing",
                 "Running": "Processing",
                 "Succeeded": "Ready",
@@ -1929,7 +5051,21 @@ class Phase1DomainService:
             failure_class=job.failure_class,
             error_code=job.failure_code,
             user_message=job.failure_message,
-            can_retry=(job.status == "Failed" and job.attempt_count < job.max_attempts),
+            can_retry=(
+                job.status == "DeferredQuota"
+                or (
+                    job.job_type == "Description"
+                    and job.status == "Cancelled"
+                    and job.failure_code
+                    in {
+                        "UnsupportedPhoto",
+                        "SourceChanged",
+                        "SourceUnavailable",
+                        "UserSkipped",
+                    }
+                )
+                or (job.status == "Failed" and job.attempt_count < job.max_attempts)
+            ),
             created_at_utc=_utc(job.created_at_utc) or datetime.now(timezone.utc),
             started_at_utc=_utc(job.started_at_utc),
             completed_at_utc=_utc(job.completed_at_utc),
@@ -2054,6 +5190,7 @@ class Phase1DomainService:
                 continue
             occurrence_id = item.get("occurrence_id")
             asset_id = item.get("media_asset_id")
+            description_job_id = item.get("description_job_id")
             results.append(
                 ManifestEntryResult(
                     source_item_id=str(item["source_item_id"]),
@@ -2061,6 +5198,9 @@ class Phase1DomainService:
                     occurrence_id=(UUID(str(occurrence_id)) if occurrence_id else None),
                     media_asset_id=(UUID(str(asset_id)) if asset_id else None),
                     upload_required=bool(item.get("upload_required", False)),
+                    description_job_id=(
+                        UUID(str(description_job_id)) if description_job_id else None
+                    ),
                     error_code=(
                         str(item["error_code"])
                         if item.get("error_code") is not None
@@ -2092,6 +5232,53 @@ class Phase1DomainService:
                 rejected=int(count_values.get("rejected", 0)),
             ),
             results=tuple(results),
+        )
+
+    @staticmethod
+    def _upload_plan_from_json(value: Mapping[str, Any]) -> UploadPlanRecord:
+        single_value = value.get("single_part")
+        single_part = None
+        if isinstance(single_value, dict):
+            headers = single_value.get("headers")
+            single_part = SignedUploadRequestRecord(
+                url=str(single_value["url"]),
+                method="PUT",
+                headers=(
+                    {str(key): str(item) for key, item in headers.items()}
+                    if isinstance(headers, dict)
+                    else {}
+                ),
+                expires_at_utc=_parse_datetime(single_value["expires_at_utc"])
+                or datetime.now(timezone.utc),
+            )
+        session_id = value.get("upload_session_id")
+        return UploadPlanRecord(
+            disposition=str(value["disposition"]),
+            strategy=str(value["strategy"]),
+            media_asset_id=UUID(str(value["media_asset_id"])),
+            occurrence_id=UUID(str(value["occurrence_id"])),
+            upload_session_id=(UUID(str(session_id)) if session_id else None),
+            expires_at_utc=_parse_datetime(value.get("expires_at_utc")),
+            deduplicated=bool(value.get("deduplicated", False)),
+            retry_after_seconds=(
+                int(value["retry_after_seconds"])
+                if value.get("retry_after_seconds") is not None
+                else None
+            ),
+            single_part=single_part,
+        )
+
+    @staticmethod
+    def _upload_complete_from_json(
+        value: Mapping[str, Any]
+    ) -> UploadCompleteRecord:
+        jobs = value.get("processing_jobs")
+        if not isinstance(jobs, list):
+            jobs = []
+        return UploadCompleteRecord(
+            media_asset_id=UUID(str(value["media_asset_id"])),
+            storage_state=str(value["storage_state"]),
+            processing_jobs=tuple(UUID(str(item)) for item in jobs),
         )
 
     @staticmethod

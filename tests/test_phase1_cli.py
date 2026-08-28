@@ -827,8 +827,17 @@ def test_media_and_job_commands_use_existing_api_surface(tmp_path: Path, monkeyp
             self.calls.append("jobs-list")
             return []
 
-        def retry_job(self, job_id):
-            self.calls.append(f"jobs-retry:{job_id}")
+        def get_job(self, job_id):
+            self.calls.append(f"jobs-get:{job_id}")
+            return {
+                "jobId": job_id,
+                "jobType": "Geocode",
+                "status": "Failed",
+                "attemptCount": 1,
+            }
+
+        def retry_job(self, job_id, *, key):
+            self.calls.append(f"jobs-retry:{job_id}:{key}")
             return {"jobId": job_id, "status": "Queued"}
 
     api = SurfaceApi()
@@ -848,7 +857,8 @@ def test_media_and_job_commands_use_existing_api_surface(tmp_path: Path, monkeyp
         "show:asset-1:66bf29e1-8c76-42aa-bd9b-d7487f914276",
         "search:beach:66bf29e1-8c76-42aa-bd9b-d7487f914276",
         "jobs-list",
-        "jobs-retry:job-1",
+        "jobs-get:job-1",
+        "jobs-retry:job-1:job-retry:job-1:Failed:1",
     ]
     assert api.calls[0].startswith("device-register:device:")
 

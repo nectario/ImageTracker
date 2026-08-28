@@ -199,6 +199,92 @@ class ApiClient:
             headers={"Idempotency-Key": key},
         )
 
+    def create_upload_plan(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        key: str,
+    ) -> Mapping[str, Any]:
+        return self.request(
+            "POST",
+            "/v1/uploads/plan",
+            json=payload,
+            headers={"Idempotency-Key": key},
+        )
+
+    def put_signed_upload(
+        self,
+        url: str,
+        content: bytes,
+        *,
+        headers: Mapping[str, str],
+    ) -> str | None:
+        """PUT only generated preview bytes using the plan's signed headers.
+
+        This deliberately bypasses ``request`` so Cognito authorization is
+        never attached to the private object-store URL.
+        """
+
+        try:
+            response = self.http.request(
+                "PUT",
+                url,
+                content=content,
+                headers=dict(headers),
+            )
+        except httpx.HTTPError as exc:
+            raise ApiError(
+                ApiProblem(
+                    0,
+                    "Preview upload unavailable",
+                    "The temporary scene preview could not be uploaded. It will be retried.",
+                    code="TEMPORARY_UPLOAD_NETWORK_ERROR",
+                )
+            ) from exc
+        if response.status_code >= 400:
+            # Never include the signed URL or provider response body; both are
+            # unnecessary for the user and may contain temporary credentials.
+            raise ApiError(
+                ApiProblem(
+                    response.status_code,
+                    "Preview upload rejected",
+                    "Object storage rejected the temporary scene preview.",
+                    code="TEMPORARY_UPLOAD_REJECTED",
+                )
+            )
+        return response.headers.get("etag")
+
+    def get_upload_session(self, upload_session_id: str) -> Mapping[str, Any]:
+        return self.request("GET", f"/v1/uploads/{upload_session_id}")
+
+    def complete_upload(
+        self,
+        upload_session_id: str,
+        payload: Mapping[str, Any],
+        *,
+        key: str,
+    ) -> Mapping[str, Any]:
+        return self.request(
+            "POST",
+            f"/v1/uploads/{upload_session_id}/complete",
+            json=payload,
+            headers={"Idempotency-Key": key},
+        )
+
+    def cancel_upload(
+        self,
+        upload_session_id: str,
+        *,
+        reason: str,
+        key: str,
+    ) -> None:
+        self.request(
+            "POST",
+            f"/v1/uploads/{upload_session_id}/cancel",
+            json={"reason": reason},
+            headers={"Idempotency-Key": key},
+        )
+
     def list_jobs(
         self,
         *,
@@ -211,11 +297,28 @@ class ApiClient:
         page = self.request("GET", "/v1/jobs", params=params)
         return [item for item in page.get("items", []) if isinstance(item, Mapping)]
 
+    def get_job(self, job_id: str) -> Mapping[str, Any]:
+        return self.request("GET", f"/v1/jobs/{job_id}")
+
     def retry_job(self, job_id: str, *, key: str | None = None) -> Mapping[str, Any]:
         return self.request(
             "POST",
             f"/v1/jobs/{job_id}/retry",
             headers={"Idempotency-Key": key or self.idempotency_key("job-retry")},
+        )
+
+    def cancel_job(
+        self,
+        job_id: str,
+        *,
+        reason: str,
+        key: str,
+    ) -> Mapping[str, Any]:
+        return self.request(
+            "POST",
+            f"/v1/jobs/{job_id}/cancel",
+            json={"reason": reason},
+            headers={"Idempotency-Key": key},
         )
 
     def list_media(

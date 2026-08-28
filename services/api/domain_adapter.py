@@ -135,9 +135,15 @@ def _location_summary(
         latitude=value.latitude,
         longitude=value.longitude,
         display_name=value.display_name,
+        street_address=value.street_address,
+        neighborhood=value.neighborhood,
         city=value.city,
+        county=value.county,
         state=value.state,
+        postal_code=value.postal_code,
+        country=value.country,
         country_code=value.country_code,
+        provider=value.provider,
     )
 
 
@@ -151,6 +157,7 @@ def _location(value: domain.MediaLocationRecord | None) -> api.MediaLocation | N
         horizontal_accuracy_meters=value.horizontal_accuracy_meters,
         display_name=value.display_name,
         street_address=value.street_address,
+        original_street_number=value.original_street_number,
         neighborhood=value.neighborhood,
         city=value.city,
         county=value.county,
@@ -158,6 +165,10 @@ def _location(value: domain.MediaLocationRecord | None) -> api.MediaLocation | N
         postal_code=value.postal_code,
         country=value.country,
         country_code=value.country_code,
+        provider=value.provider,
+        provider_place_id=value.provider_place_id,
+        normalization_rule_version=value.normalization_rule_version,
+        provider_updated_at_utc=value.provider_updated_at_utc,
         provenance=[_provenance(item) for item in value.provenance],
     )
 
@@ -244,6 +255,26 @@ def _job(value: domain.JobRecord) -> api.ProcessingJob:
 
 def _manifest(value: domain.ManifestResult) -> api.ManifestResponse:
     return api.ManifestResponse.model_validate(value)
+
+
+def _upload_plan(value: domain.UploadPlanRecord) -> api.UploadPlan:
+    return api.UploadPlan.model_validate(value)
+
+
+def _upload_session(value: domain.UploadSessionRecord) -> api.UploadSessionStatus:
+    return api.UploadSessionStatus(
+        upload_session_id=value.upload_session_id,
+        strategy=value.strategy,
+        status=value.status,
+        expected_byte_size=value.expected_byte_size,
+        uploaded_byte_size=value.uploaded_byte_size,
+        uploaded_parts=[],
+        expires_at_utc=value.expires_at_utc,
+    )
+
+
+def _upload_complete(value: domain.UploadCompleteRecord) -> api.UploadCompleteResponse:
+    return api.UploadCompleteResponse.model_validate(value)
 
 
 def _domain_provenance(value: api.FieldProvenance) -> domain.FieldProvenance:
@@ -462,6 +493,77 @@ class DomainServiceAdapter:
         )
         return _mutation_result(value, _manifest)
 
+    async def create_upload_plan(
+        self,
+        user_id: UUID,
+        payload: api.UploadPlanRequest,
+        mutation: MutationContext,
+    ) -> MutationResult[api.UploadPlan]:
+        value = await _domain_call(
+            self._service.create_upload_plan(
+                user_id,
+                domain.UploadPlanCommand(
+                    source_id=payload.source_id,
+                    occurrence_id=payload.occurrence_id,
+                    asset_content_sha256=payload.asset_content_sha256,
+                    object_sha256=payload.object_sha256,
+                    file_name=payload.file_name,
+                    media_type=str(payload.media_type),
+                    object_mime_type=payload.object_mime_type,
+                    object_byte_size=payload.object_byte_size,
+                    purpose=str(payload.purpose),
+                    processing_job_id=payload.processing_job_id,
+                ),
+                _domain_mutation(mutation),
+            )
+        )
+        return _mutation_result(value, _upload_plan)
+
+    async def get_upload_session(
+        self, user_id: UUID, upload_session_id: UUID
+    ) -> api.UploadSessionStatus:
+        return _upload_session(
+            await _domain_call(
+                self._service.get_upload_session(user_id, upload_session_id)
+            )
+        )
+
+    async def complete_upload(
+        self,
+        user_id: UUID,
+        upload_session_id: UUID,
+        payload: api.UploadCompleteRequest,
+        mutation: MutationContext,
+    ) -> MutationResult[api.UploadCompleteResponse]:
+        value = await _domain_call(
+            self._service.complete_upload(
+                user_id,
+                upload_session_id,
+                domain.UploadCompleteCommand(
+                    object_sha256=payload.object_sha256,
+                    etag=payload.etag,
+                    parts=tuple(payload.parts),
+                ),
+                _domain_mutation(mutation),
+            )
+        )
+        return _mutation_result(value, _upload_complete)
+
+    async def cancel_upload(
+        self,
+        user_id: UUID,
+        upload_session_id: UUID,
+        payload: api.UploadCancelRequest,
+        mutation: MutationContext,
+    ) -> MutationResult[None]:
+        del payload
+        value = await _domain_call(
+            self._service.cancel_upload(
+                user_id, upload_session_id, _domain_mutation(mutation)
+            )
+        )
+        return _mutation_result(value, lambda _: None)
+
     async def list_changes(
         self,
         user_id: UUID,
@@ -568,5 +670,22 @@ class DomainServiceAdapter:
     ) -> MutationResult[api.ProcessingJob]:
         value = await _domain_call(
             self._service.retry_job(user_id, job_id, _domain_mutation(mutation))
+        )
+        return _mutation_result(value, _job)
+
+    async def cancel_job(
+        self,
+        user_id: UUID,
+        job_id: UUID,
+        payload: api.JobCancelRequest,
+        mutation: MutationContext,
+    ) -> MutationResult[api.ProcessingJob]:
+        value = await _domain_call(
+            self._service.cancel_job(
+                user_id,
+                job_id,
+                str(payload.reason),
+                _domain_mutation(mutation),
+            )
         )
         return _mutation_result(value, _job)

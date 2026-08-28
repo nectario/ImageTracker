@@ -132,3 +132,37 @@ def test_manifest_variants_preserve_filename_and_match_live_column_limits():
     assert upsert["properties"]["sourceRevision"]["maxLength"] == 255
     assert upsert["properties"]["fileName"]["maxLength"] == 512
     assert upsert["properties"]["timeZoneId"]["maxLength"] == 64
+
+
+def test_location_contract_exposes_normalized_address_and_provider_provenance():
+    document = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+    schemas = document["components"]["schemas"]
+    detail_fields = set(schemas["MediaLocation"]["properties"])
+    assert {
+        "streetAddress",
+        "originalStreetNumber",
+        "neighborhood",
+        "city",
+        "county",
+        "state",
+        "postalCode",
+        "country",
+        "countryCode",
+        "provider",
+        "providerPlaceId",
+        "normalizationRuleVersion",
+        "providerUpdatedAtUtc",
+    } <= detail_fields
+    summary_fields = set(schemas["LocationSummary"]["properties"])
+    assert {
+        "displayName",
+        "streetAddress",
+        "neighborhood",
+        "city",
+        "county",
+        "state",
+        "postalCode",
+        "country",
+        "countryCode",
+        "provider",
+    } <= summary_fields

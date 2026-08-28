@@ -107,10 +107,14 @@ def test_lambda_packaging_keeps_runtime_files_at_archive_root():
     package = json.loads((root / "infra" / "package.json").read_text(encoding="utf-8"))
     assert "--package .build/.serverless" in package["scripts"]["package"]
     deploy_script = package["scripts"]["deploy"]
-    assert "serverless package" in deploy_script
-    assert "validate_foundation.py" in deploy_script
-    assert "deploy_packaged.py" in deploy_script
-    assert deploy_script.count("--package .build/.serverless") == 1
+    assert deploy_script == "python scripts/release.py"
+    release_helper = (root / "infra" / "scripts" / "release.py").read_text(
+        encoding="utf-8"
+    )
+    assert '"package"' in release_helper
+    assert '"scripts/validate_foundation.py"' in release_helper
+    assert '"scripts/deploy_packaged.py"' in release_helper
+    assert "parameter_args" in release_helper
 
     deploy_helper = (root / "infra" / "scripts" / "deploy_packaged.py").read_text(
         encoding="utf-8"
@@ -122,8 +126,54 @@ def test_lambda_packaging_keeps_runtime_files_at_archive_root():
         encoding="utf-8"
     )
     assert '"services/api/handler.py"' in validator
+    assert '"services/api/job_dispatcher.py"' in validator
+    assert '"services/api/temporary_store.py"' in validator
+    assert '"services/worker/handler.py"' in validator
+    assert '"services/worker/composition.py"' in validator
+    assert '"services/worker/staging.py"' in validator
+    assert '"services/enrichment/aws_location.py"' in validator
+    assert '"services/enrichment/models.py"' in validator
+    assert '"services/enrichment/normalization.py"' in validator
+    assert '"services/enrichment/openai_scene.py"' in validator
+    assert '"services/enrichment/openai_secrets.py"' in validator
     assert '"services/data/certs/us-east-2-bundle.pem"' in validator
+    assert '"location_normalization_rules.json"' in validator
     assert 'name.startswith(".build/")' in validator
+
+    stage_script = (root / "infra" / "scripts" / "stage_service.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'REPOSITORY_ROOT / "location_normalization_rules.json"' in stage_script
+    assert "WORKER_SOURCE_ROOT / \"handler.py\"" in stage_script
+
+
+def test_worker_infrastructure_is_bounded_and_schedules_stay_disabled():
+    root = Path(__file__).resolve().parents[1]
+    serverless = (root / "infra" / "serverless.yml").read_text(encoding="utf-8")
+
+    assert "handler: services/worker/handler.handler" in serverless
+    assert "memorySize: 384" in serverless
+    assert "timeout: 120" in serverless
+    assert "VisibilityTimeout: 900" in serverless
+    assert "reservedConcurrency: 1" in serverless
+    assert "batchSize: 1" in serverless
+    assert "functionResponseType: ReportBatchItemFailures" in serverless
+    assert "- sqs:ReceiveMessage" in serverless
+    assert "- sqs:DeleteMessage" in serverless
+    assert "- sqs:ChangeMessageVisibility" in serverless
+    assert "- sqs:GetQueueAttributes" in serverless
+    assert "- geo-places:ReverseGeocode" in serverless
+    assert "::provider/default" in serverless
+    assert "IMAGETRACKER_GEOCODE_REUSE_RADIUS_METERS: '5'" in serverless
+    assert "IMAGETRACKER_GEOCODE_MONTHLY_CALL_LIMIT: '1000'" in serverless
+    assert "IMAGETRACKER_SCENE_DESCRIPTION_MODEL: gpt-5.6-sol" in serverless
+    assert "IMAGETRACKER_SCENE_DESCRIPTION_SERVICE_TIER: flex" in serverless
+    assert "IMAGETRACKER_SCENE_DESCRIPTION_MONTHLY_CALL_LIMIT: '1000'" in serverless
+    assert serverless.count("State: ${self:custom.maintenanceSchedulesState}") == 3
+    assert "retryScheduleState: ${param:retryScheduleState, 'ENABLED'}" in serverless
+    assert "State: ${self:custom.retryScheduleState}" in serverless
+    assert "maintenanceSchedulesState: ${param:maintenanceSchedulesState, 'DISABLED'}" in serverless
+    assert "maxReceiveCount: 8" in serverless
 
 
 def test_python_wheel_includes_the_rds_trust_bundle(tmp_path: Path):

@@ -27,9 +27,16 @@ from services.api.models import (
     MediaType,
     ProcessingJob,
     ProcessingJobPage,
+    JobCancelRequest,
     ProcessingJobStatus,
     ProcessingJobType,
     StorageMode,
+    UploadCancelRequest,
+    UploadCompleteRequest,
+    UploadCompleteResponse,
+    UploadPlan,
+    UploadPlanRequest,
+    UploadSessionStatus,
 )
 
 
@@ -218,6 +225,33 @@ class Phase1Service(Protocol):
         mutation: MutationContext,
     ) -> MutationResult[ManifestResponse]: ...
 
+    async def create_upload_plan(
+        self,
+        user_id: UUID,
+        payload: UploadPlanRequest,
+        mutation: MutationContext,
+    ) -> MutationResult[UploadPlan]: ...
+
+    async def get_upload_session(
+        self, user_id: UUID, upload_session_id: UUID
+    ) -> UploadSessionStatus: ...
+
+    async def complete_upload(
+        self,
+        user_id: UUID,
+        upload_session_id: UUID,
+        payload: UploadCompleteRequest,
+        mutation: MutationContext,
+    ) -> MutationResult[UploadCompleteResponse]: ...
+
+    async def cancel_upload(
+        self,
+        user_id: UUID,
+        upload_session_id: UUID,
+        payload: UploadCancelRequest,
+        mutation: MutationContext,
+    ) -> MutationResult[None]: ...
+
     async def list_changes(
         self,
         user_id: UUID,
@@ -244,6 +278,14 @@ class Phase1Service(Protocol):
 
     async def retry_job(
         self, user_id: UUID, job_id: UUID, mutation: MutationContext
+    ) -> MutationResult[ProcessingJob]: ...
+
+    async def cancel_job(
+        self,
+        user_id: UUID,
+        job_id: UUID,
+        payload: JobCancelRequest,
+        mutation: MutationContext,
     ) -> MutationResult[ProcessingJob]: ...
 
 

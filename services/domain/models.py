@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
-from typing import Generic, Literal, TypeVar
+from typing import Generic, Literal, Protocol, TypeVar
 from uuid import UUID
 
 
@@ -31,6 +31,60 @@ class MutationResult(Generic[T]):
     value: T
     status_code: int
     replayed: bool = False
+
+
+class JobDispatcher(Protocol):
+    """Infrastructure boundary for publishing durable processing-job identities."""
+
+    def dispatch(self, *, job_ids: tuple[UUID, ...], job_type: str) -> None: ...
+
+
+@dataclass(frozen=True)
+class TemporaryObjectUpload:
+    """A checksum-bound direct PUT prepared by the object-store adapter."""
+
+    bucket: str
+    object_key: str
+    url: str
+    headers: dict[str, str]
+    expires_at_utc: datetime
+
+
+@dataclass(frozen=True)
+class TemporaryObjectMetadata:
+    """Normalized object metadata returned by a provider HEAD request."""
+
+    byte_size: int
+    content_type: str
+    checksum_sha256_hex: str
+
+
+class TemporaryObjectStore(Protocol):
+    """Provider-neutral boundary for short-lived scene-preview objects.
+
+    ``create_presigned_put`` must bind the exact base64 SHA-256 value, content
+    type, and content length into the signed PUT. It returns the private bucket
+    and key chosen by the adapter; the API never exposes either locator.
+    """
+
+    def create_presigned_put(
+        self,
+        *,
+        user_id: UUID,
+        media_asset_id: UUID,
+        upload_session_id: UUID,
+        checksum_sha256_base64: str,
+        content_type: str,
+        content_length: int,
+        url_expires_at_utc: datetime,
+        object_expires_at_utc: datetime,
+    ) -> TemporaryObjectUpload: ...
+
+    def head_object(
+        self, *, bucket: str, object_key: str
+    ) -> TemporaryObjectMetadata | None: ...
+
+    def delete_object(self, *, bucket: str, object_key: str) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -208,6 +262,7 @@ class ManifestEntryResult:
     occurrence_id: UUID | None = None
     media_asset_id: UUID | None = None
     upload_required: bool = False
+    description_job_id: UUID | None = None
     error_code: str | None = None
     error_message: str | None = None
 
@@ -263,6 +318,11 @@ class MediaLocationRecord:
     country: str | None
     country_code: str | None
     provenance: tuple[FieldProvenance, ...] = ()
+    original_street_number: str | None = None
+    provider: str | None = None
+    provider_place_id: str | None = None
+    normalization_rule_version: str | None = None
+    provider_updated_at_utc: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -404,3 +464,62 @@ class JobRecord:
     started_at_utc: datetime | None
     completed_at_utc: datetime | None
     updated_at_utc: datetime
+
+
+@dataclass(frozen=True)
+class UploadPlanCommand:
+    source_id: UUID
+    occurrence_id: UUID
+    asset_content_sha256: str
+    object_sha256: str
+    file_name: str
+    media_type: str
+    object_mime_type: str
+    object_byte_size: int
+    purpose: str
+    processing_job_id: UUID | None = None
+
+
+@dataclass(frozen=True)
+class SignedUploadRequestRecord:
+    url: str
+    method: Literal["PUT"]
+    headers: dict[str, str]
+    expires_at_utc: datetime
+
+
+@dataclass(frozen=True)
+class UploadPlanRecord:
+    disposition: str
+    strategy: str
+    media_asset_id: UUID
+    occurrence_id: UUID
+    upload_session_id: UUID | None
+    expires_at_utc: datetime | None
+    deduplicated: bool
+    retry_after_seconds: int | None = None
+    single_part: SignedUploadRequestRecord | None = None
+
+
+@dataclass(frozen=True)
+class UploadSessionRecord:
+    upload_session_id: UUID
+    strategy: str
+    status: str
+    expected_byte_size: int
+    uploaded_byte_size: int
+    expires_at_utc: datetime | None
+
+
+@dataclass(frozen=True)
+class UploadCompleteCommand:
+    object_sha256: str
+    etag: str | None = None
+    parts: tuple[object, ...] = ()
+
+
+@dataclass(frozen=True)
+class UploadCompleteRecord:
+    media_asset_id: UUID
+    storage_state: str
+    processing_jobs: tuple[UUID, ...]

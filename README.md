@@ -4,12 +4,18 @@ ImageTracker is a consumer media app for indexing, finding, and reliving
 photos and videos. It is also the media source for the future NektronAI
 Intelligence Layer.
 
-Phase 1 currently implements the Local-mode data path: the CLI discovers a
-folder, extracts available metadata, computes an exact SHA-256 content hash,
-and sends metadata manifests to the authenticated API. MySQL stores one
-`MediaAsset` per user and exact hash while retaining a separate
-`MediaOccurrence` for every source path. Original Local-mode files remain on
-the source computer and are not uploaded to permanent S3 storage.
+Phase 1 implements the Local-mode data path: the CLI discovers a folder,
+extracts available metadata, computes an exact SHA-256 content hash, and sends
+metadata manifests to the authenticated API. MySQL stores one `MediaAsset` per
+user and exact hash while retaining a separate `MediaOccurrence` for every
+source path. Original Local-mode files remain on the source computer and are
+not uploaded to permanent S3 storage.
+
+The current repository also contains the first bounded enrichment pipeline:
+GPS coordinates can be resolved to a useful nearby address, and photos can
+receive concise, searchable scene descriptions. These changes are not yet in
+the production stack. Persistent address resolution uses Amazon Location
+Service Places V2 so the request can explicitly declare stored use.
 
 The approved architecture and delivery sequence are in
 [the UX-first implementation plan](docs/ImageTracker%20App%20UX-First%20Implementation%20Plan.md).
@@ -17,6 +23,8 @@ The current implementation and verification ledger is in
 [the Phase 1 status](docs/PHASE1_STATUS.md).
 
 ## What works now
+
+The deployed Local core provides:
 
 - Cognito email/password sign-up, one-time email confirmation, login, session
   status, token refresh, and logout. Verification messages are sent as
@@ -34,11 +42,23 @@ The current implementation and verification ledger is in
   API surfaces.
 - Read-only legacy `ImageAsset` audit and paged migration preview.
 
+The pending-deployment repository build adds:
+
+- Asynchronous Amazon Location Service Places V2 reverse geocoding with full
+  address and provider provenance (`AmazonLocationPlacesV2`). A resolved
+  address may be reused only for the same user and only when another coordinate
+  is within 5 metres.
+- Automatic photo scene descriptions using `gpt-5.6-sol`, high image detail,
+  Flex processing, reasoning effort `none`, and a versioned search prompt
+  capped at 24 words.
+- A durable CLI scene-preview outbox, signed temporary uploads, bounded SQS
+  processing, quota deferral, visible retry states, and safe staging cleanup.
+
 Remote-mode upload and retrieval are not implemented yet. The CLI rejects
-`Remote` before changing a source or uploading anything. Reverse geocoding,
-AI captions, video-audio transcription, face recognition, and all other media
-enrichment are also deferred. The legacy migration command is preview-only;
-it never writes mappings or new media rows.
+`Remote` before changing a source or uploading anything. Video-audio
+transcription, face recognition, and other media enrichment remain deferred.
+The legacy migration command is preview-only; it never writes mappings or new
+media rows.
 
 ## Development setup
 
@@ -71,8 +91,9 @@ imagetracker doctor --json
 ```
 
 See [`scripts/README.md`](scripts/README.md) for the individual WSL shell
-wrappers and their safety boundaries. The toolkit contains no deployment,
-database migration, or legacy-importer command.
+wrappers and their safety boundaries. Deployment remains outside the shell
+toolkit; the one write-capable database wrapper is the narrowly scoped,
+dry-run-by-default enrichment migration command.
 
 ## Configure the CLI
 
@@ -167,9 +188,38 @@ imagetracker jobs list
 imagetracker jobs retry JOB_ID
 ```
 
+When the enrichment build is deployed, the same normal `sync` command drives
+both additions. GPS in a manifest queues reverse geocoding. Each eligible photo
+also receives a server-owned description job; the CLI creates a deterministic
+JPEG preview, stages it, and queues the job without an extra prompt. Useful
+WSL commands for watching or repairing that work are:
+
+```bash
+./scripts/cli.sh status --follow
+./scripts/cli.sh outbox descriptions --state All
+./scripts/cli.sh jobs list
+./scripts/cli.sh media list
+./scripts/cli.sh media show MEDIA_ASSET_ID --json
+./scripts/cli.sh media search "birthday cake"
+
+# Retry client-side preview preparation/staging after fixing its issue.
+./scripts/cli.sh outbox retry-description JOB_ID
+
+# Retry a server job that is Failed or waiting on quota.
+./scripts/cli.sh jobs retry JOB_ID
+./scripts/cli.sh sync "Camera Uploads"
+```
+
+`DeferredQuota` is an intentional waiting state, not a failed upload. Once one
+scene-description request reaches the monthly ceiling, the CLI defers the
+remaining due previews together instead of asking for thousands of upload
+plans. `media show --json` exposes the durable address, description, and their
+provider/model provenance after processing succeeds.
+
 Use `--json` on configure, doctor, auth status, source add/list, sync, status,
-and legacy commands when scripting. `source remove` unregisters the source and
-does not delete files from disk.
+outbox inspection, media list/show/search, jobs list/retry, and legacy commands
+when scripting. `source remove` unregisters the source and does not delete files
+from disk.
 
 ## Inspect legacy data safely
 
@@ -196,6 +246,67 @@ resolve exactly to `ImageTracker`.
 The root `ImageTracker.py` importer remains available for its existing legacy
 workflow, but it is not called by the new CLI or shell playground. Its writes
 are separate from the Phase 1 legacy migration preview.
+
+## Enrichment privacy and cost boundaries
+
+- Reverse geocoding sends latitude and longitude to Amazon Location Service
+  Places V2. It never sends the photo, filename, local path, user identity, or
+  scene description. `ReverseGeocode` is called with `IntendedUse=Storage`,
+  `MaxResults=1`, and address-oriented place types. The returned result is
+  normalized before the address components and `AmazonLocationPlacesV2`
+  provenance are stored in MySQL.
+- Address reuse is account-scoped: a fully resolved result may satisfy another
+  coordinate for the same user within 5 metres, but it is never shared between
+  users. The default hard ceiling is 1,000 provider calls per user per calendar
+  month. At the 2026-08-28 `us-east-2` list price of USD 4 per 1,000 stored
+  reverse-geocode requests, that ceiling bounds this component to about USD 4
+  per user per month; verify current
+  [Amazon Location pricing](https://aws.amazon.com/location/pricing/) before
+  changing the limit.
+- Scene analysis never uploads the Local original. The CLI applies EXIF
+  orientation, never enlarges the image, reduces its longest edge to at most
+  1,024 pixels, renders a deterministic metadata-free JPEG, and uploads only
+  that preview to a private `staging/` key.
+- OpenAI receives the preview through a short-lived signed HTTPS URL. The
+  Responses API request uses `store: false`; the worker deletes the S3 preview
+  after a safe terminal outcome, and the bucket's one-day lifecycle rule is the
+  cleanup backstop.
+- Scene descriptions have their own 1,000-call per-user monthly hard ceiling.
+  Requests are reserved before a preview upload URL is issued, Flex processing
+  lowers unit cost, and the single-concurrency worker prevents request bursts.
+- A Local asset remains `LocalOnly`: its path remains the original reference,
+  while its durable S3 bucket, original-object key, and preview-object key stay
+  null. Temporary staging does not silently convert it to Remote mode.
+
+## Enrichment deployment gate
+
+Amazon Location Service uses the active AWS identity locally and the scoped
+Lambda IAM role after deployment; it has no API key or SSM secret. OpenAI key
+resolution checks the process environment, then the ignored repository `.env`,
+then the SSM SecureString named at runtime:
+
+```text
+/imagetracker/prod/openai
+```
+
+Never place provider values in tracked files or deployment arguments. The
+production OpenAI parameter has been provisioned. Reverse geocoding has no
+additional credential or SSM prerequisite.
+
+Use WSL Ubuntu with the existing AWS credentials to run the complete tests,
+validate/package the stack, review the IAM and artifacts, and only then deploy.
+The five-minute `RetryDueJobs` recovery schedule is enabled so a committed job
+cannot be lost with an early or failed SQS delivery. Reconciliation, quota-reset,
+and trash-purge schedules remain disabled. See
+[the infrastructure guide](infra/README.md) for the exact validation and
+deployment commands.
+
+The production geocode controls are deliberately small and explicit:
+
+```text
+IMAGETRACKER_GEOCODE_REUSE_RADIUS_METERS=5
+IMAGETRACKER_GEOCODE_MONTHLY_CALL_LIMIT=1000
+```
 
 ## Architecture boundaries
 
@@ -229,3 +340,6 @@ release criteria, not a later polish pass.
 - Keep one occurrence per source path even when multiple paths contain the
   same exact bytes.
 - Never upload Local-mode originals or previews to permanent S3 storage.
+- Permit only short-lived `TemporaryProcessing` preview staging for an
+  authorized Local photo-description job; it must never populate durable S3
+  asset locators or change Local storage mode.

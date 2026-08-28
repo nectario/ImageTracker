@@ -1,0 +1,4 @@
+ALTER TABLE `MediaLocation`
+    MODIFY COLUMN `ProviderPlaceId` VARCHAR(500) NULL,
+    MODIFY COLUMN `PostalCode` VARCHAR(50) NULL,
+    ALGORITHM=COPY;

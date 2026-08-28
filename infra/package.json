@@ -10,7 +10,7 @@
     "validate": "python scripts/validate_foundation.py",
     "stage": "python scripts/stage_service.py",
     "package": "python scripts/stage_service.py --install-dependencies && serverless package --config .build/serverless.yml --stage prod --package .build/.serverless",
-    "deploy": "python scripts/stage_service.py --install-dependencies && serverless package --config .build/serverless.yml --stage prod --package .build/.serverless && python scripts/validate_foundation.py --stage prod --packaged-template .build/.serverless/cloudformation-template-update-stack.json && python scripts/deploy_packaged.py --stage prod"
+    "deploy": "python scripts/release.py"
   },
   "devDependencies": {
     "serverless": "4.41.1"

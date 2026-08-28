@@ -44,7 +44,7 @@ legacy_app = typer.Typer(
     help="Inspect legacy ImageAsset evidence and preview migration.",
     no_args_is_help=True,
 )
-outbox_app = typer.Typer(help="Inspect manifest batches that need attention.", no_args_is_help=True)
+outbox_app = typer.Typer(help="Inspect resumable sync and scene-preview work.", no_args_is_help=True)
 media_app = typer.Typer(help="Browse account-visible Local media metadata.", no_args_is_help=True)
 jobs_app = typer.Typer(help="Inspect and retry media processing jobs.", no_args_is_help=True)
 app.add_typer(auth_app, name="auth")
@@ -101,7 +101,8 @@ def command_errors() -> Iterator[None]:
     except (ValueError, OSError) as exc:
         _error(str(exc), ExitCode.CONFIGURATION)
     except KeyboardInterrupt:
-        _error("Interrupted. Saved work will resume on the next sync.", ExitCode.PARTIAL_SYNC)
+        console.print("[dim]Stopped. Saved work will resume safely.[/dim]")
+        raise typer.Exit(0) from None
 
 
 def _runtime() -> Runtime:
@@ -483,6 +484,10 @@ def _print_sync(summary: SyncSummary) -> None:
         "Quarantined entries": summary.quarantined_entries,
         "Rejected entries": summary.rejected_entries,
         "Manifest batches sent": summary.batches_sent,
+        "Scene previews staged": summary.descriptions_staged,
+        "Scene previews pending": summary.description_pending,
+        "Scene previews quota-deferred": summary.description_deferred,
+        "Scene previews needing attention": summary.description_quarantined,
     }
     for label, value in rows.items():
         table.add_row(label, str(value))
@@ -521,8 +526,9 @@ def sync(
                 _print_sync(summary)
             if summary.failed > 0:
                 _error(
-                    "Sync completed with files or manifest entries needing attention. "
-                    "Inspect quarantined batches with 'imagetracker outbox list'.",
+                    "Sync completed with work needing attention or a later retry. "
+                    "Inspect it with 'imagetracker outbox list' and "
+                    "'imagetracker outbox descriptions'.",
                     ExitCode.PARTIAL_SYNC,
                 )
             if not watch:
@@ -540,9 +546,14 @@ def status(
     with command_errors():
         runtime = _runtime()
         while True:
+            description_counts = runtime.state.description_counts()
             payload = {
                 "pendingManifestBatches": runtime.state.pending_count(),
                 "failedManifestBatches": runtime.state.failed_count(),
+                "pendingDescriptionPreviews": description_counts["Pending"],
+                "deferredDescriptionPreviews": description_counts["Deferred"],
+                "failedDescriptionPreviews": description_counts["Failed"],
+                "sentDescriptionPreviews": description_counts["Sent"],
                 "sources": len(runtime.state.list_bindings()),
                 "jobs": runtime.api.list_jobs(limit=50),
                 "recentScans": runtime.state.recent_scans(),
@@ -553,6 +564,9 @@ def status(
                 console.print(
                     f"[bold]{payload['pendingManifestBatches']}[/bold] queued manifest batches · "
                     f"[bold]{payload['failedManifestBatches']}[/bold] need attention · "
+                    f"[bold]{payload['pendingDescriptionPreviews']}[/bold] scene previews queued · "
+                    f"[bold]{payload['deferredDescriptionPreviews']}[/bold] quota-deferred · "
+                    f"[bold]{payload['failedDescriptionPreviews']}[/bold] scene previews need attention · "
                     f"[bold]{payload['sources']}[/bold] local sources"
                 )
                 table = Table(title="Processing activity")
@@ -645,20 +659,94 @@ def outbox_discard(
         )
 
 
+@outbox_app.command("descriptions")
+def outbox_descriptions(
+    state: Annotated[
+        str,
+        typer.Option("--state", help="Failed, Pending, Deferred, Sent, or All."),
+    ] = "Failed",
+    limit: Annotated[int, typer.Option("--limit", min=1, max=1000)] = 100,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable output.")] = False,
+) -> None:
+    """Inspect scene-description previews without exposing local paths."""
+
+    with command_errors():
+        normalized = state.capitalize()
+        if normalized not in {"Failed", "Pending", "Deferred", "Sent", "All"}:
+            raise ValueError("State must be Failed, Pending, Deferred, Sent, or All")
+        tasks = _runtime().state.list_description_outbox(state=normalized, limit=limit)
+        payload = [
+            {
+                "jobId": task.job_id,
+                "sourceId": task.source_id,
+                "occurrenceId": task.occurrence_id,
+                "mediaAssetId": task.media_asset_id,
+                "sourceItemId": task.source_item_id,
+                "fileName": task.file_name,
+                "state": task.state,
+                "attemptCount": task.attempt_count,
+                "nextAttemptAtUtc": task.next_attempt_at_utc,
+                "error": task.error,
+            }
+            for task in tasks
+        ]
+        if json_output:
+            _emit(payload)
+            return
+        table = Table(title="Scene-description outbox")
+        table.add_column("State", style="bold")
+        table.add_column("File")
+        table.add_column("Attempts", justify="right")
+        table.add_column("Next attempt")
+        table.add_column("Issue")
+        table.add_column("Job ID")
+        for item in payload:
+            error = item["error"] or {}
+            table.add_row(
+                str(item["state"]),
+                str(item["fileName"]),
+                str(item["attemptCount"]),
+                str(item["nextAttemptAtUtc"] or "—"),
+                str(error.get("message") or error.get("code") or ""),
+                str(item["jobId"]),
+            )
+        console.print(table)
+
+
+@outbox_app.command("retry-description")
+def outbox_retry_description(job_id: str) -> None:
+    """Make a quarantined or deferred scene preview eligible for the next sync."""
+
+    with command_errors():
+        _runtime().state.retry_description(job_id)
+        console.print(
+            f"[green]Queued[/green] scene preview {job_id}. Run 'imagetracker sync' to retry it."
+        )
+
+
 def _media_table(items: list[Mapping[str, Any]], *, title: str) -> Table:
     table = Table(title=title)
     table.add_column("Captured")
     table.add_column("Type")
     table.add_column("File", style="bold")
+    table.add_column("Location")
     table.add_column("State")
     table.add_column("Media ID")
     for raw in items:
         item = raw.get("asset") if isinstance(raw.get("asset"), Mapping) else raw
         temporal = item.get("temporal") or {}
+        location = item.get("locationDetail") or item.get("location") or {}
+        location_label = (
+            location.get("streetAddress")
+            or location.get("displayName")
+            or location.get("city")
+            or "—"
+        )
         table.add_row(
             str(temporal.get("capturedAtLocal") or temporal.get("capturedAtUtc") or "—"),
             str(item.get("mediaType") or ""),
             str(item.get("displayFileName") or ""),
+            str(location_label),
             str(item.get("state") or ""),
             str(item.get("mediaAssetId") or ""),
         )
@@ -737,7 +825,27 @@ def jobs_list(
     """List asynchronous processing activity."""
 
     with command_errors():
-        items = _runtime().api.list_jobs(limit=limit, status=status_filter)
+        normalized_status = None
+        if status_filter:
+            statuses = {
+                value.casefold(): value
+                for value in (
+                    "Preparing",
+                    "Queued",
+                    "Running",
+                    "Succeeded",
+                    "DeferredQuota",
+                    "Failed",
+                    "Cancelled",
+                )
+            }
+            normalized_status = statuses.get(status_filter.strip().casefold())
+            if normalized_status is None:
+                raise ValueError(
+                    "Status must be Preparing, Queued, Running, Succeeded, "
+                    "DeferredQuota, Failed, or Cancelled"
+                )
+        items = _runtime().api.list_jobs(limit=limit, status=normalized_status)
         if json_output:
             _emit(items)
             return
@@ -766,11 +874,41 @@ def jobs_retry(
     """Retry a job that has reached Needs attention."""
 
     with command_errors():
-        item = _runtime().api.retry_job(job_id)
+        runtime = _runtime()
+        current = runtime.api.get_job(job_id)
+        is_description = str(current.get("jobType") or "") == "Description"
+        if is_description and runtime.state.description_task(job_id) is None:
+            raise ValueError(
+                "This scene description must be retried on a device that has "
+                "its Local source photo."
+            )
+        retry_key = (
+            f"job-retry:{job_id}:{current.get('status') or 'unknown'}:"
+            f"{current.get('attemptCount') or 0}"
+        )
+        item = runtime.api.retry_job(job_id, key=retry_key)
+        if is_description and str(item.get("status") or "") == "Preparing":
+            runtime.state.retry_description(job_id, allow_sent=True)
+            if (
+                str(current.get("errorCode") or "") == "ProviderCircuitOpen"
+                or str(current.get("failureClass") or "") == "Authentication"
+                or (
+                    str(current.get("failureClass") or "") == "Quota"
+                    and str(current.get("errorCode") or "")
+                    != "MonthlySceneDescriptionLimitReached"
+                )
+            ):
+                runtime.state.retry_all_deferred_descriptions()
         if json_output:
             _emit(item)
         else:
-            console.print(f"[green]Retry queued[/green] for job {job_id}.")
+            if is_description and str(item.get("status") or "") == "Preparing":
+                console.print(
+                    f"[green]Preview retry ready[/green] for job {job_id}. "
+                    "Run 'imagetracker sync' on this source device."
+                )
+            else:
+                console.print(f"[green]Retry queued[/green] for job {job_id}.")
 
 
 @legacy_app.command("audit")

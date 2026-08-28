@@ -22,6 +22,9 @@ Individual commands:
 ./scripts/aws-smoke.sh
 ./scripts/db-smoke.sh
 ./scripts/package-infra.sh
+./scripts/store-openai-key.sh
+./scripts/migrate-db.sh
+./scripts/migrate-db.sh --apply
 ```
 
 Safety boundaries:
@@ -31,8 +34,14 @@ Safety boundaries:
 - `db-smoke.sh` retrieves the dedicated application credential from SSM in
   memory and opens an explicitly read-only transaction. It prints counts only.
 - `package-infra.sh` builds ignored `.build` output and never deploys it.
-- No script invokes `ImageTracker.py`, `tag_location.py`, `serverless deploy`,
-  or database migrations.
+- `store-openai-key.sh` copies a non-empty `OPENAI_API_KEY` from the current
+  WSL process into the ignored repository `.env` without displaying it. It does
+  not create or update an AWS SSM parameter.
+- `migrate-db.sh` is the one explicit write-capable database command. Without
+  `--apply` it reports the 012/013 plan only; with `--apply` it requires an idle
+  `ImageTracker` processing database, applies one atomic ALTER at a time, and
+  reconciles a missing migration ledger row after an interrupted DDL.
+- No script invokes `ImageTracker.py`, `tag_location.py`, or `serverless deploy`.
 
 Override defaults only when intentionally checking another environment:
 

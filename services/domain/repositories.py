@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from decimal import Decimal
+import math
 from typing import Any
 from uuid import UUID
 
@@ -20,6 +22,8 @@ from services.data.models import (
     MediaTranscript,
     MediaTranscriptSegment,
     ProcessingJob,
+    ProviderUsageMonth,
+    UploadSession,
     UserAccount,
 )
 from services.domain.errors import ConflictError, NotFoundError
@@ -27,6 +31,28 @@ from services.domain.errors import ConflictError, NotFoundError
 
 def public_id(value: UUID | str) -> str:
     return str(value)
+
+
+def _haversine_meters(
+    latitude_a: float,
+    longitude_a: float,
+    latitude_b: float,
+    longitude_b: float,
+) -> float:
+    earth_radius_meters = 6_371_008.8
+    phi_a = math.radians(latitude_a)
+    phi_b = math.radians(latitude_b)
+    delta_phi = math.radians(latitude_b - latitude_a)
+    delta_lambda = math.radians(longitude_b - longitude_a)
+    value = (
+        math.sin(delta_phi / 2.0) ** 2
+        + math.cos(phi_a)
+        * math.cos(phi_b)
+        * math.sin(delta_lambda / 2.0) ** 2
+    )
+    return earth_radius_meters * 2.0 * math.atan2(
+        math.sqrt(value), math.sqrt(max(0.0, 1.0 - value))
+    )
 
 
 class AccountRepository:
@@ -323,6 +349,26 @@ class OccurrenceRepository:
             )
         )
 
+    def require(
+        self,
+        *,
+        user_id: int,
+        occurrence_public_id: UUID | str,
+        source_id: int | None = None,
+    ) -> MediaOccurrence:
+        conditions = [
+            MediaOccurrence.user_id == user_id,
+            MediaOccurrence.public_id == public_id(occurrence_public_id),
+        ]
+        if source_id is not None:
+            conditions.append(MediaOccurrence.media_source_id == source_id)
+        occurrence = self.session.scalar(select(MediaOccurrence).where(*conditions))
+        if occurrence is None:
+            raise NotFoundError(
+                "OccurrenceNotFound", "The media occurrence was not found"
+            )
+        return occurrence
+
     def active_count_for_asset(
         self, *, user_id: int, asset_id: int, excluding_id: int | None = None
     ) -> int:
@@ -539,9 +585,13 @@ class AssetRepository:
                     or_(
                         func.lower(MediaLocation.location_display_name).like(pattern),
                         func.lower(MediaLocation.street_address).like(pattern),
+                        func.lower(MediaLocation.neighborhood).like(pattern),
                         func.lower(MediaLocation.city).like(pattern),
+                        func.lower(MediaLocation.county).like(pattern),
                         func.lower(MediaLocation.state).like(pattern),
+                        func.lower(MediaLocation.postal_code).like(pattern),
                         func.lower(MediaLocation.country).like(pattern),
+                        func.lower(MediaLocation.country_code).like(pattern),
                     ),
                 )
             )
@@ -724,6 +774,92 @@ class ChangeRepository:
         return list(self.session.scalars(statement))
 
 
+class LocationRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def by_asset(self, *, user_id: int, asset_id: int) -> MediaLocation | None:
+        return self.session.scalar(
+            select(MediaLocation).where(
+                MediaLocation.user_id == user_id,
+                MediaLocation.media_asset_id == asset_id,
+            )
+        )
+
+    def resolved_nearby(
+        self,
+        *,
+        user_id: int,
+        latitude: Decimal,
+        longitude: Decimal,
+        radius_meters: float,
+        exclude_asset_id: int | None = None,
+    ) -> MediaLocation | None:
+        """Return the nearest provider-resolved location inside a small radius.
+
+        The indexed bounding box keeps this portable across SQLite tests and MySQL;
+        the final Haversine check prevents corner points from escaping the radius.
+        """
+
+        latitude_float = float(latitude)
+        longitude_float = float(longitude)
+        latitude_delta = radius_meters / 111_320.0
+        cosine = abs(math.cos(math.radians(latitude_float)))
+        longitude_delta = (
+            180.0 if cosine < 1e-8 else min(180.0, radius_meters / (111_320.0 * cosine))
+        )
+        conditions = [
+            MediaLocation.user_id == user_id,
+            MediaLocation.latitude.between(
+                latitude_float - latitude_delta, latitude_float + latitude_delta
+            ),
+            MediaLocation.provider.is_not(None),
+            MediaLocation.provider_updated_at_utc.is_not(None),
+        ]
+        if longitude_delta < 180.0:
+            longitude_low = longitude_float - longitude_delta
+            longitude_high = longitude_float + longitude_delta
+            if longitude_low < -180.0:
+                conditions.append(
+                    or_(
+                        MediaLocation.longitude >= longitude_low + 360.0,
+                        MediaLocation.longitude <= longitude_high,
+                    )
+                )
+            elif longitude_high > 180.0:
+                conditions.append(
+                    or_(
+                        MediaLocation.longitude >= longitude_low,
+                        MediaLocation.longitude <= longitude_high - 360.0,
+                    )
+                )
+            else:
+                conditions.append(
+                    MediaLocation.longitude.between(longitude_low, longitude_high)
+                )
+        if exclude_asset_id is not None:
+            conditions.append(MediaLocation.media_asset_id != exclude_asset_id)
+        candidates = self.session.scalars(
+            select(MediaLocation)
+            .where(*conditions)
+            .order_by(MediaLocation.provider_updated_at_utc.desc(), MediaLocation.id.desc())
+            .limit(256)
+        )
+        nearest: tuple[float, MediaLocation] | None = None
+        for candidate in candidates:
+            if candidate.latitude is None or candidate.longitude is None:
+                continue
+            distance = _haversine_meters(
+                latitude_float,
+                longitude_float,
+                float(candidate.latitude),
+                float(candidate.longitude),
+            )
+            if distance <= radius_meters and (nearest is None or distance < nearest[0]):
+                nearest = (distance, candidate)
+        return nearest[1] if nearest is not None else None
+
+
 class JobRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
@@ -738,6 +874,26 @@ class JobRepository:
         if job is None:
             raise NotFoundError("JobNotFound", "The processing job was not found")
         return job
+
+    def by_public_id(
+        self, *, job_public_id: UUID | str, for_update: bool = False
+    ) -> ProcessingJob | None:
+        statement = select(ProcessingJob).where(
+            ProcessingJob.public_id == public_id(job_public_id)
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        return self.session.scalar(statement)
+
+    def by_idempotency_key(
+        self, *, user_id: int, idempotency_key: str
+    ) -> ProcessingJob | None:
+        return self.session.scalar(
+            select(ProcessingJob).where(
+                ProcessingJob.user_id == user_id,
+                ProcessingJob.idempotency_key == idempotency_key,
+            )
+        )
 
     def list_after(
         self,
@@ -763,6 +919,124 @@ class JobRepository:
                 statement.order_by(ProcessingJob.id.desc()).limit(limit)
             )
         )
+
+
+class UploadRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def require(
+        self,
+        *,
+        user_id: int,
+        upload_public_id: UUID | str,
+        for_update: bool = False,
+    ) -> UploadSession:
+        statement = select(UploadSession).where(
+            UploadSession.user_id == user_id,
+            UploadSession.public_id == public_id(upload_public_id),
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        upload = self.session.scalar(statement)
+        if upload is None:
+            raise NotFoundError(
+                "UploadSessionNotFound", "The upload session was not found"
+            )
+        return upload
+
+    def active_for_asset(
+        self,
+        *,
+        user_id: int,
+        asset_id: int,
+        object_purpose: str,
+        for_update: bool = False,
+    ) -> UploadSession | None:
+        statement = select(UploadSession).where(
+            UploadSession.user_id == user_id,
+            UploadSession.media_asset_id == asset_id,
+            UploadSession.object_purpose == object_purpose,
+            UploadSession.active_lease_marker == 1,
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        return self.session.scalar(statement)
+
+    def expired_active_for_user(
+        self, *, user_id: int, now: datetime, limit: int = 100
+    ) -> list[UploadSession]:
+        return list(
+            self.session.scalars(
+                select(UploadSession)
+                .where(
+                    UploadSession.user_id == user_id,
+                    UploadSession.object_purpose == "TemporaryProcessing",
+                    UploadSession.active_lease_marker == 1,
+                    UploadSession.expires_at_utc <= now,
+                )
+                .order_by(UploadSession.id.asc())
+                .limit(limit)
+                .with_for_update()
+            )
+        )
+
+
+class ProviderUsageRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def get(
+        self,
+        *,
+        user_id: int,
+        provider: str,
+        usage_month: date,
+        unit_type: str,
+        for_update: bool = False,
+    ) -> ProviderUsageMonth | None:
+        statement = select(ProviderUsageMonth).where(
+            ProviderUsageMonth.user_id == user_id,
+            ProviderUsageMonth.provider == provider,
+            ProviderUsageMonth.usage_month == usage_month,
+            ProviderUsageMonth.unit_type == unit_type,
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        return self.session.scalar(statement)
+
+    def get_or_create(
+        self,
+        *,
+        user_id: int,
+        provider: str,
+        usage_month: date,
+        unit_type: str,
+        hard_limit_units: Decimal,
+        now: datetime,
+    ) -> ProviderUsageMonth:
+        usage = self.get(
+            user_id=user_id,
+            provider=provider,
+            usage_month=usage_month,
+            unit_type=unit_type,
+            for_update=True,
+        )
+        if usage is None:
+            usage = ProviderUsageMonth(
+                user_id=user_id,
+                provider=provider,
+                usage_month=usage_month,
+                unit_type=unit_type,
+                processed_units=Decimal("0"),
+                reserved_units=Decimal("0"),
+                hard_limit_units=hard_limit_units,
+                created_at_utc=now,
+                updated_at_utc=now,
+            )
+            self.session.add(usage)
+            self.session.flush()
+        return usage
 
 
 class IdempotencyRepository:

@@ -37,7 +37,15 @@ from services.api.models import (
     ProcessingJobPage,
     ProcessingJobStatus,
     ProcessingJobType,
+    JobCancelRequest,
     StorageMode,
+    UploadCancelRequest,
+    UploadCompleteRequest,
+    UploadCompleteResponse,
+    UploadPartSigningRequest,
+    UploadPlan,
+    UploadPlanRequest,
+    UploadSessionStatus,
 )
 from services.api.service import (
     AuthIdentity,
@@ -73,6 +81,10 @@ def _mutation(
     | MediaSourceCreateRequest
     | MediaSourceUpdateRequest
     | ManifestRequest
+    | UploadPlanRequest
+    | UploadCompleteRequest
+    | UploadCancelRequest
+    | JobCancelRequest
     | None = None,
 ) -> MutationContext:
     return MutationContext.build(
@@ -273,6 +285,106 @@ def create_phase1_router() -> APIRouter:
         )
         return result.value
 
+    @router.post("/uploads/plan", response_model=UploadPlan)
+    async def create_upload_plan(
+        payload: UploadPlanRequest,
+        request: Request,
+        response: Response,
+        idempotency_key: IdempotencyKey,
+        user: CurrentUser = Depends(get_current_user),
+        service: Phase1Service = Depends(get_phase1_service),
+    ) -> UploadPlan:
+        result = await service.create_upload_plan(
+            user.user_id,
+            payload,
+            _mutation(request, idempotency_key, "/v1/uploads/plan", payload),
+        )
+        _apply_mutation_response(
+            response, result, allowed_statuses={200}, default_status=200
+        )
+        return result.value
+
+    @router.get("/uploads/{upload_session_id}", response_model=UploadSessionStatus)
+    async def get_upload_session(
+        upload_session_id: UUID,
+        user: CurrentUser = Depends(get_current_user),
+        service: Phase1Service = Depends(get_phase1_service),
+    ) -> UploadSessionStatus:
+        return await service.get_upload_session(user.user_id, upload_session_id)
+
+    @router.post("/uploads/{upload_session_id}/parts")
+    async def reject_upload_parts(
+        upload_session_id: UUID,
+        payload: UploadPartSigningRequest,
+        idempotency_key: IdempotencyKey,
+        user: CurrentUser = Depends(get_current_user),
+    ) -> None:
+        del upload_session_id, payload, idempotency_key, user
+        raise BadRequestError(
+            "Temporary scene previews must use a single PUT",
+            code="MULTIPART_NOT_SUPPORTED",
+        )
+
+    @router.post(
+        "/uploads/{upload_session_id}/complete",
+        response_model=UploadCompleteResponse,
+    )
+    async def complete_upload(
+        upload_session_id: UUID,
+        payload: UploadCompleteRequest,
+        request: Request,
+        response: Response,
+        idempotency_key: IdempotencyKey,
+        user: CurrentUser = Depends(get_current_user),
+        service: Phase1Service = Depends(get_phase1_service),
+    ) -> UploadCompleteResponse:
+        result = await service.complete_upload(
+            user.user_id,
+            upload_session_id,
+            payload,
+            _mutation(
+                request,
+                idempotency_key,
+                f"/v1/uploads/{upload_session_id}/complete",
+                payload,
+            ),
+        )
+        _apply_mutation_response(
+            response, result, allowed_statuses={200}, default_status=200
+        )
+        return result.value
+
+    @router.post(
+        "/uploads/{upload_session_id}/cancel",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def cancel_upload(
+        upload_session_id: UUID,
+        request: Request,
+        idempotency_key: IdempotencyKey,
+        payload: UploadCancelRequest | None = None,
+        user: CurrentUser = Depends(get_current_user),
+        service: Phase1Service = Depends(get_phase1_service),
+    ) -> Response:
+        body = payload or UploadCancelRequest()
+        result = await service.cancel_upload(
+            user.user_id,
+            upload_session_id,
+            body,
+            _mutation(
+                request,
+                idempotency_key,
+                f"/v1/uploads/{upload_session_id}/cancel",
+                body,
+            ),
+        )
+        return Response(
+            status_code=204,
+            headers={
+                "Idempotency-Replayed": "true" if result.replayed else "false"
+            },
+        )
+
     @router.get("/changes", response_model=ChangePage)
     async def list_changes(
         requesting_device_id: DeviceId,
@@ -449,6 +561,36 @@ def create_phase1_router() -> APIRouter:
         )
         _apply_mutation_response(
             response, result, allowed_statuses={202}, default_status=202
+        )
+        return result.value
+
+    @router.post(
+        "/jobs/{job_id}/cancel",
+        response_model=ProcessingJob,
+        status_code=status.HTTP_200_OK,
+    )
+    async def cancel_job(
+        job_id: UUID,
+        payload: JobCancelRequest,
+        request: Request,
+        response: Response,
+        idempotency_key: IdempotencyKey,
+        user: CurrentUser = Depends(get_current_user),
+        service: Phase1Service = Depends(get_phase1_service),
+    ) -> ProcessingJob:
+        result = await service.cancel_job(
+            user.user_id,
+            job_id,
+            payload,
+            _mutation(
+                request,
+                idempotency_key,
+                f"/v1/jobs/{job_id}/cancel",
+                payload,
+            ),
+        )
+        _apply_mutation_response(
+            response, result, allowed_statuses={200}, default_status=200
         )
         return result.value
 

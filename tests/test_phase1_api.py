@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from datetime import datetime, timezone
+import hashlib
 import json
 from typing import Any
 from uuid import UUID
@@ -15,6 +17,8 @@ from sqlalchemy.pool import StaticPool
 
 from services.api.app import create_app
 from services.api.domain_adapter import DomainServiceAdapter
+from services.api.job_dispatcher import JobDispatchError, SqsJobDispatcher
+from services.api.temporary_store import S3TemporaryObjectStore
 from services.api.models import (
     ChangePage,
     CurrentUser,
@@ -42,6 +46,10 @@ from services.api.models import (
     SourceType,
     SyncSettings,
     TemporalMetadata,
+    SignedUploadRequest,
+    UploadCompleteResponse,
+    UploadPlan,
+    UploadSessionStatus,
 )
 from services.api.service import AuthIdentity, MutationResult
 from services.common.enums import (
@@ -130,13 +138,21 @@ def _media_summary() -> dict[str, Any]:
     }
 
 
-def _job() -> ProcessingJob:
+def _job(status: str = "Failed") -> ProcessingJob:
+    selected_status = ProcessingJobStatus(status)
     return ProcessingJob(
         job_id=JOB_ID,
         media_asset_id=ASSET_ID,
         job_type=ProcessingJobType.METADATA,
-        status=ProcessingJobStatus.FAILED,
-        state=UserFacingState.NEEDS_ATTENTION,
+        status=selected_status,
+        state=(
+            UserFacingState.NEEDS_ATTENTION
+            if selected_status in {
+                ProcessingJobStatus.FAILED,
+                ProcessingJobStatus.CANCELLED,
+            }
+            else UserFacingState.PROCESSING
+        ),
         attempt_count=3,
         can_retry=True,
         created_at_utc=NOW,
@@ -203,6 +219,7 @@ class FakePhase1Service:
                         occurrence_id=OCCURRENCE_ID,
                         media_asset_id=ASSET_ID,
                         upload_required=False,
+                        description_job_id=JOB_ID,
                     )
                 ],
             ),
@@ -212,6 +229,62 @@ class FakePhase1Service:
     async def list_changes(self, *args: Any) -> ChangePage:
         self.calls.append(("list_changes", args))
         return ChangePage(items=[], page=PageInfo(has_more=False))
+
+    async def create_upload_plan(self, *args: Any) -> MutationResult[UploadPlan]:
+        self.calls.append(("create_upload_plan", args))
+        return MutationResult(
+            UploadPlan(
+                disposition="UploadRequired",
+                strategy="SinglePart",
+                media_asset_id=ASSET_ID,
+                occurrence_id=OCCURRENCE_ID,
+                upload_session_id=JOB_ID,
+                expires_at_utc=NOW,
+                deduplicated=False,
+                single_part=SignedUploadRequest(
+                    url="https://uploads.example.test/preview.jpg?signature=test",
+                    method="PUT",
+                    headers={
+                        "Content-Type": "image/jpeg",
+                        "Content-Length": "512",
+                        "x-amz-checksum-sha256": "u" * 44,
+                    },
+                    expires_at_utc=NOW,
+                ),
+            ),
+            200,
+            replayed=True,
+        )
+
+    async def get_upload_session(self, *args: Any) -> UploadSessionStatus:
+        self.calls.append(("get_upload_session", args))
+        return UploadSessionStatus(
+            upload_session_id=JOB_ID,
+            strategy="SinglePart",
+            status="Uploading",
+            expected_byte_size=512,
+            uploaded_byte_size=0,
+            uploaded_parts=[],
+            expires_at_utc=NOW,
+        )
+
+    async def complete_upload(
+        self, *args: Any
+    ) -> MutationResult[UploadCompleteResponse]:
+        self.calls.append(("complete_upload", args))
+        return MutationResult(
+            UploadCompleteResponse(
+                media_asset_id=ASSET_ID,
+                storage_state="LocalOnly",
+                processing_jobs=[JOB_ID],
+            ),
+            200,
+            replayed=True,
+        )
+
+    async def cancel_upload(self, *args: Any) -> MutationResult[None]:
+        self.calls.append(("cancel_upload", args))
+        return MutationResult(None, 204, replayed=True)
 
     async def list_media(self, *args: Any) -> MediaAssetPage:
         self.calls.append(("list_media", args))
@@ -264,6 +337,10 @@ class FakePhase1Service:
         self.calls.append(("retry_job", args))
         return MutationResult(_job(), 202, replayed=True)
 
+    async def cancel_job(self, *args: Any) -> MutationResult[ProcessingJob]:
+        self.calls.append(("cancel_job", args))
+        return MutationResult(_job(status="Cancelled"), 200, replayed=True)
+
 
 IDENTITY = AuthIdentity(subject="cognito-subject", email="owner@example.com")
 
@@ -299,6 +376,101 @@ def _headers(*, device: bool = False, idempotency: bool = False) -> dict[str, st
     if idempotency:
         values["Idempotency-Key"] = "request-0001"
     return values
+
+
+def test_sqs_dispatcher_batches_job_ids_and_fails_closed():
+    class FakeSqs:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def send_message_batch(self, **kwargs: Any) -> dict[str, Any]:
+            self.calls.append(kwargs)
+            return {"Successful": [{"Id": item["Id"]} for item in kwargs["Entries"]]}
+
+    client = FakeSqs()
+    job_ids = tuple(UUID(int=index + 1) for index in range(23))
+    SqsJobDispatcher(client=client, queue_url="queue-url").dispatch(
+        job_ids=job_ids,
+        job_type="Geocode",
+    )
+    assert [len(call["Entries"]) for call in client.calls] == [10, 10, 3]
+    bodies = [
+        json.loads(entry["MessageBody"])
+        for call in client.calls
+        for entry in call["Entries"]
+    ]
+    assert bodies == [
+        {"jobId": str(job_id), "jobType": "Geocode"} for job_id in job_ids
+    ]
+    assert all(
+        entry["DelaySeconds"] == 2
+        for call in client.calls
+        for entry in call["Entries"]
+    )
+
+    class RejectingSqs:
+        def send_message_batch(self, **kwargs: Any) -> dict[str, Any]:
+            return {"Failed": [{"Id": "0", "Code": "InternalError"}]}
+
+    with pytest.raises(JobDispatchError, match="InternalError"):
+        SqsJobDispatcher(client=RejectingSqs(), queue_url="queue-url").dispatch(
+            job_ids=(UUID(int=1),),
+            job_type="Geocode",
+        )
+
+
+def test_s3_temporary_store_signs_and_verifies_exact_preview_bytes():
+    content = b"deterministic-preview"
+    checksum_bytes = hashlib.sha256(content).digest()
+    checksum_base64 = base64.b64encode(checksum_bytes).decode("ascii")
+
+    class FakeS3:
+        def __init__(self) -> None:
+            self.presigned: list[tuple[str, dict[str, Any]]] = []
+            self.deleted: list[dict[str, str]] = []
+
+        def generate_presigned_url(self, operation: str, **kwargs: Any) -> str:
+            self.presigned.append((operation, kwargs))
+            return f"https://staging.example/{operation}"
+
+        def head_object(self, **kwargs: Any) -> dict[str, Any]:
+            assert kwargs["ChecksumMode"] == "ENABLED"
+            return {
+                "ContentLength": len(content),
+                "ContentType": "image/jpeg",
+                "ChecksumSHA256": checksum_base64,
+            }
+
+        def delete_object(self, **kwargs: str) -> None:
+            self.deleted.append(kwargs)
+
+    client = FakeS3()
+    store = S3TemporaryObjectStore(client=client, bucket="media-bucket")
+    upload = store.create_presigned_put(
+        user_id=USER_ID,
+        media_asset_id=ASSET_ID,
+        upload_session_id=UUID("70000000-0000-4000-8000-000000000001"),
+        checksum_sha256_base64=checksum_base64,
+        content_type="image/jpeg",
+        content_length=len(content),
+        url_expires_at_utc=NOW,
+        object_expires_at_utc=NOW,
+    )
+    assert upload.url == "https://staging.example/put_object"
+    assert upload.headers["x-amz-checksum-sha256"] == checksum_base64
+    assert upload.object_key.startswith(f"staging/{USER_ID}/scene/{ASSET_ID}/")
+    metadata = store.head_object(
+        bucket="media-bucket", object_key=upload.object_key
+    )
+    assert metadata is not None
+    assert metadata.checksum_sha256_hex == hashlib.sha256(content).hexdigest()
+    assert store.create_presigned_get(
+        bucket="media-bucket", object_key=upload.object_key
+    ) == "https://staging.example/get_object"
+    store.delete_object(bucket="media-bucket", object_key=upload.object_key)
+    assert client.deleted == [
+        {"Bucket": "media-bucket", "Key": upload.object_key}
+    ]
 
 
 def test_cognito_claims_are_read_from_mangum_scope_not_raw_bearer_header():
@@ -706,11 +878,21 @@ def test_jobs_support_filters_get_and_idempotent_manual_retry():
         f"/v1/jobs/{JOB_ID}/retry",
         headers=_headers(idempotency=True),
     )
+    cancelled = _request(
+        _app(service),
+        "POST",
+        f"/v1/jobs/{JOB_ID}/cancel",
+        headers=_headers(idempotency=True),
+        json={"reason": "UnsupportedPhoto"},
+    )
 
     assert listed.status_code == 200
     assert fetched.status_code == 200
     assert retried.status_code == 202
     assert retried.headers["idempotency-replayed"] == "true"
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "Cancelled"
+    assert cancelled.headers["idempotency-replayed"] == "true"
 
 
 def test_admin_placeholders_are_restricted_and_never_expose_secrets():
@@ -736,10 +918,63 @@ def test_admin_placeholders_are_restricted_and_never_expose_secrets():
     assert "dsn" not in combined.casefold()
 
 
-def test_phase3_upload_and_media_lifecycle_routes_are_not_accidentally_enabled():
+def test_temporary_scene_upload_routes_are_enabled_but_media_lifecycle_is_not():
+    service = FakePhase1Service()
+    payload = {
+        "sourceId": str(SOURCE_ID),
+        "occurrenceId": str(OCCURRENCE_ID),
+        "assetContentSha256": "a" * 64,
+        "objectSha256": "b" * 64,
+        "fileName": "scene-preview.jpg",
+        "mediaType": "Photo",
+        "objectMimeType": "image/jpeg",
+        "objectByteSize": 512,
+        "purpose": "TemporaryProcessing",
+        "processingJobId": str(JOB_ID),
+    }
+    planned = _request(
+        _app(service),
+        "POST",
+        "/v1/uploads/plan",
+        headers=_headers(idempotency=True),
+        json=payload,
+    )
+    status_response = _request(
+        _app(service), "GET", f"/v1/uploads/{JOB_ID}"
+    )
+    completed = _request(
+        _app(service),
+        "POST",
+        f"/v1/uploads/{JOB_ID}/complete",
+        headers=_headers(idempotency=True),
+        json={"objectSha256": "b" * 64, "parts": []},
+    )
+    cancelled = _request(
+        _app(service),
+        "POST",
+        f"/v1/uploads/{JOB_ID}/cancel",
+        headers=_headers(idempotency=True),
+        json={"reason": "Stopped locally"},
+    )
+    rejected_parts = _request(
+        _app(service),
+        "POST",
+        f"/v1/uploads/{JOB_ID}/parts",
+        headers=_headers(idempotency=True),
+        json={"parts": [{"partNumber": 1, "checksumSha256": "A" * 43 + "="}]},
+    )
+
+    assert planned.status_code == 200
+    assert planned.json()["singlePart"]["method"] == "PUT"
+    assert planned.headers["idempotency-replayed"] == "true"
+    assert status_response.status_code == 200
+    assert completed.status_code == 200
+    assert completed.json()["storageState"] == "LocalOnly"
+    assert cancelled.status_code == 204
+    assert rejected_parts.status_code == 400
+    assert rejected_parts.json()["code"] == "MULTIPART_NOT_SUPPORTED"
+
     for method, path in (
-        ("POST", "/v1/uploads/plan"),
-        ("GET", f"/v1/uploads/{ASSET_ID}"),
         ("POST", f"/v1/media/{ASSET_ID}/trash"),
         ("POST", f"/v1/media/{ASSET_ID}/restore"),
     ):

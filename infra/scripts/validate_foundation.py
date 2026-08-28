@@ -18,6 +18,19 @@ REQUIRED_MARKERS = {
     "us-east-2 region": "region: us-east-2",
     "shared API handler": "handler: services/api/handler.handler",
     "bounded API concurrency": "reservedConcurrency: 4",
+    "shared worker handler": "handler: services/worker/handler.handler",
+    "bounded worker concurrency": "reservedConcurrency: 1",
+    "single-message worker batches": "batchSize: 1",
+    "partial SQS batch responses": "functionResponseType: ReportBatchItemFailures",
+    "worker queue consumption": "- sqs:ReceiveMessage",
+    "worker queue deletion": "- sqs:DeleteMessage",
+    "worker visibility management": "- sqs:ChangeMessageVisibility",
+    "packaged location rules path": "IMAGETRACKER_LOCATION_NORMALIZATION_RULES_PATH: /var/task/location_normalization_rules.json",
+    "nearby geocode reuse radius": "IMAGETRACKER_GEOCODE_REUSE_RADIUS_METERS: '5'",
+    "bounded monthly geocode calls": "IMAGETRACKER_GEOCODE_MONTHLY_CALL_LIMIT: '1000'",
+    "scene description model": "IMAGETRACKER_SCENE_DESCRIPTION_MODEL: gpt-5.6-sol",
+    "bounded monthly descriptions": "IMAGETRACKER_SCENE_DESCRIPTION_MONTHLY_CALL_LIMIT: '1000'",
+    "cost-efficient scene tier": "IMAGETRACKER_SCENE_DESCRIPTION_SERVICE_TIER: flex",
     "Phase 1 API proxy": "path: /v1/{proxy+}",
     "device context CORS header": "- X-ImageTracker-Device-Id",
     "Cognito user pool": "Type: AWS::Cognito::UserPool",
@@ -62,6 +75,7 @@ EXPECTED_RESOURCE_TYPES = {
     "AWS::Cognito::UserPoolClient",
     "AWS::Events::Rule",
     "AWS::Lambda::Function",
+    "AWS::Lambda::EventSourceMapping",
     "AWS::S3::Bucket",
     "AWS::SQS::Queue",
 }
@@ -81,17 +95,64 @@ def _validate_packaged_template(path: Path) -> list[str]:
     if forbidden_types:
         failures.append(f"packaged template contains forbidden resource types: {sorted(forbidden_types)}")
 
-    lambda_resource = resources.get("ApiLambdaFunction", {}).get("Properties", {})
-    if lambda_resource.get("Runtime") != "python3.12":
-        failures.append("packaged Lambda runtime is not python3.12")
-    if lambda_resource.get("Handler") != "services/api/handler.handler":
-        failures.append("packaged Lambda handler does not point to services/api")
-    if lambda_resource.get("ReservedConcurrentExecutions") != 4:
-        failures.append("packaged Lambda concurrency is not bounded at 4")
-    if lambda_resource.get("MemorySize") != 512:
-        failures.append("packaged Lambda memory is not 512 MB")
-    if lambda_resource.get("Timeout") != 28:
-        failures.append("packaged Lambda timeout is not 28 seconds")
+    api_lambda = resources.get("ApiLambdaFunction", {}).get("Properties", {})
+    if api_lambda.get("Runtime") != "python3.12":
+        failures.append("packaged API Lambda runtime is not python3.12")
+    if api_lambda.get("Handler") != "services/api/handler.handler":
+        failures.append("packaged API Lambda handler does not point to services/api")
+    if api_lambda.get("ReservedConcurrentExecutions") != 4:
+        failures.append("packaged API Lambda concurrency is not bounded at 4")
+    if api_lambda.get("MemorySize") != 512:
+        failures.append("packaged API Lambda memory is not 512 MB")
+    if api_lambda.get("Timeout") != 28:
+        failures.append("packaged API Lambda timeout is not 28 seconds")
+
+    worker_lambda = resources.get("WorkerLambdaFunction", {}).get("Properties", {})
+    if worker_lambda.get("Runtime") != "python3.12":
+        failures.append("packaged worker Lambda runtime is not python3.12")
+    if worker_lambda.get("Handler") != "services/worker/handler.handler":
+        failures.append("packaged worker Lambda handler does not point to services/worker")
+    if worker_lambda.get("ReservedConcurrentExecutions") != 1:
+        failures.append("packaged worker Lambda concurrency is not bounded at 1")
+    if worker_lambda.get("MemorySize") != 384:
+        failures.append("packaged worker Lambda memory is not 384 MB")
+    if worker_lambda.get("Timeout") != 120:
+        failures.append("packaged worker Lambda timeout is not 120 seconds")
+    queue = resources.get("ProcessingQueue", {}).get("Properties", {})
+    if int(queue.get("VisibilityTimeout", 0)) < 720:
+        failures.append("processing queue visibility must cover worker retries")
+
+    mappings = [
+        resource.get("Properties", {})
+        for resource in resources.values()
+        if resource.get("Type") == "AWS::Lambda::EventSourceMapping"
+    ]
+    worker_mappings = [
+        mapping
+        for mapping in mappings
+        if "WorkerLambdaFunction" in json.dumps(mapping.get("FunctionName"))
+    ]
+    if len(worker_mappings) != 1:
+        failures.append("packaged worker must have exactly one SQS event source mapping")
+    else:
+        worker_mapping = worker_mappings[0]
+        if worker_mapping.get("BatchSize") != 1:
+            failures.append("packaged worker SQS batch size is not 1")
+        if worker_mapping.get("FunctionResponseTypes") != ["ReportBatchItemFailures"]:
+            failures.append("packaged worker does not report partial SQS batch failures")
+        if "ProcessingQueue" not in json.dumps(worker_mapping.get("EventSourceArn")):
+            failures.append("packaged worker event source is not ProcessingQueue")
+
+    execution_role = resources.get("IamRoleLambdaExecution", {}).get("Properties", {})
+    role_document = json.dumps(execution_role.get("Policies", []))
+    for action in (
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:ChangeMessageVisibility",
+        "sqs:GetQueueAttributes",
+    ):
+        if action not in role_document:
+            failures.append(f"packaged Lambda role is missing worker permission: {action}")
 
     user_pool = resources.get("ImageTrackerUserPoolV2", {}).get("Properties", {})
     if user_pool.get("UsernameConfiguration", {}).get("CaseSensitive") is not False:
@@ -108,8 +169,11 @@ def _validate_packaged_template(path: Path) -> list[str]:
     ):
         failures.append("Cognito SES SourceArn is not scoped to info@nektron.ai")
 
+    retry_state = resources.get("RetrySchedule", {}).get("Properties", {}).get("State")
+    if retry_state != "ENABLED":
+        failures.append("RetrySchedule must package as ENABLED for durable job recovery")
+
     for logical_id in (
-        "RetrySchedule",
         "ReconciliationSchedule",
         "QuotaResetSchedule",
         "TrashPurgeSchedule",
@@ -140,10 +204,24 @@ def _validate_lambda_archive(template_path: Path) -> list[str]:
 
     required_entries = {
         "services/api/handler.py",
+        "services/api/composition.py",
         "services/api/domain_adapter.py",
+        "services/api/job_dispatcher.py",
+        "services/api/temporary_store.py",
         "services/data/database.py",
         "services/domain/service.py",
+        "services/enrichment/aws_location.py",
+        "services/enrichment/models.py",
+        "services/enrichment/normalization.py",
+        "services/enrichment/openai_scene.py",
+        "services/enrichment/openai_secrets.py",
+        "services/worker/contracts.py",
+        "services/worker/composition.py",
+        "services/worker/handler.py",
+        "services/worker/processor.py",
+        "services/worker/staging.py",
         "services/data/certs/us-east-2-bundle.pem",
+        "location_normalization_rules.json",
     }
     failures: list[str] = []
     try:

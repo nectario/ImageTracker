@@ -31,8 +31,10 @@ from services.data.models import (
     MediaOccurrence,
     MediaSource,
     ProcessingJob,
+    ProviderUsageMonth,
     UserAccount,
 )
+from services.enrichment.models import GeocodeResolution, ReverseGeocodeResult
 from services.domain.errors import ConflictError, NotFoundError
 from services.domain.models import (
     AccountIdentity,
@@ -48,6 +50,8 @@ from services.domain.models import (
 )
 from services.domain.service import Phase1DomainService
 from services.domain.repositories import AccountRepository
+from services.worker.contracts import GeocodeJobFailure
+from services.enrichment.models import ProviderFailureClass
 
 
 FIXED_NOW = datetime(2026, 8, 27, 16, 0, 0)
@@ -147,10 +151,17 @@ def create_source(
     ).value
 
 
-def manifest_upsert(source_item_id: str, *, content_hash: str = PHOTO_HASH):
+def manifest_upsert(
+    source_item_id: str,
+    *,
+    revision: str = "r1",
+    content_hash: str = PHOTO_HASH,
+    latitude: Decimal = Decimal("40.668700"),
+    longitude: Decimal = Decimal("-74.114300"),
+):
     return ManifestUpsert(
         source_item_id=source_item_id,
-        source_revision="r1",
+        source_revision=revision,
         file_name=f"{source_item_id}.JPG",
         local_locator=f"C:/Photos/{source_item_id}.JPG",
         content_sha256=content_hash,
@@ -164,10 +175,30 @@ def manifest_upsert(source_item_id: str, *, content_hash: str = PHOTO_HASH):
         time_zone_id="America/New_York",
         utc_offset_minutes=-240,
         location=GeoPoint(
-            latitude=Decimal("40.668700"),
-            longitude=Decimal("-74.114300"),
+            latitude=latitude,
+            longitude=longitude,
         ),
     )
+
+
+class RecordingJobDispatcher:
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[UUID, ...], str]] = []
+
+    def dispatch(self, *, job_ids: tuple[UUID, ...], job_type: str) -> None:
+        self.calls.append((job_ids, job_type))
+
+
+class FailOnceJobDispatcher(RecordingJobDispatcher):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failures_remaining = 1
+
+    def dispatch(self, *, job_ids: tuple[UUID, ...], job_type: str) -> None:
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise RuntimeError("simulated dispatch failure")
+        super().dispatch(job_ids=job_ids, job_type=job_type)
 
 
 class FakeSsm:
@@ -559,6 +590,530 @@ def test_local_manifest_deduplicates_exact_bytes_and_replays_idempotently(
         assert session.scalar(select(func.count()).select_from(MediaLocation)) == 1
 
 
+def test_geocode_jobs_dispatch_once_and_reuse_full_nearby_resolution(
+    session_factory,
+) -> None:
+    dispatcher = RecordingJobDispatcher()
+    service = Phase1DomainService(
+        session_factory,
+        clock=lambda: FIXED_NOW,
+        job_dispatcher=dispatcher,
+    )
+    user = bootstrap(service)
+    device = register_device(
+        service,
+        user.user_id,
+        key="00000000-0000-0000-0000-000000000061",
+        name="Geocode",
+    )
+    source = create_source(
+        service, user.user_id, device.device_id, source_key="geocode-source"
+    )
+    request_context = context("geocode-first")
+    first = run(
+        service.submit_manifest(
+            user.user_id,
+            source.source_id,
+            ManifestCommand(
+                kind="Incremental",
+                permission_state="NotApplicable",
+                deletion_detection_reliable=True,
+                entries=(manifest_upsert("first"),),
+            ),
+            request_context,
+        )
+    )
+    assert len(dispatcher.calls) == 1
+    assert dispatcher.calls[0][1] == "Geocode"
+    assert len(dispatcher.calls[0][0]) == 1
+
+    replay = run(
+        service.submit_manifest(
+            user.user_id,
+            source.source_id,
+            ManifestCommand(
+                kind="Incremental",
+                permission_state="NotApplicable",
+                deletion_detection_reliable=True,
+                entries=(manifest_upsert("first"),),
+            ),
+            request_context,
+        )
+    )
+    assert replay.replayed is True
+    assert len(dispatcher.calls) == 1
+
+    with transaction_scope(session_factory) as session:
+        first_location = session.scalar(select(MediaLocation))
+        first_location.location_display_name = "Bayonne, NJ, USA"
+        first_location.street_address = "99 Prospect Avenue"
+        first_location.original_street_number = "101"
+        first_location.neighborhood = "Constable Hook"
+        first_location.city = "Bayonne"
+        first_location.county = "Hudson County"
+        first_location.state = "New Jersey"
+        first_location.postal_code = "07002"
+        first_location.country = "United States"
+        first_location.country_code = "US"
+        first_location.provider = "AmazonLocationPlacesV2"
+        first_location.provider_place_id = "place-1"
+        first_location.normalization_rule_version = "bayonne-v1"
+        first_location.confidence = Decimal("0.9900")
+        first_location.raw_provider_json = {
+            "status": "OK",
+            "marker": "raw",
+            "OriginalAddress": {
+                "DisplayName": "Bayonne, NJ, USA",
+                "StreetAddress": "99 Prospect Avenue",
+                "StreetNumber": "101",
+                "Neighborhood": "Constable Hook",
+                "City": "Bayonne",
+                "County": "Hudson County",
+                "State": "New Jersey",
+                "PostalCode": "07002",
+                "Country": "United States",
+                "CountryCode": "US",
+            },
+        }
+        first_location.provider_updated_at_utc = FIXED_NOW
+
+    second = run(
+        service.submit_manifest(
+            user.user_id,
+            source.source_id,
+            ManifestCommand(
+                kind="Incremental",
+                permission_state="NotApplicable",
+                deletion_detection_reliable=True,
+                entries=(
+                    manifest_upsert(
+                        "second",
+                        content_hash="b" * 64,
+                        latitude=Decimal("40.668730"),
+                    ),
+                ),
+            ),
+            context("geocode-nearby"),
+        )
+    ).value
+    assert second.results[0].outcome == "CreatedOccurrence"
+    assert len(dispatcher.calls) == 1
+    with transaction_scope(session_factory) as session:
+        copied = session.scalar(
+            select(MediaLocation).where(
+                MediaLocation.media_asset_id
+                == session.scalar(
+                    select(MediaAsset.id).where(
+                        MediaAsset.public_id
+                        == str(second.results[0].media_asset_id)
+                    )
+                )
+            )
+        )
+        assert copied.latitude == Decimal("40.668730")
+        assert copied.street_address == "99 Prospect Avenue"
+        assert copied.original_street_number == "101"
+        assert copied.provider == "AmazonLocationPlacesV2"
+        assert copied.provider_place_id == "place-1"
+        assert copied.normalization_rule_version is None
+        assert copied.confidence is None
+        assert copied.raw_provider_json["marker"] == "raw"
+        assert copied.provider_updated_at_utc == FIXED_NOW
+        assert session.scalar(
+            select(func.count()).select_from(ProcessingJob).where(
+                ProcessingJob.job_type == "Geocode"
+            )
+        ) == 1
+        assert session.scalar(
+            select(func.count()).select_from(ProcessingJob).where(
+                ProcessingJob.job_type == "Description"
+            )
+        ) == 2
+
+    other_user = bootstrap(
+        service, subject="geocode-other-user", email="other@example.com"
+    )
+    other_device = register_device(
+        service,
+        other_user.user_id,
+        key="00000000-0000-0000-0000-000000000065",
+        name="Other geocode user",
+    )
+    other_source = create_source(
+        service,
+        other_user.user_id,
+        other_device.device_id,
+        source_key="other-geocode-source",
+    )
+    run(
+        service.submit_manifest(
+            other_user.user_id,
+            other_source.source_id,
+            ManifestCommand(
+                kind="Incremental",
+                permission_state="NotApplicable",
+                deletion_detection_reliable=True,
+                entries=(manifest_upsert("other-user"),),
+            ),
+            context("other-user-geocode"),
+        )
+    )
+    assert len(dispatcher.calls) == 2
+    with transaction_scope(session_factory) as session:
+        other_account_id = session.scalar(
+            select(UserAccount.id).where(
+                UserAccount.public_id == str(other_user.user_id)
+            )
+        )
+        other_location = session.scalar(
+            select(MediaLocation).where(MediaLocation.user_id == other_account_id)
+        )
+        assert other_location.provider is None
+        assert session.scalar(
+            select(func.count()).select_from(ProcessingJob).where(
+                ProcessingJob.job_type == "Geocode"
+            )
+        ) == 2
+        assert session.scalar(
+            select(func.count()).select_from(ProcessingJob).where(
+                ProcessingJob.job_type == "Description"
+            )
+        ) == 3
+
+
+def test_geocode_worker_claim_quota_and_completion_are_transactional(
+    service, session_factory
+) -> None:
+    user = bootstrap(service)
+    device = register_device(
+        service,
+        user.user_id,
+        key="00000000-0000-0000-0000-000000000062",
+        name="Worker",
+    )
+    source = create_source(
+        service, user.user_id, device.device_id, source_key="worker-source"
+    )
+    run(
+        service.submit_manifest(
+            user.user_id,
+            source.source_id,
+            ManifestCommand(
+                kind="Incremental",
+                permission_state="NotApplicable",
+                deletion_detection_reliable=True,
+                entries=(manifest_upsert("worker-one"),),
+            ),
+            context("worker-one"),
+        )
+    )
+    with transaction_scope(session_factory) as session:
+        first_job_id = UUID(
+            session.scalar(
+                select(ProcessingJob.public_id).where(
+                    ProcessingJob.job_type == "Geocode"
+                )
+            )
+        )
+
+    assert service.claim_geocode_job(job_id=uuid4(), message_id="orphan") is None
+    claimed = service.claim_geocode_job(job_id=first_job_id, message_id="message-one")
+    assert claimed is not None
+    assert claimed.coordinate_revision
+    assert service.find_reusable_location(job=claimed, radius_meters=15) is None
+    assert service.reserve_provider_call(
+        job=claimed,
+        provider="AmazonLocationPlacesV2",
+        monthly_limit=1,
+    )
+    # Reservation is idempotent for a duplicate delivery of the same lease.
+    assert service.reserve_provider_call(
+        job=claimed,
+        provider="AmazonLocationPlacesV2",
+        monthly_limit=1,
+    )
+    with transaction_scope(session_factory) as session:
+        usage = session.scalar(select(ProviderUsageMonth))
+        assert usage.processed_units == Decimal("0.000000")
+        assert usage.reserved_units == Decimal("1.000000")
+        asset = session.scalar(select(MediaAsset))
+        asset.time_zone = None
+        asset.utc_offset_minutes = None
+        asset.capture_datetime_utc = None
+    assert service.consume_provider_call(
+        job=claimed,
+        provider="AmazonLocationPlacesV2",
+    )
+    with transaction_scope(session_factory) as session:
+        usage = session.scalar(select(ProviderUsageMonth))
+        assert usage.processed_units == Decimal("1.000000")
+        assert usage.reserved_units == Decimal("0.000000")
+
+    result = ReverseGeocodeResult(
+        provider="AmazonLocationPlacesV2",
+        provider_status="OK",
+        resolution=GeocodeResolution(
+            location_display_name="Bayonne, NJ, USA",
+            street_address="99 Prospect Avenue",
+            original_street_number="101",
+            neighborhood="Constable Hook",
+            city="Bayonne",
+            county="Hudson County",
+            state="New Jersey",
+            postal_code="07002",
+            country="United States",
+            country_code="US",
+            provider="AmazonLocationPlacesV2",
+            provider_place_id="place-worker",
+            raw_provider_json={"formatted_address": "99 Prospect Avenue"},
+            normalization_rule_version="bayonne-v1",
+            time_zone_id="America/New_York",
+        ),
+        raw_provider_json={"status": "OK", "results": [{"place_id": "place-worker"}]},
+    )
+    service.complete_geocode(job=claimed, result=result, reused=False)
+    with transaction_scope(session_factory) as session:
+        location = session.scalar(select(MediaLocation))
+        job = session.scalar(
+            select(ProcessingJob).where(ProcessingJob.public_id == str(first_job_id))
+        )
+        usage = session.scalar(select(ProviderUsageMonth))
+        asset = session.scalar(select(MediaAsset))
+        assert location.street_address == "99 Prospect Avenue"
+        assert location.original_street_number == "101"
+        assert location.provider_place_id == "place-worker"
+        assert location.normalization_rule_version == "bayonne-v1"
+        assert location.raw_provider_json["status"] == "OK"
+        assert job.status == "Succeeded"
+        assert job.lease_token_hash is None
+        assert usage.processed_units == Decimal("1.000000")
+        assert usage.reserved_units == Decimal("0.000000")
+        assert asset.time_zone == "America/New_York"
+        assert asset.utc_offset_minutes == -240
+        assert asset.capture_datetime_utc == datetime(2026, 8, 20, 16, 30)
+
+    run(
+        service.submit_manifest(
+            user.user_id,
+            source.source_id,
+            ManifestCommand(
+                kind="Incremental",
+                permission_state="NotApplicable",
+                deletion_detection_reliable=True,
+                entries=(
+                    manifest_upsert(
+                        "worker-two",
+                        content_hash="c" * 64,
+                        latitude=Decimal("41.000000"),
+                        longitude=Decimal("-75.000000"),
+                    ),
+                ),
+            ),
+            context("worker-two"),
+        )
+    )
+    with transaction_scope(session_factory) as session:
+        second_job_id = UUID(
+            session.scalar(
+                select(ProcessingJob.public_id)
+                .where(ProcessingJob.status == "Queued")
+                .order_by(ProcessingJob.id.desc())
+            )
+        )
+    second_claim = service.claim_geocode_job(
+        job_id=second_job_id, message_id="message-two"
+    )
+    assert second_claim is not None
+    assert not service.reserve_provider_call(
+        job=second_claim,
+        provider="AmazonLocationPlacesV2",
+        monthly_limit=1,
+    )
+    service.defer_geocode_quota(
+        job=second_claim,
+        failure=GeocodeJobFailure(
+            failure_class=ProviderFailureClass.QUOTA,
+            code="MonthlyGeocodeLimitReached",
+            user_message="Waiting for the monthly provider quota.",
+            retryable=False,
+        ),
+        provider_called=False,
+    )
+    with transaction_scope(session_factory) as session:
+        deferred = session.scalar(
+            select(ProcessingJob).where(ProcessingJob.public_id == str(second_job_id))
+        )
+        usage = session.scalar(select(ProviderUsageMonth))
+        assert deferred.status == "DeferredQuota"
+        assert deferred.next_attempt_at_utc == datetime(2026, 9, 1)
+        assert usage.processed_units == Decimal("1.000000")
+        assert usage.reserved_units == Decimal("0.000000")
+
+
+def test_geocode_completion_cannot_overwrite_newer_coordinates(
+    service, session_factory
+) -> None:
+    user = bootstrap(service)
+    device = register_device(
+        service,
+        user.user_id,
+        key="00000000-0000-0000-0000-000000000063",
+        name="Stale",
+    )
+    source = create_source(service, user.user_id, device.device_id, source_key="stale")
+    run(
+        service.submit_manifest(
+            user.user_id,
+            source.source_id,
+            ManifestCommand(
+                kind="Incremental",
+                permission_state="NotApplicable",
+                deletion_detection_reliable=True,
+                entries=(manifest_upsert("stale"),),
+            ),
+            context("stale"),
+        )
+    )
+    with transaction_scope(session_factory) as session:
+        job_id = UUID(
+            session.scalar(
+                select(ProcessingJob.public_id).where(
+                    ProcessingJob.job_type == "Geocode"
+                )
+            )
+        )
+    claim = service.claim_geocode_job(job_id=job_id, message_id="stale-message")
+    assert claim is not None
+    with transaction_scope(session_factory) as session:
+        location = session.scalar(select(MediaLocation))
+        location.latitude = Decimal("42.000000")
+        location.longitude = Decimal("-76.000000")
+    service.complete_geocode(
+        job=claim,
+        result=ReverseGeocodeResult(
+            provider="AmazonLocationPlacesV2",
+            provider_status="ZERO_RESULTS",
+            resolution=None,
+            raw_provider_json={"status": "ZERO_RESULTS", "results": []},
+        ),
+        reused=False,
+    )
+    with transaction_scope(session_factory) as session:
+        location = session.scalar(select(MediaLocation))
+        job = session.scalar(
+            select(ProcessingJob).where(ProcessingJob.job_type == "Geocode")
+        )
+        assert location.latitude == Decimal("42.000000")
+        assert location.provider is None
+        assert job.status == "Cancelled"
+        assert job.failure_code == "StaleCoordinates"
+
+
+def test_returning_to_an_earlier_coordinate_requeues_its_terminal_job(
+    session_factory,
+) -> None:
+    dispatcher = RecordingJobDispatcher()
+    service = Phase1DomainService(
+        session_factory,
+        clock=lambda: FIXED_NOW,
+        job_dispatcher=dispatcher,
+    )
+    user = bootstrap(service)
+    device = register_device(
+        service,
+        user.user_id,
+        key="00000000-0000-0000-0000-000000000068",
+        name="Coordinate return",
+    )
+    source = create_source(
+        service, user.user_id, device.device_id, source_key="coordinate-return"
+    )
+    run(
+        service.submit_manifest(
+            user.user_id,
+            source.source_id,
+            ManifestCommand(
+                kind="Incremental",
+                permission_state="NotApplicable",
+                deletion_detection_reliable=True,
+                entries=(manifest_upsert("moving-photo", revision="a"),),
+            ),
+            context("coordinate-a"),
+        )
+    )
+    with transaction_scope(session_factory) as session:
+        first_job = session.scalar(select(ProcessingJob))
+        first_job_id = UUID(first_job.public_id)
+        first_job.status = "Succeeded"
+        first_job.completed_at_utc = FIXED_NOW
+        location = session.scalar(select(MediaLocation))
+        location.provider = "AmazonLocationPlacesV2"
+        location.provider_updated_at_utc = FIXED_NOW
+        location.street_address = "99 Prospect Avenue"
+
+    run(
+        service.submit_manifest(
+            user.user_id,
+            source.source_id,
+            ManifestCommand(
+                kind="Incremental",
+                permission_state="NotApplicable",
+                deletion_detection_reliable=True,
+                entries=(
+                    manifest_upsert(
+                        "moving-photo",
+                        revision="b",
+                        latitude=Decimal("41.000000"),
+                        longitude=Decimal("-75.000000"),
+                    ),
+                ),
+            ),
+            context("coordinate-b"),
+        )
+    )
+    with transaction_scope(session_factory) as session:
+        second_job = session.scalar(
+            select(ProcessingJob).where(
+                ProcessingJob.public_id != str(first_job_id)
+            )
+        )
+        second_job.status = "Succeeded"
+        second_job.completed_at_utc = FIXED_NOW
+        location = session.scalar(select(MediaLocation))
+        location.provider = "AmazonLocationPlacesV2"
+        location.provider_updated_at_utc = FIXED_NOW
+        location.street_address = "200 Different Street"
+
+    run(
+        service.submit_manifest(
+            user.user_id,
+            source.source_id,
+            ManifestCommand(
+                kind="Incremental",
+                permission_state="NotApplicable",
+                deletion_detection_reliable=True,
+                entries=(manifest_upsert("moving-photo", revision="c"),),
+            ),
+            context("coordinate-a-again"),
+        )
+    )
+
+    assert dispatcher.calls[-1] == ((first_job_id,), "Geocode")
+    with transaction_scope(session_factory) as session:
+        first_job = session.scalar(
+            select(ProcessingJob).where(
+                ProcessingJob.public_id == str(first_job_id)
+            )
+        )
+        location = session.scalar(select(MediaLocation))
+        assert first_job.status == "Queued"
+        assert first_job.attempt_count == 0
+        assert first_job.completed_at_utc is None
+        assert location.latitude == Decimal("40.668700")
+        assert location.street_address is None
+        assert location.provider is None
+
+
 def test_local_visibility_and_safe_deletion(service) -> None:
     user = bootstrap(service)
     owner = register_device(
@@ -760,7 +1315,7 @@ def test_failed_job_retry_is_scoped_and_idempotent(service, session_factory) -> 
             user_id=account.id,
             media_asset_id=asset.id,
             idempotency_key="seed-job",
-            job_type="Description",
+            job_type="Metadata",
             status="Failed",
             attempt_count=1,
             max_attempts=5,
@@ -781,8 +1336,274 @@ def test_failed_job_retry_is_scoped_and_idempotent(service, session_factory) -> 
     replay = run(service.retry_job(user.user_id, job_id, mutation_context))
     assert replay.replayed is True
     assert replay.value == retried.value
-    jobs = run(service.list_jobs(user.user_id, JobQuery()))
+    jobs = run(service.list_jobs(user.user_id, JobQuery(job_type="Metadata")))
     assert len(jobs.items) == 1
+
+
+def test_quota_deferred_job_manual_retry_dispatches_once(session_factory) -> None:
+    dispatcher = RecordingJobDispatcher()
+    service = Phase1DomainService(
+        session_factory,
+        clock=lambda: FIXED_NOW,
+        job_dispatcher=dispatcher,
+    )
+    user = bootstrap(service)
+    device = register_device(
+        service,
+        user.user_id,
+        key="00000000-0000-0000-0000-000000000064",
+        name="Retry quota",
+    )
+    source = create_source(service, user.user_id, device.device_id, source_key="quota")
+    run(
+        service.submit_manifest(
+            user.user_id,
+            source.source_id,
+            ManifestCommand(
+                kind="Incremental",
+                permission_state="NotApplicable",
+                deletion_detection_reliable=True,
+                entries=(manifest_upsert("quota"),),
+            ),
+            context("quota-create"),
+        )
+    )
+    assert len(dispatcher.calls) == 1
+    with transaction_scope(session_factory) as session:
+        job = session.scalar(
+            select(ProcessingJob).where(ProcessingJob.job_type == "Geocode")
+        )
+        job.status = "DeferredQuota"
+        job.attempt_count = job.max_attempts
+        job.failure_class = "Quota"
+        job.failure_code = "MonthlyGeocodeLimitReached"
+        job_id = UUID(job.public_id)
+
+    retry_context = context("quota-manual-retry")
+    retried = run(service.retry_job(user.user_id, job_id, retry_context))
+    assert retried.value.status == "Queued"
+    assert dispatcher.calls[-1] == ((job_id,), "Geocode")
+    assert len(dispatcher.calls) == 2
+    replay = run(service.retry_job(user.user_id, job_id, retry_context))
+    assert replay.replayed is True
+    assert len(dispatcher.calls) == 2
+
+
+def test_due_job_sweep_recovers_orphans_and_promotes_description_restage(
+    session_factory,
+) -> None:
+    dispatcher = RecordingJobDispatcher()
+    service = Phase1DomainService(
+        session_factory,
+        clock=lambda: FIXED_NOW,
+        job_dispatcher=dispatcher,
+    )
+    user = bootstrap(service)
+    device = register_device(
+        service,
+        user.user_id,
+        key="00000000-0000-0000-0000-000000000065",
+        name="Recovery sweep",
+    )
+    source = create_source(
+        service, user.user_id, device.device_id, source_key="recovery"
+    )
+    run(
+        service.submit_manifest(
+            user.user_id,
+            source.source_id,
+            ManifestCommand(
+                kind="Incremental",
+                permission_state="NotApplicable",
+                deletion_detection_reliable=True,
+                entries=(
+                    manifest_upsert("recover-one", content_hash="d" * 64),
+                    manifest_upsert(
+                        "recover-two",
+                        content_hash="e" * 64,
+                        latitude=Decimal("41.000000"),
+                        longitude=Decimal("-75.000000"),
+                    ),
+                ),
+            ),
+            context("recovery-create"),
+        )
+    )
+    dispatcher.calls.clear()
+    with transaction_scope(session_factory) as session:
+        geocodes = list(
+            session.scalars(
+                select(ProcessingJob)
+                .where(ProcessingJob.job_type == "Geocode")
+                .order_by(ProcessingJob.id)
+            )
+        )
+        descriptions = list(
+            session.scalars(
+                select(ProcessingJob)
+                .where(ProcessingJob.job_type == "Description")
+                .order_by(ProcessingJob.id)
+            )
+        )
+        geocodes[0].status = "Queued"
+        geocodes[0].next_attempt_at_utc = FIXED_NOW - timedelta(minutes=10)
+        geocodes[0].updated_at_utc = FIXED_NOW - timedelta(minutes=10)
+        geocodes[1].status = "DeferredQuota"
+        geocodes[1].attempt_count = geocodes[1].max_attempts
+        geocodes[1].next_attempt_at_utc = FIXED_NOW - timedelta(seconds=1)
+        geocodes[1].updated_at_utc = FIXED_NOW - timedelta(minutes=10)
+        descriptions[0].status = "DeferredQuota"
+        descriptions[0].attempt_count = descriptions[0].max_attempts
+        descriptions[0].next_attempt_at_utc = FIXED_NOW - timedelta(seconds=1)
+        descriptions[0].request_json = {
+            **(descriptions[0].request_json or {}),
+            "stagingBucket": "temporary",
+            "stagingObjectKey": "temporary/object.jpg",
+            "uploadSessionId": str(uuid4()),
+        }
+
+    assert service.redispatch_due_jobs(limit=100) == 2
+    assert len(dispatcher.calls) == 1
+    dispatched_ids, dispatched_type = dispatcher.calls[0]
+    assert dispatched_type == "Geocode"
+    assert len(dispatched_ids) == 2
+    with transaction_scope(session_factory) as session:
+        geocodes = list(
+            session.scalars(
+                select(ProcessingJob)
+                .where(ProcessingJob.job_type == "Geocode")
+                .order_by(ProcessingJob.id)
+            )
+        )
+        description = session.scalar(
+            select(ProcessingJob)
+            .where(ProcessingJob.job_type == "Description")
+            .order_by(ProcessingJob.id)
+        )
+        assert all(job.status == "Queued" for job in geocodes)
+        assert geocodes[1].attempt_count == 0
+        assert description.status == "Preparing"
+        assert description.attempt_count == 0
+        assert description.next_attempt_at_utc is None
+        assert "stagingBucket" not in description.request_json
+        assert "stagingObjectKey" not in description.request_json
+        assert "uploadSessionId" not in description.request_json
+
+
+def test_due_job_sweep_conservatively_charges_expired_exhausted_attempt(
+    session_factory,
+) -> None:
+    dispatcher = RecordingJobDispatcher()
+    service = Phase1DomainService(
+        session_factory,
+        clock=lambda: FIXED_NOW,
+        job_dispatcher=dispatcher,
+    )
+    user = bootstrap(service)
+    device = register_device(
+        service,
+        user.user_id,
+        key="00000000-0000-0000-0000-000000000066",
+        name="Expired attempt",
+    )
+    source = create_source(service, user.user_id, device.device_id, source_key="expired")
+    run(
+        service.submit_manifest(
+            user.user_id,
+            source.source_id,
+            ManifestCommand(
+                kind="Incremental",
+                permission_state="NotApplicable",
+                deletion_detection_reliable=True,
+                entries=(manifest_upsert("expired-attempt", content_hash="f" * 64),),
+            ),
+            context("expired-attempt-create"),
+        )
+    )
+    dispatcher.calls.clear()
+    with transaction_scope(session_factory) as session:
+        job_id = UUID(
+            session.scalar(
+                select(ProcessingJob.public_id).where(
+                    ProcessingJob.job_type == "Geocode"
+                )
+            )
+        )
+    claim = service.claim_geocode_job(job_id=job_id, message_id="expired-message")
+    assert claim is not None
+    assert service.reserve_provider_call(
+        job=claim,
+        provider="AmazonLocationPlacesV2",
+        monthly_limit=10,
+    )
+    with transaction_scope(session_factory) as session:
+        job = session.scalar(
+            select(ProcessingJob).where(ProcessingJob.public_id == str(job_id))
+        )
+        job.attempt_count = job.max_attempts
+        job.lease_expires_at_utc = FIXED_NOW - timedelta(seconds=1)
+
+    assert service.redispatch_due_jobs(limit=100) == 0
+    assert dispatcher.calls == []
+    with transaction_scope(session_factory) as session:
+        job = session.scalar(
+            select(ProcessingJob).where(ProcessingJob.public_id == str(job_id))
+        )
+        usage = session.scalar(select(ProviderUsageMonth))
+        assert job.status == "Failed"
+        assert job.failure_code == "AttemptsExhausted"
+        assert usage.reserved_units == Decimal("0.000000")
+        assert usage.processed_units == Decimal("1.000000")
+
+
+def test_due_job_dispatch_failure_is_recovered_by_the_next_sweep(
+    session_factory,
+) -> None:
+    clock = [FIXED_NOW]
+    initial_dispatcher = RecordingJobDispatcher()
+    service = Phase1DomainService(
+        session_factory,
+        clock=lambda: clock[0],
+        job_dispatcher=initial_dispatcher,
+    )
+    user = bootstrap(service)
+    device = register_device(
+        service,
+        user.user_id,
+        key="00000000-0000-0000-0000-000000000067",
+        name="Dispatch retry",
+    )
+    source = create_source(
+        service, user.user_id, device.device_id, source_key="dispatch-retry"
+    )
+    run(
+        service.submit_manifest(
+            user.user_id,
+            source.source_id,
+            ManifestCommand(
+                kind="Incremental",
+                permission_state="NotApplicable",
+                deletion_detection_reliable=True,
+                entries=(manifest_upsert("dispatch-retry", content_hash="1" * 64),),
+            ),
+            context("dispatch-retry-create"),
+        )
+    )
+    with transaction_scope(session_factory) as session:
+        job = session.scalar(
+            select(ProcessingJob).where(ProcessingJob.job_type == "Geocode")
+        )
+        job.next_attempt_at_utc = FIXED_NOW - timedelta(minutes=10)
+        job.updated_at_utc = FIXED_NOW - timedelta(minutes=10)
+
+    fail_once = FailOnceJobDispatcher()
+    service._job_dispatcher = fail_once
+    with pytest.raises(RuntimeError, match="simulated dispatch failure"):
+        service.redispatch_due_jobs(limit=100)
+
+    clock[0] = FIXED_NOW + timedelta(minutes=10)
+    assert service.redispatch_due_jobs(limit=100) == 1
+    assert len(fail_once.calls) == 1
 
 
 def test_idempotency_key_cannot_be_reused_for_a_different_request(service) -> None:

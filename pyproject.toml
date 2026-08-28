@@ -5,7 +5,7 @@ description = "UX-first local and remote media ingestion foundation"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-  "boto3>=1.35.0,<2",
+  "boto3>=1.43.0,<2",
   "fastapi>=0.115.0,<1",
   "httpx>=0.27.0,<1",
   "mangum>=0.19.0,<1",

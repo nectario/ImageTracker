@@ -21,8 +21,9 @@ Commands:
   check          Run cli doctor, tests, local API, AWS, and DB checks
   help           Show this help
 
-No command in this toolkit deploys AWS resources, applies database migrations,
-or runs the legacy importer.
+No `play.sh` command deploys AWS resources, applies database migrations, or
+runs the legacy importer. The separate `migrate-db.sh` wrapper is intentionally
+excluded from this playground.
 EOF
 }
 

@@ -1468,6 +1468,72 @@
         }
       }
     },
+    "/v1/jobs/{jobId}/cancel": {
+      "post": {
+        "tags": [
+          "Jobs"
+        ],
+        "operationId": "cancelProcessingJob",
+        "summary": "Skip scene-description work that cannot prepare a preview",
+        "description": "Cancels a non-completed Description job and releases temporary staging and quota reservations.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/JobIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKeyHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobCancelRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Processing cancelled.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              },
+              "Idempotency-Replayed": {
+                "$ref": "#/components/headers/IdempotencyReplayedHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessingJob"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/ServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
     "/v1/webhooks/elevenlabs": {
       "post": {
         "tags": [
@@ -2820,6 +2886,12 @@
           "uploadRequired": {
             "type": "boolean"
           },
+          "descriptionJobId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "One per-asset scene-description job. Present only while the photo lacks a current successful description. Duplicate occurrences share the same job ID."
+          },
           "errorCode": {
             "type": "string",
             "nullable": true
@@ -3460,7 +3532,19 @@
             "type": "string",
             "nullable": true
           },
+          "streetAddress": {
+            "type": "string",
+            "nullable": true
+          },
+          "neighborhood": {
+            "type": "string",
+            "nullable": true
+          },
           "city": {
+            "type": "string",
+            "nullable": true
+          },
+          "county": {
             "type": "string",
             "nullable": true
           },
@@ -3468,10 +3552,22 @@
             "type": "string",
             "nullable": true
           },
+          "postalCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "country": {
+            "type": "string",
+            "nullable": true
+          },
           "countryCode": {
             "type": "string",
             "minLength": 2,
             "maxLength": 2,
+            "nullable": true
+          },
+          "provider": {
+            "type": "string",
             "nullable": true
           }
         }
@@ -3704,6 +3800,10 @@
             "type": "string",
             "nullable": true
           },
+          "originalStreetNumber": {
+            "type": "string",
+            "nullable": true
+          },
           "neighborhood": {
             "type": "string",
             "nullable": true
@@ -3732,6 +3832,23 @@
             "type": "string",
             "minLength": 2,
             "maxLength": 2,
+            "nullable": true
+          },
+          "provider": {
+            "type": "string",
+            "nullable": true
+          },
+          "providerPlaceId": {
+            "type": "string",
+            "nullable": true
+          },
+          "normalizationRuleVersion": {
+            "type": "string",
+            "nullable": true
+          },
+          "providerUpdatedAtUtc": {
+            "type": "string",
+            "format": "date-time",
             "nullable": true
           },
           "provenance": {
@@ -4059,6 +4176,7 @@
       "ProcessingJobStatus": {
         "type": "string",
         "enum": [
+          "Preparing",
           "Queued",
           "Running",
           "Succeeded",
@@ -4077,6 +4195,24 @@
           "InvalidMedia",
           "Internal"
         ]
+      },
+      "JobCancelRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string",
+            "enum": [
+              "UnsupportedPhoto",
+              "SourceUnavailable",
+              "SourceChanged",
+              "UserSkipped"
+            ]
+          }
+        }
       },
       "ProcessingJob": {
         "type": "object",

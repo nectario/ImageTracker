@@ -6,7 +6,7 @@ import sqlite3
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -54,6 +54,22 @@ class BatchResolution:
     failed_entries: int
     state: str
     failures: tuple[Mapping[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class DescriptionOutboxItem:
+    job_id: str
+    source_id: str
+    occurrence_id: str
+    media_asset_id: str
+    source_item_id: str
+    local_path: str
+    asset_content_sha256: str
+    file_name: str
+    state: str
+    attempt_count: int
+    next_attempt_at_utc: str | None = None
+    error: Mapping[str, Any] | None = None
 
 
 class LocalState:
@@ -140,6 +156,40 @@ class LocalState:
                 );
                 CREATE INDEX IF NOT EXISTS IX_ManifestOutbox_Pending
                     ON ManifestOutbox (SourceId, State, SequenceNumber);
+                CREATE TABLE IF NOT EXISTS DescriptionOutbox (
+                    JobId TEXT PRIMARY KEY,
+                    SourceId TEXT NOT NULL,
+                    OccurrenceId TEXT NOT NULL,
+                    MediaAssetId TEXT NOT NULL,
+                    SourceItemId TEXT NOT NULL,
+                    LocalPath TEXT NOT NULL,
+                    AssetContentSha256 TEXT NOT NULL,
+                    FileName TEXT NOT NULL,
+                    State TEXT NOT NULL DEFAULT 'Pending',
+                    AttemptCount INTEGER NOT NULL DEFAULT 0,
+                    NextAttemptAtUtc TEXT,
+                    ErrorJson TEXT,
+                    CreatedAtUtc TEXT NOT NULL,
+                    UpdatedAtUtc TEXT NOT NULL,
+                    SentAtUtc TEXT,
+                    FailedAtUtc TEXT
+                );
+                CREATE INDEX IF NOT EXISTS IX_DescriptionOutbox_Due
+                    ON DescriptionOutbox (SourceId, State, NextAttemptAtUtc, CreatedAtUtc);
+                CREATE TABLE IF NOT EXISTS DescriptionCandidate (
+                    JobId TEXT NOT NULL,
+                    OccurrenceId TEXT NOT NULL,
+                    MediaAssetId TEXT NOT NULL,
+                    SourceId TEXT NOT NULL,
+                    SourceItemId TEXT NOT NULL,
+                    LocalPath TEXT NOT NULL,
+                    AssetContentSha256 TEXT NOT NULL,
+                    FileName TEXT NOT NULL,
+                    UpdatedAtUtc TEXT NOT NULL,
+                    PRIMARY KEY (JobId, OccurrenceId)
+                );
+                CREATE INDEX IF NOT EXISTS IX_DescriptionCandidate_Source
+                    ON DescriptionCandidate (SourceId, SourceItemId, JobId);
                 CREATE TABLE IF NOT EXISTS LegacyMigrationCheckpoint (
                     MigrationName TEXT PRIMARY KEY,
                     LastLegacyId INTEGER NOT NULL DEFAULT 0,
@@ -275,6 +325,26 @@ class LocalState:
             # look unchanged and prevent those occurrences from being restored.
             connection.execute("DELETE FROM KnownOccurrence WHERE SourceId = ?", (source_id,))
             connection.execute("DELETE FROM ManifestOutbox WHERE SourceId = ?", (source_id,))
+            affected_jobs = [
+                str(row["JobId"])
+                for row in connection.execute(
+                    "SELECT DISTINCT JobId FROM DescriptionCandidate WHERE SourceId = ?",
+                    (source_id,),
+                ).fetchall()
+            ]
+            connection.execute(
+                "DELETE FROM DescriptionCandidate WHERE SourceId = ?", (source_id,)
+            )
+            for job_id in affected_jobs:
+                self._reselect_description_candidate(connection, job_id)
+            connection.execute(
+                """
+                DELETE FROM DescriptionOutbox
+                WHERE SourceId = ?
+                  AND JobId NOT IN (SELECT JobId FROM DescriptionCandidate)
+                """,
+                (source_id,),
+            )
             connection.execute("DELETE FROM ScanRun WHERE SourceId = ?", (source_id,))
             connection.execute("DELETE FROM SourceBinding WHERE SourceId = ?", (source_id,))
             connection.execute(
@@ -484,7 +554,7 @@ class LocalState:
             for item in response.get("results", [])
             if item.get("sourceItemId")
         }
-        accepted: list[Mapping[str, Any]] = []
+        accepted: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
         failures: list[dict[str, Any]] = []
         for entry in entries:
             item_id = str(entry.get("sourceItemId") or "")
@@ -525,7 +595,7 @@ class LocalState:
                     }
                 )
             else:
-                accepted.append(entry)
+                accepted.append((entry, result or {}))
 
         reported_rejected = int((response.get("counts") or {}).get("rejected") or 0)
         if reported_rejected > len(failures):
@@ -552,7 +622,7 @@ class LocalState:
         }
         final_state = "Failed" if failures else "Sent"
         with self._connect() as connection:
-            for entry in accepted:
+            for entry, result in accepted:
                 if entry.get("operation") == "Upsert":
                     connection.execute(
                         """
@@ -572,11 +642,36 @@ class LocalState:
                             utc_now_text(),
                         ),
                     )
+                    self._queue_description_in_transaction(
+                        connection,
+                        source_id=batch.source_id,
+                        entry=entry,
+                        result=result,
+                    )
                 elif entry.get("operation") == "Deleted":
+                    affected_jobs = [
+                        str(row["JobId"])
+                        for row in connection.execute(
+                            """
+                            SELECT JobId FROM DescriptionCandidate
+                            WHERE SourceId = ? AND SourceItemId = ?
+                            """,
+                            (batch.source_id, entry["sourceItemId"]),
+                        ).fetchall()
+                    ]
                     connection.execute(
                         "DELETE FROM KnownOccurrence WHERE SourceId = ? AND SourceItemId = ?",
                         (batch.source_id, entry["sourceItemId"]),
                     )
+                    connection.execute(
+                        """
+                        DELETE FROM DescriptionCandidate
+                        WHERE SourceId = ? AND SourceItemId = ?
+                        """,
+                        (batch.source_id, entry["sourceItemId"]),
+                    )
+                    for job_id in affected_jobs:
+                        self._reselect_description_candidate(connection, job_id)
             now = utc_now_text()
             if failures:
                 connection.execute(
@@ -613,6 +708,493 @@ class LocalState:
             state=final_state,
             failures=tuple(failures),
         )
+
+    @staticmethod
+    def _queue_description_in_transaction(
+        connection: sqlite3.Connection,
+        *,
+        source_id: str,
+        entry: Mapping[str, Any],
+        result: Mapping[str, Any],
+    ) -> None:
+        """Persist an accepted photo's staging work in the manifest transaction."""
+
+        job_id = str(result.get("descriptionJobId") or "").strip()
+        if not job_id or str(entry.get("mediaType") or "") != "Photo":
+            return
+        required = {
+            "occurrence_id": str(result.get("occurrenceId") or "").strip(),
+            "media_asset_id": str(result.get("mediaAssetId") or "").strip(),
+            "source_item_id": str(entry.get("sourceItemId") or "").strip(),
+            "local_path": str(entry.get("localLocator") or "").strip(),
+            "asset_content_sha256": str(entry.get("contentSha256") or "").strip().lower(),
+            "file_name": str(entry.get("fileName") or "").strip(),
+        }
+        # An incomplete server result must not make an otherwise accepted
+        # manifest transaction fail. The service contract supplies all fields.
+        if any(not value for value in required.values()):
+            return
+        now = utc_now_text()
+        replaced_jobs = [
+            str(row["JobId"])
+            for row in connection.execute(
+                """
+                SELECT DISTINCT JobId FROM DescriptionCandidate
+                WHERE SourceId = ? AND SourceItemId = ? AND JobId != ?
+                """,
+                (source_id, required["source_item_id"], job_id),
+            ).fetchall()
+        ]
+        connection.execute(
+            """
+            DELETE FROM DescriptionCandidate
+            WHERE SourceId = ? AND SourceItemId = ? AND JobId != ?
+            """,
+            (source_id, required["source_item_id"], job_id),
+        )
+        for replaced_job_id in replaced_jobs:
+            LocalState._reselect_description_candidate(
+                connection, replaced_job_id
+            )
+        connection.execute(
+            """
+            INSERT INTO DescriptionCandidate
+                (JobId, OccurrenceId, MediaAssetId, SourceId, SourceItemId,
+                 LocalPath, AssetContentSha256, FileName, UpdatedAtUtc)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (JobId, OccurrenceId) DO UPDATE SET
+                MediaAssetId = excluded.MediaAssetId,
+                SourceId = excluded.SourceId,
+                SourceItemId = excluded.SourceItemId,
+                LocalPath = excluded.LocalPath,
+                AssetContentSha256 = excluded.AssetContentSha256,
+                FileName = excluded.FileName,
+                UpdatedAtUtc = excluded.UpdatedAtUtc
+            """,
+            (
+                job_id,
+                required["occurrence_id"],
+                required["media_asset_id"],
+                source_id,
+                required["source_item_id"],
+                required["local_path"],
+                required["asset_content_sha256"],
+                required["file_name"],
+                now,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO DescriptionOutbox
+                (JobId, SourceId, OccurrenceId, MediaAssetId, SourceItemId,
+                 LocalPath, AssetContentSha256, FileName, State, CreatedAtUtc, UpdatedAtUtc)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pending', ?, ?)
+            ON CONFLICT (JobId) DO UPDATE SET
+                UpdatedAtUtc = excluded.UpdatedAtUtc
+            WHERE DescriptionOutbox.State != 'Sent'
+              AND DescriptionOutbox.OccurrenceId = excluded.OccurrenceId
+            """,
+            (
+                job_id,
+                source_id,
+                required["occurrence_id"],
+                required["media_asset_id"],
+                required["source_item_id"],
+                required["local_path"],
+                required["asset_content_sha256"],
+                required["file_name"],
+                now,
+                now,
+            ),
+        )
+
+    @staticmethod
+    def _reselect_description_candidate(
+        connection: sqlite3.Connection, job_id: str
+    ) -> None:
+        candidate = connection.execute(
+            """
+            SELECT SourceId, OccurrenceId, MediaAssetId, SourceItemId, LocalPath,
+                   AssetContentSha256, FileName
+            FROM DescriptionCandidate
+            WHERE JobId = ?
+            ORDER BY UpdatedAtUtc DESC, OccurrenceId
+            LIMIT 1
+            """,
+            (job_id,),
+        ).fetchone()
+        if candidate is None:
+            connection.execute(
+                "DELETE FROM DescriptionOutbox WHERE JobId = ?", (job_id,)
+            )
+            return
+        connection.execute(
+            """
+            UPDATE DescriptionOutbox
+            SET SourceId = ?, OccurrenceId = ?, MediaAssetId = ?,
+                SourceItemId = ?, LocalPath = ?, AssetContentSha256 = ?,
+                FileName = ?, UpdatedAtUtc = ?
+            WHERE JobId = ?
+            """,
+            (
+                candidate["SourceId"],
+                candidate["OccurrenceId"],
+                candidate["MediaAssetId"],
+                candidate["SourceItemId"],
+                candidate["LocalPath"],
+                candidate["AssetContentSha256"],
+                candidate["FileName"],
+                utc_now_text(),
+                job_id,
+            ),
+        )
+
+    def due_description_tasks(
+        self,
+        source_id: str,
+        *,
+        now_utc: datetime | None = None,
+        limit: int = 100,
+    ) -> list[DescriptionOutboxItem]:
+        now = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        now_text = now.isoformat().replace("+00:00", "Z")
+        return self._description_items(
+            """
+            WHERE SourceId = ? AND State IN ('Pending', 'Deferred')
+              AND (NextAttemptAtUtc IS NULL OR NextAttemptAtUtc <= ?)
+            ORDER BY CreatedAtUtc, JobId LIMIT ?
+            """,
+            (source_id, now_text, limit),
+        )
+
+    def due_sent_description_tasks(
+        self,
+        source_id: str,
+        *,
+        now_utc: datetime | None = None,
+        limit: int = 100,
+    ) -> list[DescriptionOutboxItem]:
+        now = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        now_text = now.isoformat().replace("+00:00", "Z")
+        return self._description_items(
+            """
+            WHERE SourceId = ? AND State = 'Sent'
+              AND NextAttemptAtUtc IS NOT NULL AND NextAttemptAtUtc <= ?
+            ORDER BY NextAttemptAtUtc, CreatedAtUtc, JobId LIMIT ?
+            """,
+            (source_id, now_text, limit),
+        )
+
+    def list_description_outbox(
+        self,
+        *,
+        state: str | None = None,
+        source_id: str | None = None,
+        limit: int = 100,
+    ) -> list[DescriptionOutboxItem]:
+        if not 1 <= limit <= 1000:
+            raise ValueError("Description outbox limit must be between 1 and 1000")
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if state and state != "All":
+            clauses.append("State = ?")
+            parameters.append(state)
+        if source_id:
+            clauses.append("SourceId = ?")
+            parameters.append(source_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        parameters.append(limit)
+        return self._description_items(
+            f"{where} ORDER BY UpdatedAtUtc DESC, JobId LIMIT ?",
+            parameters,
+        )
+
+    def description_task(self, job_id: str) -> DescriptionOutboxItem | None:
+        items = self._description_items("WHERE JobId = ? LIMIT 1", (job_id,))
+        return items[0] if items else None
+
+    def _description_items(
+        self, suffix: str, parameters: Sequence[Any]
+    ) -> list[DescriptionOutboxItem]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT JobId, SourceId, OccurrenceId, MediaAssetId, SourceItemId,
+                       LocalPath, AssetContentSha256, FileName, State, AttemptCount,
+                       NextAttemptAtUtc, ErrorJson
+                FROM DescriptionOutbox
+                """
+                + suffix,
+                parameters,
+            ).fetchall()
+        return [
+            DescriptionOutboxItem(
+                job_id=str(row["JobId"]),
+                source_id=str(row["SourceId"]),
+                occurrence_id=str(row["OccurrenceId"]),
+                media_asset_id=str(row["MediaAssetId"]),
+                source_item_id=str(row["SourceItemId"]),
+                local_path=str(row["LocalPath"]),
+                asset_content_sha256=str(row["AssetContentSha256"]),
+                file_name=str(row["FileName"]),
+                state=str(row["State"]),
+                attempt_count=int(row["AttemptCount"]),
+                next_attempt_at_utc=(
+                    str(row["NextAttemptAtUtc"]) if row["NextAttemptAtUtc"] else None
+                ),
+                error=json.loads(row["ErrorJson"]) if row["ErrorJson"] else None,
+            )
+            for row in rows
+        ]
+
+    def mark_description_sent(self, job_id: str) -> None:
+        now_value = datetime.now(timezone.utc)
+        now = now_value.isoformat().replace("+00:00", "Z")
+        next_check = (now_value + timedelta(minutes=5)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE DescriptionOutbox
+                SET State = 'Sent', AttemptCount = AttemptCount + 1,
+                    NextAttemptAtUtc = ?, ErrorJson = NULL,
+                    SentAtUtc = ?, FailedAtUtc = NULL, UpdatedAtUtc = ?
+                WHERE JobId = ? AND State != 'Sent'
+                """,
+                (next_check, now, now, job_id),
+            )
+
+    def schedule_sent_description_check(
+        self,
+        job_id: str,
+        *,
+        retry_after_seconds: int,
+    ) -> None:
+        seconds = max(30, min(int(retry_after_seconds), 31 * 24 * 60 * 60))
+        now = datetime.now(timezone.utc)
+        next_check = (now + timedelta(seconds=seconds)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE DescriptionOutbox
+                SET NextAttemptAtUtc = ?, UpdatedAtUtc = ?
+                WHERE JobId = ? AND State = 'Sent'
+                """,
+                (
+                    next_check,
+                    now.isoformat().replace("+00:00", "Z"),
+                    job_id,
+                ),
+            )
+
+    def confirm_description_complete(self, job_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE DescriptionOutbox
+                SET NextAttemptAtUtc = NULL, ErrorJson = NULL, UpdatedAtUtc = ?
+                WHERE JobId = ? AND State = 'Sent'
+                """,
+                (utc_now_text(), job_id),
+            )
+            connection.execute(
+                "DELETE FROM DescriptionCandidate WHERE JobId = ?", (job_id,)
+            )
+
+    def fail_description_from_server(
+        self, job_id: str, *, code: str, message: str
+    ) -> None:
+        error = {
+            "code": self._safe_error_text(code, 128) or "DESCRIPTION_FAILED",
+            "message": self._safe_error_text(message, 500)
+            or "Scene description needs attention.",
+            "retryable": False,
+        }
+        now = utc_now_text()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE DescriptionOutbox
+                SET State = 'Failed', NextAttemptAtUtc = NULL, ErrorJson = ?,
+                    FailedAtUtc = ?, UpdatedAtUtc = ?
+                WHERE JobId = ?
+                """,
+                (json.dumps(error, sort_keys=True), now, now, job_id),
+            )
+
+    def mark_description_skipped(
+        self, job_id: str, *, code: str, message: str
+    ) -> None:
+        note = {
+            "code": self._safe_error_text(code, 128) or "DESCRIPTION_SKIPPED",
+            "message": self._safe_error_text(message, 500)
+            or "Scene description was skipped.",
+            "retryable": False,
+        }
+        now = utc_now_text()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE DescriptionOutbox
+                SET State = 'Skipped', NextAttemptAtUtc = NULL, ErrorJson = ?,
+                    FailedAtUtc = NULL, UpdatedAtUtc = ?
+                WHERE JobId = ?
+                """,
+                (json.dumps(note, sort_keys=True), now, job_id),
+            )
+            connection.execute(
+                "DELETE FROM DescriptionCandidate WHERE JobId = ?", (job_id,)
+            )
+
+    def defer_description(
+        self,
+        job_id: str,
+        *,
+        retry_after_seconds: int,
+        code: str,
+        message: str,
+    ) -> None:
+        seconds = max(1, min(int(retry_after_seconds), 31 * 24 * 60 * 60))
+        next_attempt = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+        error = {
+            "code": self._safe_error_text(code, 128) or "STAGING_DEFERRED",
+            "message": self._safe_error_text(message, 500) or "Scene preview staging was deferred.",
+            "retryable": True,
+        }
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE DescriptionOutbox
+                SET State = ?, AttemptCount = AttemptCount + 1,
+                    NextAttemptAtUtc = ?, ErrorJson = ?, FailedAtUtc = NULL,
+                    UpdatedAtUtc = ?
+                WHERE JobId = ? AND State != 'Sent'
+                """,
+                (
+                    "Pending",
+                    next_attempt.isoformat().replace("+00:00", "Z"),
+                    json.dumps(error, sort_keys=True),
+                    utc_now_text(),
+                    job_id,
+                ),
+            )
+
+    def defer_all_descriptions_for_quota(
+        self,
+        attempted_job_id: str,
+        *,
+        retry_after_seconds: int,
+    ) -> int:
+        """Apply one account-wide quota decision without more provider-plan calls."""
+
+        seconds = max(1, min(int(retry_after_seconds), 31 * 24 * 60 * 60))
+        now = datetime.now(timezone.utc)
+        now_text = now.isoformat().replace("+00:00", "Z")
+        next_attempt_text = (now + timedelta(seconds=seconds)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        error = json.dumps(
+            {
+                "code": "MONTHLY_DESCRIPTION_QUOTA",
+                "message": "Scene description is waiting for monthly quota.",
+                "retryable": True,
+            },
+            sort_keys=True,
+        )
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE DescriptionOutbox
+                SET State = 'Deferred',
+                    AttemptCount = AttemptCount + CASE WHEN JobId = ? THEN 1 ELSE 0 END,
+                    NextAttemptAtUtc = ?, ErrorJson = ?, FailedAtUtc = NULL,
+                    UpdatedAtUtc = ?
+                WHERE State IN ('Pending', 'Deferred')
+                  AND (NextAttemptAtUtc IS NULL OR NextAttemptAtUtc <= ?)
+                """,
+                (
+                    attempted_job_id,
+                    next_attempt_text,
+                    error,
+                    now_text,
+                    now_text,
+                ),
+            )
+        return max(0, int(cursor.rowcount))
+
+    def quarantine_description(self, job_id: str, *, code: str, message: str) -> None:
+        error = {
+            "code": self._safe_error_text(code, 128) or "STAGING_FAILED",
+            "message": self._safe_error_text(message, 500) or "Scene preview staging failed.",
+            "retryable": False,
+        }
+        now = utc_now_text()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE DescriptionOutbox
+                SET State = 'Failed', AttemptCount = AttemptCount + 1,
+                    NextAttemptAtUtc = NULL, ErrorJson = ?, FailedAtUtc = ?, UpdatedAtUtc = ?
+                WHERE JobId = ? AND State != 'Sent'
+                """,
+                (json.dumps(error, sort_keys=True), now, now, job_id),
+            )
+
+    def retry_description(self, job_id: str, *, allow_sent: bool = False) -> None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT State FROM DescriptionOutbox WHERE JobId = ?", (job_id,)
+            ).fetchone()
+            if not row:
+                raise ValueError(f"Description task {job_id!r} was not found")
+            allowed_states = {"Failed", "Deferred", "Pending", "Skipped"}
+            if allow_sent:
+                allowed_states.add("Sent")
+            if row["State"] not in allowed_states:
+                raise ValueError("Only an unsent description task can be retried")
+            connection.execute(
+                """
+                UPDATE DescriptionOutbox
+                SET State = 'Pending', NextAttemptAtUtc = NULL, ErrorJson = NULL,
+                    FailedAtUtc = NULL, UpdatedAtUtc = ? WHERE JobId = ?
+                """,
+                (utc_now_text(), job_id),
+            )
+
+    def retry_all_deferred_descriptions(self) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE DescriptionOutbox
+                SET State = 'Pending', NextAttemptAtUtc = NULL, ErrorJson = NULL,
+                    FailedAtUtc = NULL, UpdatedAtUtc = ?
+                WHERE State = 'Deferred'
+                """,
+                (utc_now_text(),),
+            )
+        return max(0, int(cursor.rowcount))
+
+    def description_counts(self, source_id: str | None = None) -> dict[str, int]:
+        query = "SELECT State, COUNT(*) AS Total FROM DescriptionOutbox"
+        parameters: tuple[Any, ...] = ()
+        if source_id:
+            query += " WHERE SourceId = ?"
+            parameters = (source_id,)
+        query += " GROUP BY State"
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        counts = {
+            "Pending": 0,
+            "Deferred": 0,
+            "Failed": 0,
+            "Sent": 0,
+            "Skipped": 0,
+        }
+        counts.update({str(row["State"]): int(row["Total"]) for row in rows})
+        return counts
 
     def quarantine_request_error(
         self,

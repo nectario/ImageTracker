@@ -333,6 +333,8 @@ class MediaLocation(Base):
             name="Fk_MediaLocation_MediaAsset",
             ondelete="CASCADE",
         ),
+        Index("Ix_MediaLocation_User_LatLon", "UserId", "Latitude", "Longitude"),
+        Index("Ix_MediaLocation_User_City_State", "UserId", "City", "State"),
     )
 
     id: Mapped[int] = mapped_column("Id", ID_TYPE, primary_key=True, autoincrement=True)
@@ -354,12 +356,12 @@ class MediaLocation(Base):
     city: Mapped[str | None] = mapped_column("City", String(255))
     county: Mapped[str | None] = mapped_column("County", String(255))
     state: Mapped[str | None] = mapped_column("State", String(255))
-    postal_code: Mapped[str | None] = mapped_column("PostalCode", String(32))
+    postal_code: Mapped[str | None] = mapped_column("PostalCode", String(50))
     country: Mapped[str | None] = mapped_column("Country", String(255))
     country_code: Mapped[str | None] = mapped_column("CountryCode", String(8))
     location_source: Mapped[str | None] = mapped_column("LocationSource", String(32))
     provider: Mapped[str | None] = mapped_column("Provider", String(64))
-    provider_place_id: Mapped[str | None] = mapped_column("ProviderPlaceId", String(255))
+    provider_place_id: Mapped[str | None] = mapped_column("ProviderPlaceId", String(500))
     normalization_rule_version: Mapped[str | None] = mapped_column(
         "NormalizationRuleVersion", String(64)
     )
@@ -376,6 +378,30 @@ class MediaLocation(Base):
 
 class MediaDescription(Base):
     __tablename__ = "MediaDescription"
+    __table_args__ = (
+        UniqueConstraint("PublicId", name="Ux_MediaDescription_PublicId"),
+        UniqueConstraint(
+            "UserId",
+            "MediaAssetId",
+            "Provider",
+            "Model",
+            "PromptVersion",
+            name="Ux_MediaDescription_Asset_Version",
+        ),
+        ForeignKeyConstraint(
+            ["UserId", "MediaAssetId"],
+            ["MediaAsset.UserId", "MediaAsset.Id"],
+            name="Fk_MediaDescription_MediaAsset",
+            ondelete="CASCADE",
+        ),
+        Index("Ix_MediaDescription_User_Status", "UserId", "Status", "UpdatedAtUtc"),
+        Index(
+            "Ix_MediaDescription_User_Asset_Current",
+            "UserId",
+            "MediaAssetId",
+            "IsCurrent",
+        ),
+    )
 
     id: Mapped[int] = mapped_column("Id", ID_TYPE, primary_key=True, autoincrement=True)
     public_id: Mapped[str] = mapped_column("PublicId", String(36), default=new_public_id)
@@ -442,6 +468,80 @@ class MediaTranscriptSegment(Base):
     created_at_utc: Mapped[datetime] = mapped_column("CreatedAtUtc", DateTime, default=utc_now)
 
 
+class UploadSession(Base):
+    __tablename__ = "UploadSession"
+    __table_args__ = (
+        UniqueConstraint("PublicId", name="Ux_UploadSession_PublicId"),
+        UniqueConstraint(
+            "UserId", "IdempotencyKey", name="Ux_UploadSession_User_Idempotency"
+        ),
+        UniqueConstraint(
+            "UserId",
+            "MediaAssetId",
+            "ObjectPurpose",
+            "ActiveLeaseMarker",
+            name="Ux_UploadSession_ActiveLease",
+        ),
+        ForeignKeyConstraint(
+            ["UserId", "MediaAssetId"],
+            ["MediaAsset.UserId", "MediaAsset.Id"],
+            name="Fk_UploadSession_MediaAsset",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["UserId", "MediaOccurrenceId"],
+            ["MediaOccurrence.UserId", "MediaOccurrence.Id"],
+            name="Fk_UploadSession_MediaOccurrence",
+            ondelete="CASCADE",
+        ),
+        Index("Ix_UploadSession_User_Status", "UserId", "Status", "UpdatedAtUtc"),
+        Index("Ix_UploadSession_Status_Expiry", "Status", "ExpiresAtUtc"),
+    )
+
+    id: Mapped[int] = mapped_column("Id", ID_TYPE, primary_key=True, autoincrement=True)
+    public_id: Mapped[str] = mapped_column("PublicId", String(36), default=new_public_id)
+    user_id: Mapped[int] = mapped_column("UserId", UINT_BIGINT)
+    media_asset_id: Mapped[int] = mapped_column("MediaAssetId", UINT_BIGINT)
+    media_occurrence_id: Mapped[int | None] = mapped_column(
+        "MediaOccurrenceId", UINT_BIGINT
+    )
+    idempotency_key: Mapped[str] = mapped_column("IdempotencyKey", String(128))
+    object_purpose: Mapped[str] = mapped_column("ObjectPurpose", String(32))
+    upload_kind: Mapped[str] = mapped_column("UploadKind", String(16))
+    status: Mapped[str] = mapped_column("Status", String(32), default="Preparing")
+    active_lease_marker: Mapped[int | None] = mapped_column(
+        "ActiveLeaseMarker", BOOL_INT, default=1
+    )
+    lease_token_hash: Mapped[str] = mapped_column("LeaseTokenHash", String(64))
+    lease_owner: Mapped[str | None] = mapped_column("LeaseOwner", String(128))
+    s3_bucket: Mapped[str] = mapped_column("S3Bucket", String(63))
+    s3_object_key: Mapped[str] = mapped_column("S3ObjectKey", String(1024))
+    s3_upload_id: Mapped[str | None] = mapped_column("S3UploadId", String(1024))
+    checksum_sha256: Mapped[str] = mapped_column("ChecksumSha256", String(64))
+    s3_checksum_algorithm: Mapped[str] = mapped_column(
+        "S3ChecksumAlgorithm", String(16)
+    )
+    s3_checksum_type: Mapped[str] = mapped_column("S3ChecksumType", String(16))
+    s3_checksum_value: Mapped[str | None] = mapped_column(
+        "S3ChecksumValue", String(255)
+    )
+    expected_byte_size: Mapped[int] = mapped_column("ExpectedByteSize", UINT_BIGINT)
+    uploaded_byte_size: Mapped[int] = mapped_column(
+        "UploadedByteSize", UINT_BIGINT, default=0
+    )
+    part_size_bytes: Mapped[int | None] = mapped_column("PartSizeBytes", UINT_BIGINT)
+    parts_json: Mapped[dict[str, Any] | list[Any] | None] = mapped_column(
+        "PartsJson", JSON
+    )
+    expires_at_utc: Mapped[datetime] = mapped_column("ExpiresAtUtc", DateTime)
+    completed_at_utc: Mapped[datetime | None] = mapped_column("CompletedAtUtc", DateTime)
+    failure_code: Mapped[str | None] = mapped_column("FailureCode", String(64))
+    created_at_utc: Mapped[datetime] = mapped_column("CreatedAtUtc", DateTime, default=utc_now)
+    updated_at_utc: Mapped[datetime] = mapped_column(
+        "UpdatedAtUtc", DateTime, default=utc_now, onupdate=utc_now
+    )
+
+
 class ProcessingJob(Base):
     __tablename__ = "ProcessingJob"
     __table_args__ = (
@@ -460,6 +560,19 @@ class ProcessingJob(Base):
             ["MediaSource.UserId", "MediaSource.Id"],
             name="Fk_ProcessingJob_MediaSource",
             ondelete="RESTRICT",
+        ),
+        Index(
+            "Ix_ProcessingJob_Status_NextAttempt",
+            "Status",
+            "NextAttemptAtUtc",
+            "Id",
+        ),
+        Index("Ix_ProcessingJob_User_Status", "UserId", "Status", "CreatedAtUtc"),
+        Index(
+            "Ix_ProcessingJob_User_Asset_Type",
+            "UserId",
+            "MediaAssetId",
+            "JobType",
         ),
     )
 
@@ -483,6 +596,56 @@ class ProcessingJob(Base):
     request_json: Mapped[dict[str, Any] | None] = mapped_column("RequestJson", JSON)
     started_at_utc: Mapped[datetime | None] = mapped_column("StartedAtUtc", DateTime)
     completed_at_utc: Mapped[datetime | None] = mapped_column("CompletedAtUtc", DateTime)
+    created_at_utc: Mapped[datetime] = mapped_column("CreatedAtUtc", DateTime, default=utc_now)
+    updated_at_utc: Mapped[datetime] = mapped_column(
+        "UpdatedAtUtc", DateTime, default=utc_now, onupdate=utc_now
+    )
+
+
+class ProviderUsageMonth(Base):
+    __tablename__ = "ProviderUsageMonth"
+    __table_args__ = (
+        UniqueConstraint("PublicId", name="Ux_ProviderUsageMonth_PublicId"),
+        UniqueConstraint(
+            "UserId",
+            "Provider",
+            "UsageMonth",
+            "UnitType",
+            name="Ux_ProviderUsageMonth_User_Provider_Month_Unit",
+        ),
+        ForeignKeyConstraint(
+            ["UserId"],
+            ["UserAccount.Id"],
+            name="Fk_ProviderUsageMonth_UserAccount",
+            ondelete="CASCADE",
+        ),
+        Index("Ix_ProviderUsageMonth_User_Month", "UserId", "UsageMonth"),
+    )
+
+    id: Mapped[int] = mapped_column("Id", ID_TYPE, primary_key=True, autoincrement=True)
+    public_id: Mapped[str] = mapped_column("PublicId", String(36), default=new_public_id)
+    user_id: Mapped[int] = mapped_column("UserId", UINT_BIGINT)
+    provider: Mapped[str] = mapped_column("Provider", String(64))
+    usage_month: Mapped[date] = mapped_column("UsageMonth", Date)
+    unit_type: Mapped[str] = mapped_column("UnitType", String(32))
+    processed_units: Mapped[Decimal] = mapped_column(
+        "ProcessedUnits", Numeric(20, 6), default=Decimal("0")
+    )
+    reserved_units: Mapped[Decimal] = mapped_column(
+        "ReservedUnits", Numeric(20, 6), default=Decimal("0")
+    )
+    hard_limit_units: Mapped[Decimal] = mapped_column(
+        "HardLimitUnits", Numeric(20, 6)
+    )
+    circuit_state: Mapped[str] = mapped_column(
+        "CircuitState", String(16), default="Closed"
+    )
+    circuit_opened_at_utc: Mapped[datetime | None] = mapped_column(
+        "CircuitOpenedAtUtc", DateTime
+    )
+    circuit_failure_code: Mapped[str | None] = mapped_column(
+        "CircuitFailureCode", String(64)
+    )
     created_at_utc: Mapped[datetime] = mapped_column("CreatedAtUtc", DateTime, default=utc_now)
     updated_at_utc: Mapped[datetime] = mapped_column(
         "UpdatedAtUtc", DateTime, default=utc_now, onupdate=utc_now
@@ -579,6 +742,8 @@ __all__ = [
     "MediaTranscript",
     "MediaTranscriptSegment",
     "ProcessingJob",
+    "ProviderUsageMonth",
+    "UploadSession",
     "UserAccount",
     "new_public_id",
     "utc_now",

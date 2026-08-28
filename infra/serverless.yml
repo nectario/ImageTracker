@@ -4,6 +4,7 @@ configValidationMode: error
 
 custom:
   parameterPrefix: /imagetracker/${sls:stage}
+  retryScheduleState: ${param:retryScheduleState, 'ENABLED'}
   maintenanceSchedulesState: ${param:maintenanceSchedulesState, 'DISABLED'}
   monthlyBudgetUsd: ${param:monthlyBudgetUsd, 50}
   budgetEmail: ${param:budgetEmail, ''}
@@ -71,7 +72,6 @@ provider:
     IMAGETRACKER_MYSQL_DATABASE: ImageTracker
     IMAGETRACKER_CONFIG_PARAMETER_PREFIX: ${self:custom.parameterPrefix}
     IMAGETRACKER_DB_SECRET_PARAMETER: ${self:custom.parameterPrefix}/mysql
-    IMAGETRACKER_GOOGLE_SECRET_PARAMETER: ${self:custom.parameterPrefix}/google
     IMAGETRACKER_OPENAI_SECRET_PARAMETER: ${self:custom.parameterPrefix}/openai
     IMAGETRACKER_ELEVENLABS_SECRET_PARAMETER: ${self:custom.parameterPrefix}/elevenlabs
     IMAGETRACKER_MEDIA_BUCKET:
@@ -82,6 +82,14 @@ provider:
       Fn::GetAtt:
         - ProcessingQueue
         - Arn
+    IMAGETRACKER_LOCATION_NORMALIZATION_RULES_PATH: /var/task/location_normalization_rules.json
+    IMAGETRACKER_GEOCODE_REUSE_RADIUS_METERS: '5'
+    IMAGETRACKER_GEOCODE_MONTHLY_CALL_LIMIT: '1000'
+    IMAGETRACKER_SCENE_DESCRIPTION_MODEL: gpt-5.6-sol
+    IMAGETRACKER_SCENE_DESCRIPTION_DETAIL: high
+    IMAGETRACKER_SCENE_DESCRIPTION_SERVICE_TIER: flex
+    IMAGETRACKER_SCENE_DESCRIPTION_MAX_WORDS: '24'
+    IMAGETRACKER_SCENE_DESCRIPTION_MONTHLY_CALL_LIMIT: '1000'
   iam:
     role:
       statements:
@@ -132,6 +140,29 @@ provider:
             Fn::GetAtt:
               - ProcessingQueue
               - Arn
+        - Sid: ConsumeImageTrackerProcessing
+          Effect: Allow
+          Action:
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:ChangeMessageVisibility
+            - sqs:GetQueueAttributes
+          Resource:
+            Fn::GetAtt:
+              - ProcessingQueue
+              - Arn
+        - Sid: ResolveStoredImageTrackerLocations
+          Effect: Allow
+          Action:
+            - geo-places:ReverseGeocode
+          Resource:
+            Fn::Join:
+              - ''
+              - - 'arn:'
+                - Ref: AWS::Partition
+                - ':geo-places:'
+                - Ref: AWS::Region
+                - '::provider/default'
 
 package:
   patterns:
@@ -157,6 +188,21 @@ functions:
           path: /v1/{proxy+}
           authorizer:
             name: cognito
+  worker:
+    name: ${self:service}-${sls:stage}-worker
+    description: ImageTracker bounded asynchronous enrichment worker
+    handler: services/worker/handler.handler
+    memorySize: 384
+    timeout: 120
+    reservedConcurrency: 1
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt:
+              - ProcessingQueue
+              - Arn
+          batchSize: 1
+          functionResponseType: ReportBatchItemFailures
 
 resources:
   Parameters:
@@ -363,14 +409,14 @@ resources:
         QueueName: ${self:service}-${sls:stage}-processing
         MessageRetentionPeriod: 345600
         ReceiveMessageWaitTimeSeconds: 20
-        VisibilityTimeout: 180
+        VisibilityTimeout: 900
         SqsManagedSseEnabled: true
         RedrivePolicy:
           deadLetterTargetArn:
             Fn::GetAtt:
               - ProcessingDeadLetterQueue
               - Arn
-          maxReceiveCount: 5
+          maxReceiveCount: 8
         Tags:
           - Key: Application
             Value: ImageTracker
@@ -385,9 +431,9 @@ resources:
       Type: AWS::Events::Rule
       Properties:
         Name: ${self:service}-${sls:stage}-retry-due-jobs
-        Description: Enqueues retry sweeps after the Phase 1 worker is enabled.
+        Description: Recovers durable jobs whose first delivery or retry was lost.
         ScheduleExpression: rate(5 minutes)
-        State: ${self:custom.maintenanceSchedulesState}
+        State: ${self:custom.retryScheduleState}
         Targets:
           - Arn:
               Fn::GetAtt:
