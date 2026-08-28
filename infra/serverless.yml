@@ -7,7 +7,6 @@ custom:
   retryScheduleState: ${param:retryScheduleState, 'ENABLED'}
   maintenanceSchedulesState: ${param:maintenanceSchedulesState, 'DISABLED'}
   monthlyBudgetUsd: ${param:monthlyBudgetUsd, 50}
-  budgetEmail: ${param:budgetEmail, ''}
 
 provider:
   name: aws
@@ -206,22 +205,11 @@ functions:
 
 resources:
   Parameters:
-    BudgetNotificationEmail:
-      Type: String
-      Default: ${self:custom.budgetEmail}
-      Description: Optional email subscriber for the monthly ImageTracker budget.
     MonthlyBudgetUsd:
       Type: Number
       Default: ${self:custom.monthlyBudgetUsd}
       MinValue: 1
       Description: Monthly incremental ImageTracker budget in USD.
-
-  Conditions:
-    HasBudgetNotificationEmail:
-      Fn::Not:
-        - Fn::Equals:
-            - Ref: BudgetNotificationEmail
-            - ''
 
   Resources:
     ImageTrackerUserPoolV2:
@@ -571,19 +559,6 @@ resources:
                     - ${sls:stage}
                   MatchOptions:
                     - EQUALS
-        NotificationsWithSubscribers:
-          Fn::If:
-            - HasBudgetNotificationEmail
-            - - Notification:
-                  ComparisonOperator: GREATER_THAN
-                  NotificationType: ACTUAL
-                  Threshold: 80
-                  ThresholdType: PERCENTAGE
-                Subscribers:
-                  - Address:
-                      Ref: BudgetNotificationEmail
-                    SubscriptionType: EMAIL
-            - Ref: AWS::NoValue
 
   Outputs:
     ImageTrackerHttpApiUrl:

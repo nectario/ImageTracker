@@ -22,7 +22,8 @@ Nothing here deploys automatically.
   `RetryDueJobs` is **enabled by default** to recover a durable MySQL job after
   a lost or early SQS delivery. The other three rules remain disabled.
 - A tag-filtered monthly AWS budget, defaulting to USD 50. An email subscriber
-  is added only when `budgetEmail` is supplied.
+  is managed in place after deployment when `--budget-email` is supplied to
+  the release helper, avoiding replacement of the existing named budget.
 
 The stack deliberately has no VPC attachment, NAT gateway, new database, RDS
 Proxy, ECS service, load balancer, CDN, vector database, or SageMaker endpoint.
@@ -163,11 +164,12 @@ international provider/address fields. The wrapper refuses a non-`ImageTracker`
 database or active processing rows and reconciles a DDL that committed before
 its ledger marker.
 
-After schema verification, deployment is explicit. Parameters must be supplied
-to the release command so they are present during package rendering:
+After schema verification, deployment is explicit. CloudFormation parameters
+are rendered during packaging; the budget subscriber is updated in place after
+the stack succeeds:
 
 ```bash
-npm run deploy -- --param="budgetEmail=you@example.com"
+npm run deploy -- --budget-email info@nektron.ai
 ```
 
 Other supported parameters are:

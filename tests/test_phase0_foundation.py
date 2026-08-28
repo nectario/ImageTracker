@@ -115,6 +115,10 @@ def test_lambda_packaging_keeps_runtime_files_at_archive_root():
     assert '"scripts/validate_foundation.py"' in release_helper
     assert '"scripts/deploy_packaged.py"' in release_helper
     assert "parameter_args" in release_helper
+    assert 'parser.add_argument("--budget-email")' in release_helper
+    assert '"create-notification"' in release_helper
+    assert '"create-subscriber"' in release_helper
+    assert '"budgetEmail"' not in release_helper
 
     deploy_helper = (root / "infra" / "scripts" / "deploy_packaged.py").read_text(
         encoding="utf-8"

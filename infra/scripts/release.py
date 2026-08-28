@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import re
 import shutil
@@ -17,7 +18,6 @@ PACKAGE_ROOT = BUILD_ROOT / ".serverless"
 TEMPLATE_PATH = PACKAGE_ROOT / "cloudformation-template-update-stack.json"
 ALLOWED_PARAMETERS = {
     "allowedOrigin",
-    "budgetEmail",
     "maintenanceSchedulesState",
     "monthlyBudgetUsd",
     "retryScheduleState",
@@ -45,13 +45,119 @@ def _parameter(value: str) -> str:
     return value
 
 
+def _aws_json(arguments: list[str]) -> object:
+    result = subprocess.run(
+        ["aws", *arguments, "--output", "json"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(result.stdout or "null")
+
+
+def _ensure_budget_alert(*, stage: str, email: str) -> None:
+    account_id = str(
+        _aws_json(["sts", "get-caller-identity", "--query", "Account"])
+    )
+    budget_name = f"image-tracker-{stage}-incremental-monthly"
+    notification = {
+        "NotificationType": "ACTUAL",
+        "ComparisonOperator": "GREATER_THAN",
+        "Threshold": 80,
+        "ThresholdType": "PERCENTAGE",
+    }
+    subscriber = {"SubscriptionType": "EMAIL", "Address": email}
+    response = _aws_json(
+        [
+            "budgets",
+            "describe-notifications-for-budget",
+            "--account-id",
+            account_id,
+            "--budget-name",
+            budget_name,
+            "--region",
+            "us-east-1",
+        ]
+    )
+    notifications = response.get("Notifications", []) if isinstance(response, dict) else []
+    matching = next(
+        (
+            item
+            for item in notifications
+            if item.get("NotificationType") == "ACTUAL"
+            and item.get("ComparisonOperator") == "GREATER_THAN"
+            and float(item.get("Threshold", -1)) == 80.0
+        ),
+        None,
+    )
+    if matching is None:
+        subprocess.run(
+            [
+                "aws",
+                "budgets",
+                "create-notification",
+                "--account-id",
+                account_id,
+                "--budget-name",
+                budget_name,
+                "--notification",
+                json.dumps(notification, separators=(",", ":")),
+                "--subscribers",
+                json.dumps([subscriber], separators=(",", ":")),
+                "--region",
+                "us-east-1",
+            ],
+            check=True,
+        )
+        return
+    subscribers = _aws_json(
+        [
+            "budgets",
+            "describe-subscribers-for-notification",
+            "--account-id",
+            account_id,
+            "--budget-name",
+            budget_name,
+            "--notification",
+            json.dumps(notification, separators=(",", ":")),
+            "--region",
+            "us-east-1",
+        ]
+    )
+    values = subscribers.get("Subscribers", []) if isinstance(subscribers, dict) else []
+    if subscriber not in values:
+        subprocess.run(
+            [
+                "aws",
+                "budgets",
+                "create-subscriber",
+                "--account-id",
+                account_id,
+                "--budget-name",
+                budget_name,
+                "--notification",
+                json.dumps(notification, separators=(",", ":")),
+                "--subscriber",
+                json.dumps(subscriber, separators=(",", ":")),
+                "--region",
+                "us-east-1",
+            ],
+            check=True,
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", default="prod")
     parser.add_argument("--param", action="append", default=[], type=_parameter)
+    parser.add_argument("--budget-email")
     args = parser.parse_args()
     if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?", args.stage):
         raise ValueError("Stage must be a 1-32 character lowercase stage name")
+    if args.budget_email and not re.fullmatch(
+        r"[^@\s]+@[^@\s]+\.[^@\s]+", args.budget_email
+    ):
+        raise ValueError("Budget email must be a valid email address")
     parameter_args = [
         item for value in args.param for item in ("--param", value)
     ]
@@ -99,6 +205,8 @@ def main() -> int:
         cwd=INFRA_ROOT,
         check=True,
     )
+    if args.budget_email:
+        _ensure_budget_alert(stage=args.stage, email=args.budget_email)
     return 0
 
 
