@@ -13,9 +13,10 @@ not uploaded to permanent S3 storage.
 
 The current repository also contains the first bounded enrichment pipeline:
 GPS coordinates can be resolved to a useful nearby address, and photos can
-receive concise, searchable scene descriptions. These changes are not yet in
-the production stack. Persistent address resolution uses Amazon Location
-Service Places V2 so the request can explicitly declare stored use.
+receive concise, searchable scene descriptions. These capabilities are now
+deployed in the production app stack. Persistent address resolution uses
+Amazon Location Service Places V2 so the request can explicitly declare stored
+use.
 
 The approved architecture and delivery sequence are in
 [the UX-first implementation plan](docs/ImageTracker%20App%20UX-First%20Implementation%20Plan.md).
@@ -42,7 +43,7 @@ The deployed Local core provides:
   API surfaces.
 - Read-only legacy `ImageAsset` audit and paged migration preview.
 
-The pending-deployment repository build adds:
+The deployed enrichment build adds:
 
 - Asynchronous Amazon Location Service Places V2 reverse geocoding with full
   address and provider provenance (`AmazonLocationPlacesV2`). A resolved
@@ -188,7 +189,7 @@ imagetracker jobs list
 imagetracker jobs retry JOB_ID
 ```
 
-When the enrichment build is deployed, the same normal `sync` command drives
+The same normal `sync` command drives
 both additions. GPS in a manifest queues reverse geocoding. Each eligible photo
 also receives a server-owned description job; the CLI creates a deterministic
 JPEG preview, stages it, and queues the job without an extra prompt. Useful
@@ -278,7 +279,7 @@ are separate from the Phase 1 legacy migration preview.
   while its durable S3 bucket, original-object key, and preview-object key stay
   null. Temporary staging does not silently convert it to Remote mode.
 
-## Enrichment deployment gate
+## Enrichment configuration and release gate
 
 Amazon Location Service uses the active AWS identity locally and the scoped
 Lambda IAM role after deployment; it has no API key or SSM secret. OpenAI key

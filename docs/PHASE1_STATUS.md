@@ -3,13 +3,13 @@
 Implementation snapshot: 2026-08-28. The Local-mode core is deployed to
 `image-tracker-prod` in `us-east-2`; the original acceptance evidence below was
 measured against that stack on 2026-08-27. Reverse geocoding and scene
-description are implemented in the current repository but have not been
-deployed or run against the user's production library.
+description are now deployed in the bounded production worker. Only a synthetic
+disposable photo—not the user's production library—was used for acceptance.
 
 Production schema migrations `012` and `013` were applied and verified on
 2026-08-28. The enrichment package subsequently passed the complete 258-test
 suite, repository artifact validation, and AWS CloudFormation validation. The
-application/worker deployment remains held for explicit production approval.
+authorized application/worker deployment completed successfully.
 
 ## Scope delivered in the repository
 
@@ -123,8 +123,8 @@ evidence that its runtime capability is enabled.
 
 ## Acceptance evidence ledger
 
-This ledger describes the already deployed Local core, not the undeployed
-enrichment candidate.
+The original rows below describe the Local core; enrichment evidence is added
+after them.
 
 The deployed checks are reproducible with
 [`infra/scripts/live_phase1_smoke.py`](../infra/scripts/live_phase1_smoke.py).
@@ -144,6 +144,10 @@ that subject, and confirms both Cognito and MySQL cleanup before returning.
 | Local storage boundary | Local sync performs zero original/preview writes to S3 | Pass live; bucket inventory remained 0 objects/0 bytes and every asset S3 locator was null |
 | Reliable deletion | Completed scan emits a deletion; incomplete traversal does not infer deletion | Pass in scanner/domain integration tests; unreadable traversal exits partial |
 | Legacy safety | Audit/preview use a read-only transaction and report zero writes | Pass live; 2,099 rows audited, one temporal-review row identified, bounded preview reported `writesPerformed=0` |
+| Stored reverse geocode | Synthetic GPS resolves through Amazon Location Places V2 | Pass live; provider `AmazonLocationPlacesV2`, street address `338-350 5th Ave` |
+| Scene description | Metadata-free preview is described by the pinned model | Pass live; provider `OpenAI`, model `gpt-5.6-sol`, searchable sentence persisted |
+| Temporary preview cleanup | Local asset remains LocalOnly and staging is deleted | Pass live; durable S3 locators null, zero staging objects after processing |
+| Worker cost/recovery controls | Queue, concurrency, DLQ, retry rule, and alert are bounded | Pass live; concurrency 1, visibility 900, max receives 8, retry every 5 minutes, 80% budget alert to `info@nektron.ai` |
 
 ## Enrichment deployment prerequisites
 
@@ -167,8 +171,7 @@ that subject, and confirms both Cognito and MySQL cleanup before returning.
 
 ## Release gate
 
-Phase 1 Local mode has passed its repository, package, deployed authentication,
-database reconciliation, exact-deduplication, cleanup, and S3 no-write gates.
-The enrichment candidate is implemented but remains held at the IAM review,
-final verification, deployment, and live-acceptance gates. Native UX work
-remains outside this phase boundary.
+Phase 1 Local mode and its bounded enrichment worker have passed repository,
+package, authentication, database, exact-deduplication, cleanup, S3-boundary,
+deployment, and live-acceptance gates. Native UX work remains outside this
+phase boundary.
