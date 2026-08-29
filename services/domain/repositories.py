@@ -349,6 +349,26 @@ class OccurrenceRepository:
             )
         )
 
+    def by_source_items(
+        self,
+        *,
+        user_id: int,
+        source_id: int,
+        source_item_ids: set[str],
+    ) -> dict[str, MediaOccurrence]:
+        """Prefetch a manifest batch without one SELECT per entry."""
+
+        if not source_item_ids:
+            return {}
+        rows = self.session.scalars(
+            select(MediaOccurrence).where(
+                MediaOccurrence.user_id == user_id,
+                MediaOccurrence.media_source_id == source_id,
+                MediaOccurrence.source_item_id.in_(source_item_ids),
+            )
+        )
+        return {row.source_item_id: row for row in rows}
+
     def require(
         self,
         *,
@@ -405,6 +425,24 @@ class AssetRepository:
                 MediaAsset.content_sha256 == sha256,
             )
         )
+
+    def by_hashes(
+        self,
+        *,
+        user_id: int,
+        sha256_values: set[str],
+    ) -> dict[str, MediaAsset]:
+        """Prefetch exact-duplicate candidates for an entire manifest batch."""
+
+        if not sha256_values:
+            return {}
+        rows = self.session.scalars(
+            select(MediaAsset).where(
+                MediaAsset.user_id == user_id,
+                MediaAsset.content_sha256.in_(sha256_values),
+            )
+        )
+        return {row.content_sha256: row for row in rows}
 
     def require(self, *, user_id: int, asset_public_id: UUID | str) -> MediaAsset:
         asset = self.session.scalar(
@@ -721,6 +759,7 @@ class ChangeRepository:
         asset_id: int | None = None,
         occurrence_id: int | None = None,
         data: dict[str, Any] | None = None,
+        flush: bool = True,
     ) -> MediaChange:
         change = MediaChange(
             user_id=user_id,
@@ -736,7 +775,8 @@ class ChangeRepository:
             created_at_utc=now,
         )
         self.session.add(change)
-        self.session.flush()
+        if flush:
+            self.session.flush()
         return change
 
     def list_after(

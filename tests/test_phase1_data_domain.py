@@ -1244,6 +1244,63 @@ def test_unhashed_occurrence_stays_pending_then_links_without_duplication(
         assert session.scalar(select(func.count()).select_from(MediaOccurrence)) == 1
 
 
+def test_fast_add_batches_five_hundred_pending_occurrences(
+    service, session_factory
+) -> None:
+    user = bootstrap(service, subject="bulk-fast-add")
+    device = register_device(
+        service,
+        user.user_id,
+        key="00000000-0000-0000-0000-000000000099",
+        name="Bulk Fast Add",
+    )
+    source = create_source(
+        service,
+        user.user_id,
+        device.device_id,
+        source_key="bulk-fast-add",
+    )
+    entries = tuple(
+        ManifestUpsert(
+            source_item_id=f"pending-{index:04d}",
+            source_revision=f"revision-{index:04d}",
+            file_name=f"IMG_{index:04d}.JPG",
+            local_locator=f"C:/Photos/IMG_{index:04d}.JPG",
+            content_sha256=None,
+            media_type="Photo",
+            mime_type="image/jpeg",
+            byte_size=1_000 + index,
+        )
+        for index in range(500)
+    )
+
+    response = run(
+        service.submit_manifest(
+            user.user_id,
+            source.source_id,
+            ManifestCommand(
+                kind="Incremental",
+                permission_state="NotApplicable",
+                deletion_detection_reliable=True,
+                entries=entries,
+            ),
+            context("bulk-pending-500"),
+        )
+    ).value
+
+    assert response.counts.created == 500
+    assert len(response.results) == 500
+    assert len({item.occurrence_id for item in response.results}) == 500
+    assert all(item.media_asset_id is None for item in response.results)
+    with transaction_scope(session_factory) as session:
+        assert session.scalar(select(func.count()).select_from(MediaOccurrence)) == 500
+        assert session.scalar(
+            select(func.count())
+            .select_from(MediaChange)
+            .where(MediaChange.entity_type == "MediaOccurrence")
+        ) == 500
+
+
 def test_every_resource_query_is_user_scoped(service) -> None:
     first = bootstrap(service, subject="first", email="first@example.com")
     second = bootstrap(service, subject="second", email="second@example.com")

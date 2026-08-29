@@ -33,7 +33,7 @@ class AppSettings(BaseSettings):
     location_normalization_rules_path: str = "location_normalization_rules.json"
     geocode_reuse_radius_meters: float = Field(default=5.0, gt=0, le=100)
     geocode_monthly_call_limit: int = Field(default=1000, ge=0, le=10000)
-    scene_description_model: str = "gpt-5.6-sol"
+    scene_description_model: str = "gpt-5.6-terra"
     scene_description_detail: str = Field(default="high", pattern=r"^(low|high)$")
     scene_description_service_tier: str = Field(
         default="flex", pattern=r"^(auto|default|flex)$"

@@ -40,6 +40,10 @@ class SyncSummary:
     description_deferred: int = 0
     description_quarantined: int = 0
     force_rehash: bool = False
+    scan_workers: int = 1
+    scan_seconds: float = 0.0
+    scan_files_per_second: float = 0.0
+    hash_pending: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -69,6 +73,8 @@ class SyncEngine:
         *,
         dry_run: bool = False,
         force_rehash: bool = False,
+        scan_workers: int | None = None,
+        fast_add: bool = False,
     ) -> SyncSummary:
         summary = SyncSummary(
             source_id=binding.source_id,
@@ -95,7 +101,14 @@ class SyncEngine:
 
         root = Path(binding.root_path)
         self.progress(f"Scanning {root}")
-        scan = self.scanner.scan(binding.source_id, root, force_rehash=force_rehash)
+        scan = self.scanner.scan(
+            binding.source_id,
+            root,
+            force_rehash=force_rehash,
+            fast_add=fast_add,
+            workers=scan_workers,
+            progress=self.progress,
+        )
         known = self.state.known_occurrences(binding.source_id)
         quarantined = self.state.quarantined_revisions(binding.source_id)
         changed_entries: list[dict[str, Any]] = []
@@ -132,6 +145,10 @@ class SyncEngine:
         summary.deletions = len(deleted_entries)
         summary.failed += scan.failed
         summary.deletion_detection_reliable = scan.complete_read
+        summary.scan_workers = scan.worker_count
+        summary.scan_seconds = scan.elapsed_seconds
+        summary.scan_files_per_second = scan.files_per_second
+        summary.hash_pending = scan.pending_hash
 
         entries = [*changed_entries, *deleted_entries]
         if not entries:

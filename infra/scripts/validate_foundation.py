@@ -28,7 +28,7 @@ REQUIRED_MARKERS = {
     "packaged location rules path": "IMAGETRACKER_LOCATION_NORMALIZATION_RULES_PATH: /var/task/location_normalization_rules.json",
     "nearby geocode reuse radius": "IMAGETRACKER_GEOCODE_REUSE_RADIUS_METERS: '5'",
     "bounded monthly geocode calls": "IMAGETRACKER_GEOCODE_MONTHLY_CALL_LIMIT: '1000'",
-    "scene description model": "IMAGETRACKER_SCENE_DESCRIPTION_MODEL: gpt-5.6-sol",
+    "scene description model": "IMAGETRACKER_SCENE_DESCRIPTION_MODEL: gpt-5.6-terra",
     "bounded monthly descriptions": "IMAGETRACKER_SCENE_DESCRIPTION_MONTHLY_CALL_LIMIT: '1000'",
     "cost-efficient scene tier": "IMAGETRACKER_SCENE_DESCRIPTION_SERVICE_TIER: flex",
     "Phase 1 API proxy": "path: /v1/{proxy+}",

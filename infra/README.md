@@ -72,7 +72,7 @@ The production controls are
 only `geo-places:ReverseGeocode`, scoped to the regional
 `provider/default` resource.
 
-Scene descriptions use `gpt-5.6-sol` with high-detail, 1024-pixel previews,
+Scene descriptions use `gpt-5.6-terra` with high-detail, 1024-pixel previews,
 Flex processing, and a separate 1,000-call per-user monthly ceiling. Local
 originals remain on-device; only metadata-free temporary JPEG previews enter
 the one-day staging prefix.

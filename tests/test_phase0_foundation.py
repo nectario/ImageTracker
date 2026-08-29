@@ -170,7 +170,7 @@ def test_worker_infrastructure_is_bounded_and_schedules_stay_disabled():
     assert "::provider/default" in serverless
     assert "IMAGETRACKER_GEOCODE_REUSE_RADIUS_METERS: '5'" in serverless
     assert "IMAGETRACKER_GEOCODE_MONTHLY_CALL_LIMIT: '1000'" in serverless
-    assert "IMAGETRACKER_SCENE_DESCRIPTION_MODEL: gpt-5.6-sol" in serverless
+    assert "IMAGETRACKER_SCENE_DESCRIPTION_MODEL: gpt-5.6-terra" in serverless
     assert "IMAGETRACKER_SCENE_DESCRIPTION_SERVICE_TIER: flex" in serverless
     assert "IMAGETRACKER_SCENE_DESCRIPTION_MONTHLY_CALL_LIMIT: '1000'" in serverless
     assert serverless.count("State: ${self:custom.maintenanceSchedulesState}") == 3

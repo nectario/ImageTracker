@@ -42,7 +42,7 @@ def description_result() -> SceneDescriptionResult:
     return SceneDescriptionResult(
         description="A red bicycle rests beside a sunny lakeside path.",
         provider="OpenAI",
-        model="gpt-5.6-sol",
+        model="gpt-5.6-terra",
         prompt_version="scene-search-v1",
         usage={"input_tokens": 800, "output_tokens": 12, "total_tokens": 812},
     )
@@ -61,7 +61,7 @@ class FakeDescriptionRepository:
             preview_sha256="b" * 64,
             preview_byte_size=12_345,
             preview_mime_type="image/jpeg",
-            model="gpt-5.6-sol",
+            model="gpt-5.6-terra",
             prompt_version="scene-search-v1",
             detail="high",
             service_tier="flex",
@@ -143,7 +143,7 @@ class FakeSceneProvider:
     outcome: SceneDescriptionResult | SceneDescriptionProviderError
     events: list[str]
     provider: str = "OpenAI"
-    model: str = "gpt-5.6-sol"
+    model: str = "gpt-5.6-terra"
     prompt_version: str = "scene-search-v1"
     detail: str = "high"
     service_tier: str = "flex"

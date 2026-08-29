@@ -217,7 +217,7 @@ def test_duplicate_manifest_paths_share_one_preparing_description_job(
         assert session.scalar(select(func.count()).select_from(MediaAsset)) == 1
         assert session.scalar(select(func.count()).select_from(ProcessingJob)) == 1
         stored = session.scalar(select(ProcessingJob))
-        assert stored.request_json["model"] == "gpt-5.6-sol"
+        assert stored.request_json["model"] == "gpt-5.6-terra"
         assert stored.request_json["promptVersion"] == "scene-search-v1"
 
 
@@ -638,7 +638,7 @@ def test_description_success_persists_current_result_usage_and_settles_quota(
         result=SceneDescriptionResult(
             description="A red bicycle rests beside a sunny lakeside path.",
             provider="OpenAI",
-            model="gpt-5.6-sol",
+            model="gpt-5.6-terra",
             prompt_version="scene-search-v1",
             usage={"input_tokens": 800, "output_tokens": 12, "total_tokens": 812},
         ),

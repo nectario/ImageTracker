@@ -1,22 +1,29 @@
 # Phase 1 Local Mode and Enrichment Status
 
-Implementation snapshot: 2026-08-28. The Local-mode core is deployed to
+Implementation snapshot: 2026-08-29. The Local-mode core is deployed to
 `image-tracker-prod` in `us-east-2`; the original acceptance evidence below was
 measured against that stack on 2026-08-27. Reverse geocoding and scene
 description are now deployed in the bounded production worker. Only a synthetic
 disposable photo—not the user's production library—was used for acceptance.
 
 Production schema migrations `012` and `013` were applied and verified on
-2026-08-28. The enrichment package subsequently passed the complete 258-test
+2026-08-28. The enrichment package subsequently passed the complete 262-test
 suite, repository artifact validation, and AWS CloudFormation validation. The
 authorized application/worker deployment completed successfully.
+
+The 2026-08-29 performance release deployed `gpt-5.6-terra`, added
+500-entry manifest prefetch/batched pending-occurrence writes, and introduced
+progressive fast-add with parallel discovery and file metadata reads. On the
+96-core/192-thread workstation, 160,769 media files were prepared in 31.04
+seconds at 5,180 files/second; 64 workers outperformed 96 and remains the
+auto-tuned cap.
 
 ## Scope delivered in the repository
 
 - Cognito-backed account sessions and authenticated device registration.
 - Local folder source create/list/update/remove behavior.
-- Recursive photo/video scanning, exact SHA-256 hashing, metadata extraction,
-  and a persistent SQLite cache.
+- Parallel photo/video discovery, progressive fast-add, exact SHA-256 hashing,
+  metadata extraction, and bulk writes to a persistent SQLite cache.
 - Durable manifest outbox batches with stable idempotency keys and retry-safe
   acknowledgement, structured failure quarantine, inspection, and release.
 - MySQL-backed accounts, devices, sources, assets, occurrences, locations,
@@ -45,7 +52,7 @@ authorized application/worker deployment completed successfully.
 - The preview is a deterministic, metadata-free JPEG with a maximum 1,024-pixel
   long edge. It is checksum-bound to a single-part signed PUT under `staging/`,
   then exposed to the worker through a short-lived signed GET.
-- The scene request uses `gpt-5.6-sol`, high image detail, Flex processing,
+- The scene request uses `gpt-5.6-terra`, high image detail, Flex processing,
   reasoning effort `none`, `store: false`, prompt version `scene-search-v1`,
   and at most 24 words. Provider/model/prompt provenance is stored with the
   resulting description.
@@ -67,8 +74,9 @@ authorized application/worker deployment completed successfully.
    every operation to that account.
 3. `imagetracker source add` registers the installation and Local folder while
    saving the path binding only in the CLI's private SQLite state.
-4. The scanner walks the folder without following symlinks, hashes recognized
-   media in chunks, extracts available metadata, and caches unchanged results.
+4. The scanner walks folders concurrently without following symlinks. Fast-add
+   can register directory metadata immediately; the deep-index pass hashes and
+   extracts metadata with bounded workers, then caches results in bulk.
 5. Changed occurrences and reliable deletions are saved as manifest batches in
    the local outbox before transmission.
 6. The API applies each idempotent manifest transaction to MySQL. Equal hashes
@@ -145,7 +153,7 @@ that subject, and confirms both Cognito and MySQL cleanup before returning.
 | Reliable deletion | Completed scan emits a deletion; incomplete traversal does not infer deletion | Pass in scanner/domain integration tests; unreadable traversal exits partial |
 | Legacy safety | Audit/preview use a read-only transaction and report zero writes | Pass live; 2,099 rows audited, one temporal-review row identified, bounded preview reported `writesPerformed=0` |
 | Stored reverse geocode | Synthetic GPS resolves through Amazon Location Places V2 | Pass live; provider `AmazonLocationPlacesV2`, street address `338-350 5th Ave` |
-| Scene description | Metadata-free preview is described by the pinned model | Pass live; provider `OpenAI`, model `gpt-5.6-sol`, searchable sentence persisted |
+| Scene description | Metadata-free preview is described by the pinned model | Pass live; provider `OpenAI`, model `gpt-5.6-terra`, searchable sentence persisted |
 | Temporary preview cleanup | Local asset remains LocalOnly and staging is deleted | Pass live; durable S3 locators null, zero staging objects after processing |
 | Worker cost/recovery controls | Queue, concurrency, DLQ, retry rule, and alert are bounded | Pass live; concurrency 1, visibility 900, max receives 8, retry every 5 minutes, 80% budget alert to `info@nektron.ai` |
 

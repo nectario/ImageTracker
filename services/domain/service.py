@@ -235,7 +235,7 @@ class Phase1DomainService:
         idempotency_hours: int = 24,
         job_dispatcher: JobDispatcher | None = None,
         temporary_object_store: TemporaryObjectStore | None = None,
-        scene_description_model: str = "gpt-5.6-sol",
+        scene_description_model: str = "gpt-5.6-terra",
         scene_description_detail: str = "high",
         scene_description_service_tier: str = "flex",
         scene_description_max_words: int = 24,
@@ -675,6 +675,24 @@ class Phase1DomainService:
                     command.permission_state not in {"Limited", "Denied", "Unavailable"}
                 )
                 seen_item_ids: set[str] = set()
+                source_item_ids = {entry.source_item_id for entry in command.entries}
+                occurrence_index = OccurrenceRepository(session).by_source_items(
+                    user_id=account.id,
+                    source_id=source.id,
+                    source_item_ids=source_item_ids,
+                )
+                content_hashes = {
+                    entry.content_sha256.lower()
+                    for entry in command.entries
+                    if isinstance(entry, ManifestUpsert)
+                    and isinstance(entry.content_sha256, str)
+                    and HEX_SHA256.fullmatch(entry.content_sha256.lower())
+                }
+                asset_index = AssetRepository(session).by_hashes(
+                    user_id=account.id,
+                    sha256_values=content_hashes,
+                )
+                deferred_pending_occurrences: list[MediaOccurrence] = []
                 for entry in command.entries:
                     if entry.source_item_id in seen_item_ids:
                         result = ManifestEntryResult(
@@ -695,6 +713,7 @@ class Phase1DomainService:
                                     entry=entry,
                                     deletion_allowed=deletion_allowed,
                                     now=now,
+                                    occurrence_index=occurrence_index,
                                 )
                             else:
                                 result = self._manifest_upsert(
@@ -704,6 +723,11 @@ class Phase1DomainService:
                                     entry=entry,
                                     now=now,
                                     geocode_job_ids=geocode_job_ids,
+                                    occurrence_index=occurrence_index,
+                                    asset_index=asset_index,
+                                    deferred_pending_occurrences=(
+                                        deferred_pending_occurrences
+                                    ),
                                 )
                         except (ConflictError, ValueError) as exc:
                             result = ManifestEntryResult(
@@ -725,6 +749,23 @@ class Phase1DomainService:
                     counts[count_key] += 1
                     results.append(result)
 
+                # New fast-add occurrences are flushed as one ORM batch, then
+                # their change-feed rows are flushed as a second batch.
+                session.flush()
+                changes = ChangeRepository(session)
+                for occurrence in deferred_pending_occurrences:
+                    changes.add(
+                        user_id=account.id,
+                        device_id=source.device_id,
+                        source_id=source.id,
+                        occurrence_id=occurrence.id,
+                        entity_type="MediaOccurrence",
+                        entity_id=occurrence.id,
+                        entity_public_id=occurrence.public_id,
+                        change_type="Upsert",
+                        now=now,
+                        flush=False,
+                    )
                 source.permission_state = command.permission_state
                 source.sync_cursor = command.client_cursor
                 source.last_manifest_at_utc = now
@@ -740,7 +781,9 @@ class Phase1DomainService:
                     entity_public_id=source.public_id,
                     change_type="Upsert",
                     now=now,
+                    flush=False,
                 )
+                session.flush()
                 return (
                     ManifestResult(
                         source_id=_uuid(source.public_id),
@@ -773,18 +816,59 @@ class Phase1DomainService:
         entry: ManifestUpsert,
         now: datetime,
         geocode_job_ids: list[UUID],
+        occurrence_index: dict[str, MediaOccurrence] | None = None,
+        asset_index: dict[str, MediaAsset] | None = None,
+        deferred_pending_occurrences: list[MediaOccurrence] | None = None,
     ) -> ManifestEntryResult:
         if entry.byte_size <= 0:
             raise ConflictError("InvalidByteSize", "Media byte size must be positive")
-        occurrence_repository = OccurrenceRepository(session)
-        occurrence = occurrence_repository.by_source_item(
-            user_id=account.id,
-            source_id=source.id,
-            source_item_id=entry.source_item_id,
+        occurrence = (
+            occurrence_index.get(entry.source_item_id)
+            if occurrence_index is not None
+            else OccurrenceRepository(session).by_source_item(
+                user_id=account.id,
+                source_id=source.id,
+                source_item_id=entry.source_item_id,
+            )
         )
         occurrence_created = occurrence is None
         old_asset_id = occurrence.media_asset_id if occurrence is not None else None
         was_deleted = occurrence is not None and occurrence.deletion_state != "Active"
+
+        if (
+            entry.content_sha256 is None
+            and occurrence is None
+            and deferred_pending_occurrences is not None
+        ):
+            occurrence = MediaOccurrence(
+                public_id=str(uuid4()),
+                user_id=account.id,
+                media_source_id=source.id,
+                source_item_id=entry.source_item_id,
+                original_file_name=entry.file_name,
+                local_locator=entry.local_locator,
+                source_revision=entry.source_revision,
+                observed_byte_size=entry.byte_size,
+                hash_status="Pending",
+                availability_state="Available",
+                deletion_state="Active",
+                first_seen_at_utc=now,
+                last_seen_at_utc=now,
+                created_at_utc=now,
+                updated_at_utc=now,
+            )
+            session.add(occurrence)
+            deferred_pending_occurrences.append(occurrence)
+            if occurrence_index is not None:
+                occurrence_index[entry.source_item_id] = occurrence
+            return ManifestEntryResult(
+                source_item_id=entry.source_item_id,
+                outcome="CreatedOccurrence",
+                occurrence_id=_uuid(occurrence.public_id),
+                media_asset_id=None,
+                upload_required=False,
+                description_job_id=None,
+            )
 
         if entry.content_sha256 is None:
             changed = occurrence_created or (
@@ -831,6 +915,8 @@ class Phase1DomainService:
                     occurrence.hash_status = "Pending"
                     occurrence.hash_failure_code = None
             session.flush()
+            if occurrence_index is not None:
+                occurrence_index[entry.source_item_id] = occurrence
             if old_asset_id is not None and occurrence.media_asset_id is None:
                 self._trash_if_unreferenced(
                     session=session,
@@ -908,8 +994,13 @@ class Phase1DomainService:
             raise ConflictError(
                 "InvalidContentHash", "Content SHA-256 must contain 64 hexadecimal characters"
             )
-        asset_repository = AssetRepository(session)
-        asset = asset_repository.by_hash(user_id=account.id, sha256=content_hash)
+        asset = (
+            asset_index.get(content_hash)
+            if asset_index is not None
+            else AssetRepository(session).by_hash(
+                user_id=account.id, sha256=content_hash
+            )
+        )
         asset_created = asset is None
         if asset is not None and asset.byte_size != entry.byte_size:
             raise ConflictError(
@@ -947,6 +1038,8 @@ class Phase1DomainService:
             )
             session.add(asset)
             session.flush()
+            if asset_index is not None:
+                asset_index[content_hash] = asset
             ChangeRepository(session).add(
                 user_id=account.id,
                 device_id=source.device_id,
@@ -1034,6 +1127,8 @@ class Phase1DomainService:
             occurrence.last_seen_at_utc = now
             occurrence.updated_at_utc = now
         session.flush()
+        if occurrence_index is not None:
+            occurrence_index[entry.source_item_id] = occurrence
 
         if old_asset_id is not None and old_asset_id != asset.id:
             self._trash_if_unreferenced(
@@ -1107,11 +1202,16 @@ class Phase1DomainService:
         entry: ManifestDelete,
         deletion_allowed: bool,
         now: datetime,
+        occurrence_index: dict[str, MediaOccurrence] | None = None,
     ) -> ManifestEntryResult:
-        occurrence = OccurrenceRepository(session).by_source_item(
-            user_id=account.id,
-            source_id=source.id,
-            source_item_id=entry.source_item_id,
+        occurrence = (
+            occurrence_index.get(entry.source_item_id)
+            if occurrence_index is not None
+            else OccurrenceRepository(session).by_source_item(
+                user_id=account.id,
+                source_id=source.id,
+                source_item_id=entry.source_item_id,
+            )
         )
         if not deletion_allowed or occurrence is None or occurrence.deletion_state != "Active":
             return ManifestEntryResult(

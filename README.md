@@ -5,8 +5,8 @@ photos and videos. It is also the media source for the future NektronAI
 Intelligence Layer.
 
 Phase 1 implements the Local-mode data path: the CLI discovers a folder,
-extracts available metadata, computes an exact SHA-256 content hash, and sends
-metadata manifests to the authenticated API. MySQL stores one `MediaAsset` per
+can register its directory metadata immediately, then extracts metadata and
+computes exact SHA-256 hashes in parallel. MySQL stores one `MediaAsset` per
 user and exact hash while retaining a separate `MediaOccurrence` for every
 source path. Original Local-mode files remain on the source computer and are
 not uploaded to permanent S3 storage.
@@ -32,8 +32,9 @@ The deployed Local core provides:
   `ImageTracker <info@nektron.ai>`.
 - Device registration and Local folder source creation, listing, update, and
   removal.
-- Recursive photo and video discovery with exact filenames and local locators.
-- Streaming SHA-256 hashing, a local hash/metadata cache, and per-user exact
+- Parallel photo and video discovery with exact filenames and local locators.
+- Progressive fast-add, parallel SHA-256/metadata extraction, bulk local cache
+  writes, and per-user exact
   deduplication in MySQL.
 - EXIF photo metadata and GPS extraction; `ffprobe` adds available video
   dimensions, duration, capture time, and embedded coordinates when installed.
@@ -49,7 +50,7 @@ The deployed enrichment build adds:
   address and provider provenance (`AmazonLocationPlacesV2`). A resolved
   address may be reused only for the same user and only when another coordinate
   is within 5 metres.
-- Automatic photo scene descriptions using `gpt-5.6-sol`, high image detail,
+- Automatic photo scene descriptions using `gpt-5.6-terra`, high image detail,
   Flex processing, reasoning effort `none`, and a versioned search prompt
   capped at 24 words.
 - A durable CLI scene-preview outbox, signed temporary uploads, bounded SQS
@@ -144,10 +145,16 @@ imagetracker source add "/mnt/d/Pictures/Camera Uploads" \
   --name "Camera Uploads"
 
 imagetracker source list
-imagetracker sync "Camera Uploads" --dry-run
-imagetracker sync "Camera Uploads"
+imagetracker sync "Camera Uploads" --fast-add
+imagetracker sync "Camera Uploads" --scan-workers 64
 imagetracker status
 ```
+
+`--fast-add` inventories new files from directory metadata without reading
+their contents, so a very large library appears quickly. A later normal sync
+performs exact SHA-256 deduplication, EXIF extraction, and video probing in the
+background-friendly deep-index phase. Worker selection is auto-tuned up to 64;
+use `--scan-workers`/`-j` to benchmark another bounded value.
 
 `--dry-run` scans and hashes without sending a manifest. A normal sync saves
 manifest batches locally before sending them, so rerunning the command resumes

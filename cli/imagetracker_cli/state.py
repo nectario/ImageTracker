@@ -34,6 +34,18 @@ class SourceBinding:
 class CachedFile:
     sha256: str
     metadata: Mapping[str, Any]
+    byte_size: int | None = None
+    modified_ns: int | None = None
+
+
+@dataclass(frozen=True)
+class FileCacheUpdate:
+    path_key: str
+    file_path: str
+    byte_size: int
+    modified_ns: int
+    sha256: str
+    metadata: Mapping[str, Any]
 
 
 @dataclass(frozen=True)
@@ -390,14 +402,47 @@ class LocalState:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT ContentSha256, MetadataJson FROM FileCache
+                SELECT ByteSize, ModifiedNs, ContentSha256, MetadataJson FROM FileCache
                 WHERE SourceId = ? AND PathKey = ? AND ByteSize = ? AND ModifiedNs = ?
                 """,
                 (source_id, normalized_path(path), size, modified_ns),
             ).fetchone()
         if not row:
             return None
-        return CachedFile(sha256=str(row["ContentSha256"]), metadata=json.loads(row["MetadataJson"]))
+        return CachedFile(
+            sha256=str(row["ContentSha256"]),
+            metadata=json.loads(row["MetadataJson"]),
+            byte_size=int(row["ByteSize"]),
+            modified_ns=int(row["ModifiedNs"]),
+        )
+
+    def cached_files(self, source_id: str) -> dict[str, CachedFile]:
+        """Load one source's hash cache in a single SQLite round trip."""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT PathKey, ByteSize, ModifiedNs, ContentSha256, MetadataJson
+                FROM FileCache
+                WHERE SourceId = ?
+                """,
+                (source_id,),
+            ).fetchall()
+        cached: dict[str, CachedFile] = {}
+        for row in rows:
+            try:
+                metadata = json.loads(row["MetadataJson"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(metadata, dict):
+                continue
+            cached[str(row["PathKey"])] = CachedFile(
+                sha256=str(row["ContentSha256"]),
+                metadata=metadata,
+                byte_size=int(row["ByteSize"]),
+                modified_ns=int(row["ModifiedNs"]),
+            )
+        return cached
 
     def cache_file(
         self,
@@ -409,8 +454,48 @@ class LocalState:
         sha256: str,
         metadata: Mapping[str, Any],
     ) -> None:
+        self.cache_files(
+            source_id,
+            (
+                FileCacheUpdate(
+                    path_key=normalized_path(path),
+                    file_path=str(path),
+                    byte_size=size,
+                    modified_ns=modified_ns,
+                    sha256=sha256,
+                    metadata=metadata,
+                ),
+            ),
+        )
+
+    def cache_files(
+        self,
+        source_id: str,
+        updates: Sequence[FileCacheUpdate],
+    ) -> None:
+        """Persist many scan results with one transaction and one prepared SQL."""
+
+        if not updates:
+            return
+        updated_at = utc_now_text()
+        values = [
+            (
+                source_id,
+                update.path_key,
+                update.file_path,
+                update.byte_size,
+                update.modified_ns,
+                update.sha256,
+                json.dumps(update.metadata, separators=(",", ":"), sort_keys=True),
+                updated_at,
+            )
+            for update in updates
+        ]
         with self._connect() as connection:
-            connection.execute(
+            # FileCache is reproducible local acceleration state. NORMAL keeps
+            # WAL durability while avoiding an fsync for every cache batch.
+            connection.execute("PRAGMA synchronous = NORMAL")
+            connection.executemany(
                 """
                 INSERT INTO FileCache
                     (SourceId, PathKey, FilePath, ByteSize, ModifiedNs, ContentSha256, MetadataJson, UpdatedAtUtc)
@@ -423,16 +508,7 @@ class LocalState:
                     MetadataJson = excluded.MetadataJson,
                     UpdatedAtUtc = excluded.UpdatedAtUtc
                 """,
-                (
-                    source_id,
-                    normalized_path(path),
-                    str(path),
-                    size,
-                    modified_ns,
-                    sha256,
-                    json.dumps(metadata, separators=(",", ":"), sort_keys=True),
-                    utc_now_text(),
-                ),
+                values,
             )
 
     def known_occurrences(self, source_id: str) -> dict[str, tuple[str, str]]:

@@ -458,6 +458,13 @@ def _cleanup_database_user(
         )
         target_user_id = account_id if account_id is not None else known_user_id
         if account_id is not None:
+            # ProcessingJob owns optional source/asset foreign keys whose
+            # MySQL delete action is restrictive. Remove only this disposable
+            # user's jobs before relying on the account's cascade graph.
+            session.execute(
+                delete(ProcessingJob).where(ProcessingJob.user_id == account_id)
+            )
+            session.flush()
             session.execute(
                 delete(UserAccount).where(UserAccount.id == account_id)
             )

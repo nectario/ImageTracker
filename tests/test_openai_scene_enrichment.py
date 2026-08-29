@@ -99,7 +99,7 @@ def test_scene_provider_uses_responses_api_https_preview_and_safe_metadata() -> 
     assert call["timeout_seconds"] == 60.0
     assert call["headers"]["Authorization"] == "Bearer never-display"
     payload = call["payload"]
-    assert payload["model"] == "gpt-5.6-sol"
+    assert payload["model"] == "gpt-5.6-terra"
     assert payload["service_tier"] == "flex"
     assert payload["reasoning"] == {"effort": "none"}
     assert payload["store"] is False
@@ -114,6 +114,8 @@ def test_scene_provider_uses_responses_api_https_preview_and_safe_metadata() -> 
     assert "Never identify people" in prompt
     assert "infer sensitive attributes" in prompt
     assert "invent an address" in prompt
+    assert "phone numbers" in prompt
+    assert "email addresses" in prompt
     assert "data:image" not in json.dumps(payload)
 
 

@@ -19,6 +19,7 @@ from rich.table import Table
 
 from .api_client import ApiError, AuthenticationRequired
 from .config import DEFAULT_STACK_NAME, ConfigStore, config_from_stack
+from .media import MediaScanner
 from .runtime import Runtime, boto3_session, build_runtime, cloudformation_client
 from .sync import SyncEngine, SyncSummary
 
@@ -228,6 +229,8 @@ def doctor(
                 state_ready = True
         checks = {
             "python": platform.python_version(),
+            "logical_cpu_threads": os.cpu_count() or 1,
+            "recommended_scan_workers": MediaScanner.recommended_worker_count(),
             "stage": service_settings.stage,
             "aws_region": config.aws_region,
             "database_scope": "ImageTracker",
@@ -389,6 +392,10 @@ def source_add(
         else:
             console.print(f"[green]Added[/green] {binding.display_name} ({binding.storage_mode})")
             console.print(binding.root_path)
+            console.print(
+                "[dim]Fast add:[/dim] "
+                f"imagetracker sync {binding.source_id} --fast-add"
+            )
 
 
 @source_app.command("list")
@@ -475,6 +482,10 @@ def _print_sync(summary: SyncSummary) -> None:
         "Scanned": summary.scanned,
         "Hashed": summary.hashed,
         "Hash cache hits": summary.cached,
+        "Scanner workers": summary.scan_workers,
+        "Scan time": f"{summary.scan_seconds:.2f}s",
+        "Scan throughput": f"{summary.scan_files_per_second:,.0f} files/s",
+        "Hashes deferred": summary.hash_pending,
         "Unchanged": summary.unchanged,
         "Upserts": summary.upserts,
         "Deleted occurrences": summary.deletions,
@@ -507,11 +518,36 @@ def sync(
         bool,
         typer.Option("--force-rehash", help="Ignore the local hash cache and reread every media file."),
     ] = False,
+    scan_workers: Annotated[
+        int | None,
+        typer.Option(
+            "--scan-workers",
+            "-j",
+            min=1,
+            max=256,
+            help=(
+                "Parallel hashing/metadata workers. Default: auto-tuned "
+                "(up to 64)."
+            ),
+        ),
+    ] = None,
+    fast_add: Annotated[
+        bool,
+        typer.Option(
+            "--fast-add",
+            help=(
+                "Register new files from directory metadata immediately; "
+                "defer content hashing and EXIF extraction to a later normal sync."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Hash and synchronize a Local folder with safe deletion detection."""
 
     del no_input  # Sync is deliberately non-interactive.
     with command_errors():
+        if fast_add and force_rehash:
+            raise ValueError("--fast-add cannot be combined with --force-rehash")
         runtime = _runtime()
         while True:
             binding = runtime.state.resolve_binding(source)
@@ -519,7 +555,13 @@ def sync(
                 lambda message: console.print(f"[dim]{message}[/dim]")
             )
             engine = SyncEngine(runtime.api, runtime.state, progress=progress)
-            summary = engine.sync(binding, dry_run=dry_run, force_rehash=force_rehash)
+            summary = engine.sync(
+                binding,
+                dry_run=dry_run,
+                force_rehash=force_rehash,
+                scan_workers=scan_workers,
+                fast_add=fast_add,
+            )
             if json_output:
                 _emit(summary.as_dict())
             else:

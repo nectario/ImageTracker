@@ -18,7 +18,7 @@ from services.enrichment.models import (
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 OPENAI_SCENE_PROVIDER = "OpenAI"
 SCENE_DESCRIPTION_PROMPT_VERSION = "scene-search-v1"
-DEFAULT_SCENE_DESCRIPTION_MODEL = "gpt-5.6-sol"
+DEFAULT_SCENE_DESCRIPTION_MODEL = "gpt-5.6-terra"
 
 
 @dataclass(frozen=True)
@@ -293,7 +293,9 @@ class OpenAISceneDescriptionProvider:
             f"{self._max_words} words, optimized for photo search. Mention the "
             "setting, activity, distinctive objects, and clearly visible text only "
             "when important. Describe only visible evidence. Never identify people, "
-            "infer sensitive attributes, or invent an address. Return only the sentence."
+            "infer sensitive attributes, or invent an address. Never reproduce contact "
+            "names, phone numbers, email addresses, or account identifiers. Return only "
+            "the sentence."
         )
 
     @staticmethod

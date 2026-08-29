@@ -5,6 +5,7 @@ import stat
 import uuid
 import base64
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -455,6 +456,105 @@ def test_force_rehash_bypasses_unchanged_file_cache(tmp_path: Path):
     assert cached.cached == 1
     assert forced.hashed == 1
     assert hash_calls == 2
+
+
+def test_scanner_hashes_and_caches_with_multiple_workers(tmp_path: Path):
+    root = tmp_path / "parallel-library"
+    root.mkdir()
+    for index in range(8):
+        (root / f"photo-{index:02d}.jpg").write_bytes(
+            (f"parallel-photo-{index}".encode("ascii")) * 128
+        )
+
+    state = LocalState(tmp_path / "parallel-state.sqlite3")
+    barrier = threading.Barrier(4)
+    names: set[str] = set()
+    names_lock = threading.Lock()
+
+    def synchronized_hash(path: Path) -> str:
+        with names_lock:
+            names.add(threading.current_thread().name)
+        barrier.wait(timeout=5)
+        return stream_sha256(path)
+
+    scanner = MediaScanner(
+        state,
+        metadata_extractor=FakeMetadata(),  # type: ignore[arg-type]
+        hash_file=synchronized_hash,
+        workers=4,
+    )
+
+    first = scanner.scan(SOURCE_ID, root)
+    repeated = scanner.scan(SOURCE_ID, root)
+
+    assert first.hashed == 8
+    assert first.worker_count == 4
+    assert first.files_per_second > 0
+    assert len(names) == 4
+    assert len(state.cached_files(SOURCE_ID)) == 8
+    assert repeated.hashed == 0
+    assert repeated.cached == 8
+
+
+def test_fast_add_discovers_without_reading_contents_then_normal_scan_enriches(
+    tmp_path: Path,
+):
+    root = tmp_path / "instant-library"
+    root.mkdir()
+    first = root / "one.jpg"
+    second = root / "two.jpg"
+    first.write_bytes(b"first-photo")
+    second.write_bytes(b"second-photo")
+    state = LocalState(tmp_path / "instant-state.sqlite3")
+    hash_calls = 0
+
+    def counted_hash(path: Path) -> str:
+        nonlocal hash_calls
+        hash_calls += 1
+        return stream_sha256(path)
+
+    scanner = MediaScanner(
+        state,
+        metadata_extractor=FakeMetadata(),  # type: ignore[arg-type]
+        hash_file=counted_hash,
+        workers=4,
+    )
+
+    instant = scanner.scan(SOURCE_ID, root, fast_add=True)
+    assert instant.scanned == 2
+    assert instant.hashed == 0
+    assert instant.pending_hash == 2
+    assert all(entry["contentSha256"] is None for entry in instant.entries)
+    assert state.cached_files(SOURCE_ID) == {}
+
+    enriched = scanner.scan(SOURCE_ID, root)
+
+    assert len(state.cached_files(SOURCE_ID)) == 2
+    assert enriched.hashed == 2
+    assert enriched.pending_hash == 0
+    assert all(entry["contentSha256"] for entry in enriched.entries)
+    assert hash_calls == 2
+
+
+def test_empty_media_placeholder_is_skipped_without_failing_library_scan(
+    tmp_path: Path,
+):
+    root = tmp_path / "library-with-placeholder"
+    root.mkdir()
+    (root / "empty.jpg").touch()
+    (root / "real.jpg").write_bytes(b"photo")
+    state = LocalState(tmp_path / "placeholder-state.sqlite3")
+
+    result = MediaScanner(
+        state,
+        metadata_extractor=FakeMetadata(),  # type: ignore[arg-type]
+        workers=4,
+    ).scan(SOURCE_ID, root, fast_add=True)
+
+    assert result.scanned == 2
+    assert result.failed == 0
+    assert result.skipped == 1
+    assert len(result.entries) == 1
 
 
 def test_local_sync_links_exact_duplicates_and_is_idempotent(tmp_path: Path):
