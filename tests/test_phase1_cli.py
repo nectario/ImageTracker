@@ -54,6 +54,18 @@ def test_interrupt_message_does_not_claim_in_progress_scan_was_saved(capsys):
     assert message == " ".join(capsys.readouterr().out.split())
 
 
+def test_cli_uses_bright_accessible_status_palette():
+    styles = cli_app_module.CLI_THEME.styles
+
+    assert "bright_cyan" in str(styles["progress"])
+    assert "bright_green" in str(styles["success"])
+    assert "bright_yellow" in str(styles["warning"])
+    assert "bright_red" in str(styles["error"])
+    assert cli_app_module._state_text("Succeeded").startswith("[success]")
+    assert cli_app_module._state_text("Preparing").startswith("[progress]")
+    assert cli_app_module._state_text("Failed").startswith("[error]")
+
+
 class FakeCloudFormation:
     def describe_stacks(self, **kwargs: Any) -> Mapping[str, Any]:
         assert kwargs == {"StackName": "image-tracker-prod"}

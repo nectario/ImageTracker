@@ -15,7 +15,9 @@ from typing import Annotated, Any, Iterator, Mapping
 import typer
 from botocore.exceptions import BotoCoreError, ClientError
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
+from rich.theme import Theme
 
 from .api_client import ApiError, AuthenticationRequired
 from .config import DEFAULT_STACK_NAME, ConfigStore, config_from_stack
@@ -55,8 +57,53 @@ app.add_typer(outbox_app, name="outbox")
 app.add_typer(media_app, name="media")
 app.add_typer(jobs_app, name="jobs")
 
-console = Console()
-error_console = Console(stderr=True)
+CLI_THEME = Theme(
+    {
+        "accent": "bold bright_cyan",
+        "count": "bold bright_cyan",
+        "error": "bold bright_red",
+        "info": "bright_blue",
+        "key": "bold bright_white",
+        "muted": "grey82",
+        "path": "bright_blue",
+        "progress": "bright_cyan",
+        "success": "bold bright_green",
+        "title": "bold bright_magenta",
+        "warning": "bold bright_yellow",
+    }
+)
+console = Console(theme=CLI_THEME)
+error_console = Console(stderr=True, theme=CLI_THEME)
+
+
+def _table(
+    *,
+    title: str,
+    show_header: bool = True,
+) -> Table:
+    return Table(
+        title=title,
+        show_header=show_header,
+        title_style="title",
+        header_style="bold bright_cyan",
+        border_style="bright_blue",
+    )
+
+
+def _state_text(value: Any) -> str:
+    rendered = str(value or "")
+    normalized = rendered.casefold()
+    if normalized in {"ready", "sent", "succeeded", "complete", "active"}:
+        style = "success"
+    elif normalized in {"failed", "needsattention", "error"}:
+        style = "error"
+    elif normalized in {"deferred", "deferredquota", "pendingquota"}:
+        style = "warning"
+    elif normalized in {"discarded", "cancelled"}:
+        style = "title"
+    else:
+        style = "progress"
+    return f"[{style}]{escape(rendered)}[/{style}]"
 
 
 def package_version() -> str:
@@ -71,7 +118,7 @@ def _emit(payload: Any) -> None:
 
 
 def _error(message: str, code: ExitCode) -> None:
-    error_console.print(f"[red]Error:[/red] {message}")
+    error_console.print(f"[error]Error:[/error] [bright_white]{message}[/bright_white]")
     raise typer.Exit(int(code))
 
 
@@ -102,7 +149,7 @@ def command_errors(*, interrupt_message: str = "Stopped.") -> Iterator[None]:
     except (ValueError, OSError) as exc:
         _error(str(exc), ExitCode.CONFIGURATION)
     except KeyboardInterrupt:
-        console.print(f"[dim]{interrupt_message}[/dim]")
+        console.print(f"[muted]{interrupt_message}[/muted]")
         raise typer.Exit(0) from None
 
 
@@ -193,8 +240,8 @@ def configure(
         if json_output:
             _emit(payload)
         else:
-            console.print(f"[green]Configured[/green] {stack} in {region}")
-            console.print(f"API: {config.api_url}")
+            console.print(f"[success]Configured[/success] [key]{stack}[/key] in [accent]{region}[/accent]")
+            console.print(f"[accent]API:[/accent] [path]{config.api_url}[/path]")
 
 
 @app.command()
@@ -244,8 +291,8 @@ def doctor(
         if json_output:
             _emit(checks)
             return
-        table = Table(title="ImageTracker doctor", show_header=False)
-        table.add_column("Check", style="bold")
+        table = _table(title="ImageTracker doctor", show_header=False)
+        table.add_column("Check", style="accent")
         table.add_column("Value")
         for key, value in checks.items():
             table.add_row(key.replace("_", " ").title(), str(value))
@@ -267,7 +314,7 @@ def auth_signup(
         actual_password = password or typer.prompt("Password", hide_input=True, confirmation_prompt=True)
         response = runtime.auth.signup(email, actual_password)
         destination = ((response.get("CodeDeliveryDetails") or {}).get("Destination") or email)
-        console.print(f"[green]Account created.[/green] Verification code sent to {destination}.")
+        console.print(f"[success]Account created.[/success] Verification code sent to [accent]{destination}[/accent].")
         console.print(f"Confirm with: imagetracker auth confirm {email} CODE")
 
 
@@ -278,7 +325,7 @@ def auth_confirm(email: str, code: str) -> None:
     with command_errors():
         runtime = _runtime()
         runtime.auth.confirm(email, code)
-        console.print("[green]Email confirmed.[/green] You can now sign in.")
+        console.print("[success]Email confirmed.[/success] You can now sign in.")
 
 
 @auth_app.command("login")
@@ -295,8 +342,8 @@ def auth_login(
         runtime = _runtime()
         actual_password = password or typer.prompt("Password", hide_input=True)
         tokens = runtime.auth.login(email, actual_password)
-        console.print(f"[green]Signed in[/green] as {tokens.email or email}.")
-        console.print(f"Session storage: {runtime.token_store.backend_name}")
+        console.print(f"[success]Signed in[/success] as [accent]{tokens.email or email}[/accent].")
+        console.print(f"[accent]Session storage:[/accent] {runtime.token_store.backend_name}")
 
 
 @auth_app.command("logout")
@@ -336,7 +383,7 @@ def auth_status(
         if json_output:
             _emit(payload)
         else:
-            console.print(f"Signed in as [bold]{payload['email'] or payload['username']}[/bold]")
+            console.print(f"Signed in as [accent]{payload['email'] or payload['username']}[/accent]")
 
 
 @source_app.command("add")
@@ -390,10 +437,10 @@ def source_add(
         if json_output:
             _emit(payload)
         else:
-            console.print(f"[green]Added[/green] {binding.display_name} ({binding.storage_mode})")
-            console.print(binding.root_path)
+            console.print(f"[success]Added[/success] [accent]{binding.display_name}[/accent] ([key]{binding.storage_mode}[/key])")
+            console.print(f"[path]{binding.root_path}[/path]")
             console.print(
-                "[dim]Fast add:[/dim] "
+                "[accent]Fast add:[/accent] "
                 f"imagetracker sync {binding.source_id} --fast-add"
             )
 
@@ -412,8 +459,8 @@ def source_list(
         if json_output:
             _emit(payload)
             return
-        table = Table(title="ImageTracker sources")
-        table.add_column("Name", style="bold")
+        table = _table(title="ImageTracker sources")
+        table.add_column("Name", style="accent")
         table.add_column("Mode")
         table.add_column("Status")
         table.add_column("Path")
@@ -449,7 +496,7 @@ def source_set_mode(source: str, mode: str) -> None:
             key=f"source-mode:{binding.source_id}:{normalized_mode}",
         )
         runtime.state.update_binding_mode(binding.source_id, str(response["storageMode"]))
-        console.print(f"[green]Updated[/green] {binding.display_name} to {response['storageMode']} mode.")
+        console.print(f"[success]Updated[/success] [accent]{binding.display_name}[/accent] to [key]{response['storageMode']}[/key] mode.")
 
 
 @source_app.command("remove")
@@ -475,9 +522,9 @@ def source_remove(
 
 
 def _print_sync(summary: SyncSummary) -> None:
-    table = Table(title="ImageTracker sync")
-    table.add_column("Result", style="bold")
-    table.add_column("Count", justify="right")
+    table = _table(title="ImageTracker sync")
+    table.add_column("Result", style="accent")
+    table.add_column("Count", justify="right", style="bright_white")
     rows = {
         "Scanned": summary.scanned,
         "Hashed": summary.hashed,
@@ -496,6 +543,7 @@ def _print_sync(summary: SyncSummary) -> None:
         "Rejected entries": summary.rejected_entries,
         "Manifest batches sent": summary.batches_sent,
         "Scene previews staged": summary.descriptions_staged,
+        "Scene previews recovered": summary.descriptions_recovered,
         "Scene previews pending": summary.description_pending,
         "Scene previews quota-deferred": summary.description_deferred,
         "Scene previews needing attention": summary.description_quarantined,
@@ -504,7 +552,7 @@ def _print_sync(summary: SyncSummary) -> None:
         table.add_row(label, str(value))
     console.print(table)
     if summary.dry_run:
-        console.print("[yellow]Dry run:[/yellow] no manifest was sent.")
+        console.print("[warning]Dry run:[/warning] no manifest was sent.")
 
 
 @app.command()
@@ -557,7 +605,7 @@ def sync(
         while True:
             binding = runtime.state.resolve_binding(source)
             progress = (lambda message: None) if json_output else (
-                lambda message: console.print(f"[dim]{message}[/dim]")
+                lambda message: console.print(f"[progress]{message}[/progress]")
             )
             engine = SyncEngine(runtime.api, runtime.state, progress=progress)
             summary = engine.sync(
@@ -609,22 +657,22 @@ def status(
                 _emit(payload)
             else:
                 console.print(
-                    f"[bold]{payload['pendingManifestBatches']}[/bold] queued manifest batches · "
-                    f"[bold]{payload['failedManifestBatches']}[/bold] need attention · "
-                    f"[bold]{payload['pendingDescriptionPreviews']}[/bold] scene previews queued · "
-                    f"[bold]{payload['deferredDescriptionPreviews']}[/bold] quota-deferred · "
-                    f"[bold]{payload['failedDescriptionPreviews']}[/bold] scene previews need attention · "
-                    f"[bold]{payload['sources']}[/bold] local sources"
+                    f"[count]{payload['pendingManifestBatches']}[/count] queued manifest batches · "
+                    f"[count]{payload['failedManifestBatches']}[/count] need attention · "
+                    f"[count]{payload['pendingDescriptionPreviews']}[/count] scene previews queued · "
+                    f"[count]{payload['deferredDescriptionPreviews']}[/count] quota-deferred · "
+                    f"[count]{payload['failedDescriptionPreviews']}[/count] scene previews need attention · "
+                    f"[count]{payload['sources']}[/count] local sources"
                 )
-                table = Table(title="Processing activity")
-                table.add_column("Type")
-                table.add_column("State")
+                table = _table(title="Processing activity")
+                table.add_column("Type", style="accent")
+                table.add_column("State", style="bright_white")
                 table.add_column("Attempts", justify="right")
                 table.add_column("Message")
                 for job in payload["jobs"]:
                     table.add_row(
                         str(job.get("jobType") or ""),
-                        str(job.get("state") or job.get("status") or ""),
+                        _state_text(job.get("state") or job.get("status")),
                         str(job.get("attemptCount") or 0),
                         str(job.get("userMessage") or ""),
                     )
@@ -665,8 +713,8 @@ def outbox_list(
         if json_output:
             _emit(payload)
             return
-        table = Table(title="Manifest outbox")
-        table.add_column("State", style="bold")
+        table = _table(title="Manifest outbox")
+        table.add_column("State", style="accent")
         table.add_column("Entries", justify="right")
         table.add_column("Issue")
         table.add_column("Batch ID")
@@ -677,7 +725,7 @@ def outbox_list(
             if len(failures) > 1:
                 issue = f"{issue} (+{len(failures) - 1} more)"
             table.add_row(
-                str(item["state"]),
+                _state_text(item["state"]),
                 str(item["entryCount"]),
                 str(issue),
                 str(item["batchId"]),
@@ -701,7 +749,7 @@ def outbox_discard(
             return
         runtime.state.discard_outbox(batch_id)
         console.print(
-            f"[green]Discarded[/green] failed batch {batch_id}. "
+            f"[success]Discarded[/success] failed batch [accent]{batch_id}[/accent]. "
             "Rejected revisions are eligible for a fresh idempotency key on the next sync."
         )
 
@@ -740,8 +788,8 @@ def outbox_descriptions(
         if json_output:
             _emit(payload)
             return
-        table = Table(title="Scene-description outbox")
-        table.add_column("State", style="bold")
+        table = _table(title="Scene-description outbox")
+        table.add_column("State", style="accent")
         table.add_column("File")
         table.add_column("Attempts", justify="right")
         table.add_column("Next attempt")
@@ -750,7 +798,7 @@ def outbox_descriptions(
         for item in payload:
             error = item["error"] or {}
             table.add_row(
-                str(item["state"]),
+                _state_text(item["state"]),
                 str(item["fileName"]),
                 str(item["attemptCount"]),
                 str(item["nextAttemptAtUtc"] or "—"),
@@ -767,15 +815,15 @@ def outbox_retry_description(job_id: str) -> None:
     with command_errors():
         _runtime().state.retry_description(job_id)
         console.print(
-            f"[green]Queued[/green] scene preview {job_id}. Run 'imagetracker sync' to retry it."
+            f"[success]Queued[/success] scene preview [accent]{job_id}[/accent]. Run 'imagetracker sync' to retry it."
         )
 
 
 def _media_table(items: list[Mapping[str, Any]], *, title: str) -> Table:
-    table = Table(title=title)
+    table = _table(title=title)
     table.add_column("Captured")
     table.add_column("Type")
-    table.add_column("File", style="bold")
+    table.add_column("File", style="accent")
     table.add_column("Location")
     table.add_column("State")
     table.add_column("Media ID")
@@ -896,16 +944,16 @@ def jobs_list(
         if json_output:
             _emit(items)
             return
-        table = Table(title="Processing jobs")
+        table = _table(title="Processing jobs")
         table.add_column("Type")
-        table.add_column("Status", style="bold")
+        table.add_column("Status", style="accent")
         table.add_column("Attempts", justify="right")
         table.add_column("Message")
         table.add_column("Job ID")
         for item in items:
             table.add_row(
                 str(item.get("jobType") or ""),
-                str(item.get("status") or item.get("state") or ""),
+                _state_text(item.get("status") or item.get("state")),
                 str(item.get("attemptCount") or 0),
                 str(item.get("userMessage") or ""),
                 str(item.get("jobId") or ""),
@@ -951,11 +999,11 @@ def jobs_retry(
         else:
             if is_description and str(item.get("status") or "") == "Preparing":
                 console.print(
-                    f"[green]Preview retry ready[/green] for job {job_id}. "
+                    f"[success]Preview retry ready[/success] for job [accent]{job_id}[/accent]. "
                     "Run 'imagetracker sync' on this source device."
                 )
             else:
-                console.print(f"[green]Retry queued[/green] for job {job_id}.")
+                console.print(f"[success]Retry queued[/success] for job [accent]{job_id}[/accent].")
 
 
 @legacy_app.command("audit")
@@ -970,8 +1018,8 @@ def legacy_audit(
         if json_output:
             _emit(payload)
             return
-        table = Table(title="Legacy audit")
-        table.add_column("Check", style="bold")
+        table = _table(title="Legacy audit")
+        table.add_column("Check", style="accent")
         table.add_column("Status")
         table.add_column("Detail")
         for check in payload.get("checks", []):
@@ -1025,11 +1073,11 @@ def legacy_migrate(
         if json_output:
             _emit(payload)
         else:
-            console.print("[yellow]Legacy migration preview[/yellow]")
+            console.print("[warning]Legacy migration preview[/warning]")
             console.print_json(data=payload)
             if save_checkpoint:
                 console.print(
-                    "[green]Saved the local preview cursor.[/green] No MySQL rows were changed."
+                    "[success]Saved the local preview cursor.[/success] No MySQL rows were changed."
                 )
 
 

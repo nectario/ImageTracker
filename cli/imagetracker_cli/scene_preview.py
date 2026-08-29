@@ -10,6 +10,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 
 
 DEFAULT_MAX_LONG_EDGE = 1024
+SCENE_PREVIEW_CAPABILITY_VERSION = "scene-preview-v2-mpo"
 JPEG_CONTENT_TYPE = "image/jpeg"
 JPEG_QUALITY = 85
 JPEG_OPTIMIZE = True
@@ -17,10 +18,12 @@ JPEG_PROGRESSIVE = False
 JPEG_SUBSAMPLING = 2
 
 # These are the still-image formats decoded by Pillow (including pillow-heif)
-# that ImageTracker accepts for scene-description previews. Raw camera formats
-# need a dedicated decoder and are intentionally rejected here.
+# that ImageTracker accepts for scene-description previews. MPO is a valid
+# multi-picture JPEG commonly produced by Sony cameras; its primary frame is
+# used for search enrichment. Raw camera formats need a dedicated decoder and
+# are intentionally rejected here.
 SUPPORTED_INPUT_FORMATS = frozenset(
-    {"AVIF", "BMP", "GIF", "HEIF", "JPEG", "PNG", "TIFF", "WEBP"}
+    {"AVIF", "BMP", "GIF", "HEIF", "JPEG", "MPO", "PNG", "TIFF", "WEBP"}
 )
 
 _SANITIZED_ERROR = "The file is not a supported or readable photo."

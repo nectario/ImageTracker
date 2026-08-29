@@ -7,7 +7,12 @@ from typing import Any, Callable, Mapping, Sequence
 
 from .api_client import ApiClient, ApiError, ApiProblem
 from .media import MediaScanner, stream_sha256
-from .scene_preview import ScenePreview, ScenePreviewError, prepare_scene_preview
+from .scene_preview import (
+    SCENE_PREVIEW_CAPABILITY_VERSION,
+    ScenePreview,
+    ScenePreviewError,
+    prepare_scene_preview,
+)
 from .state import DescriptionOutboxItem, LocalState, SourceBinding
 
 
@@ -39,6 +44,7 @@ class SyncSummary:
     description_pending: int = 0
     description_deferred: int = 0
     description_quarantined: int = 0
+    descriptions_recovered: int = 0
     force_rehash: bool = False
     scan_workers: int = 1
     scan_seconds: float = 0.0
@@ -246,6 +252,7 @@ class SyncEngine:
         summary: SyncSummary,
     ) -> None:
         self._reconcile_sent_descriptions(binding)
+        self._recover_supported_description_skips(binding, summary)
         tasks = self.state.due_description_tasks(binding.source_id)
         if tasks:
             self.progress(f"Preparing {len(tasks)} scene preview(s)")
@@ -331,6 +338,71 @@ class SyncEngine:
                 break
             elif outcome == "Pending":
                 self.progress(f"Scene preview for {task.file_name} will retry later")
+
+    def _recover_supported_description_skips(
+        self,
+        binding: SourceBinding,
+        summary: SyncSummary,
+    ) -> None:
+        """Retry previously rejected MPO/JPG files once after decoder upgrades."""
+
+        setting_key = "scene-preview-capability-version"
+        if (
+            self.state.get_setting(setting_key)
+            == SCENE_PREVIEW_CAPABILITY_VERSION
+        ):
+            return
+        skipped = self.state.list_description_outbox(
+            state="Skipped",
+            limit=1_000,
+        )
+        retry_deferred = False
+        recovered = 0
+        for task in skipped:
+            if task.source_id != binding.source_id:
+                continue
+            error_code = str((task.error or {}).get("code") or "")
+            if error_code != ScenePreviewError.code:
+                continue
+            path = Path(task.local_path)
+            if path.suffix.casefold() not in {".jpg", ".jpeg", ".mpo"}:
+                continue
+            try:
+                preview = self.preview_factory(path)
+            except (OSError, ScenePreviewError):
+                continue
+            if (
+                preview.source_sha256_hex.casefold()
+                != task.asset_content_sha256.casefold()
+            ):
+                continue
+            try:
+                job = self.api.retry_job(
+                    task.job_id,
+                    key=(
+                        f"scene-retry-capability:{task.job_id}:"
+                        f"{SCENE_PREVIEW_CAPABILITY_VERSION}"
+                    ),
+                )
+            except ApiError:
+                retry_deferred = True
+                continue
+            if str(job.get("status") or "") != "Preparing":
+                retry_deferred = True
+                continue
+            self.state.retry_description(task.job_id)
+            recovered += 1
+        if recovered:
+            summary.descriptions_recovered += recovered
+            self.progress(
+                f"Recovered {recovered} scene description(s) after "
+                "adding MPO camera-photo support"
+            )
+        if not retry_deferred and len(skipped) < 1_000:
+            self.state.set_setting(
+                setting_key,
+                SCENE_PREVIEW_CAPABILITY_VERSION,
+            )
 
     def _reconcile_not_preparing(self, task: DescriptionOutboxItem) -> str:
         try:

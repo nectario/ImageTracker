@@ -7,7 +7,7 @@ description are now deployed in the bounded production worker. Only a synthetic
 disposable photo—not the user's production library—was used for acceptance.
 
 Production schema migrations `012` and `013` were applied and verified on
-2026-08-28. The enrichment package subsequently passed the complete 268-test
+2026-08-28. The enrichment package subsequently passed the complete 271-test
 suite, repository artifact validation, and AWS CloudFormation validation. The
 authorized application/worker deployment completed successfully.
 
@@ -24,6 +24,11 @@ The trusted WSL one-file importer was exercised against the real source on
 95,267 missing occurrences and left 65,500 existing rows untouched. Local
 known-occurrence state reconciled to 160,767, pending API batches fell to zero,
 and the Local media S3 bucket remained empty.
+
+The CLI now uses a high-contrast bright terminal palette. Scene previews also
+accept MPO multi-picture JPEGs commonly emitted by Sony cameras, use their
+primary frame, and automatically retry jobs previously cancelled as
+`UnsupportedPhoto` when the upgraded decoder can now read the file.
 
 ## Scope delivered in the repository
 

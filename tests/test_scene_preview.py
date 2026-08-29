@@ -92,6 +92,29 @@ def test_preview_flattens_transparency_to_rgb(tmp_path: Path) -> None:
         assert red > 245 and green > 245 and blue > 245
 
 
+def test_preview_accepts_mpo_camera_jpg_and_uses_primary_frame(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "DSC05933.JPG"
+    with Image.new("RGB", (1200, 800), "red") as primary:
+        with Image.new("RGB", (1200, 800), "blue") as secondary:
+            primary.save(
+                source,
+                format="MPO",
+                save_all=True,
+                append_images=[secondary],
+            )
+
+    preview = prepare_scene_preview(source)
+
+    assert (preview.width_pixels, preview.height_pixels) == (1024, 683)
+    with Image.open(BytesIO(preview.content)) as output:
+        assert output.format == "JPEG"
+        red, _green, blue = output.getpixel((100, 100))
+        assert red > 240
+        assert blue < 20
+
+
 @pytest.mark.parametrize(
     "name,content",
     [

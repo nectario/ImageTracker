@@ -16,6 +16,10 @@ import cli.imagetracker_cli.app as cli_app_module
 from cli.imagetracker_cli.api_client import ApiClient, ApiError, ApiProblem
 from cli.imagetracker_cli.app import app
 from cli.imagetracker_cli.media import stream_sha256
+from cli.imagetracker_cli.scene_preview import (
+    SCENE_PREVIEW_CAPABILITY_VERSION,
+    ScenePreviewError,
+)
 from cli.imagetracker_cli.state import LocalState, SourceBinding
 from cli.imagetracker_cli.sync import SyncEngine, SyncSummary
 
@@ -89,6 +93,17 @@ def _photo(path: Path) -> None:
     Image.new("RGB", (1600, 900), (18, 80, 140)).save(path, "JPEG", quality=91)
 
 
+def _mpo(path: Path) -> None:
+    with Image.new("RGB", (1200, 800), "red") as primary:
+        with Image.new("RGB", (1200, 800), "blue") as secondary:
+            primary.save(
+                path,
+                format="MPO",
+                save_all=True,
+                append_images=[secondary],
+            )
+
+
 class UploadApi:
     def __init__(self, disposition: str = "UploadRequired"):
         self.disposition = disposition
@@ -99,6 +114,7 @@ class UploadApi:
         self.completion: Mapping[str, Any] | None = None
         self.plan_calls = 0
         self.cancelled_jobs: list[tuple[str, str, str]] = []
+        self.retried_jobs: list[tuple[str, str]] = []
 
     def create_upload_plan(self, payload: Mapping[str, Any], *, key: str):
         self.plan_calls += 1
@@ -143,6 +159,38 @@ class UploadApi:
     def cancel_job(self, job_id: str, *, reason: str, key: str):
         self.cancelled_jobs.append((job_id, reason, key))
         return {"jobId": job_id, "jobType": "Description", "status": "Cancelled"}
+
+    def retry_job(self, job_id: str, *, key: str):
+        self.retried_jobs.append((job_id, key))
+        return {"jobId": job_id, "jobType": "Description", "status": "Preparing"}
+
+
+def test_decoder_upgrade_recovers_previously_skipped_mpo_job_once(
+    tmp_path: Path,
+) -> None:
+    photo = tmp_path / "DSC05933.JPG"
+    _mpo(photo)
+    state = LocalState(tmp_path / "state.sqlite3")
+    _queue_photo(state, photo)
+    state.mark_description_skipped(
+        JOB_ID,
+        code=ScenePreviewError.code,
+        message="The file was unsupported by the previous decoder.",
+    )
+    api = UploadApi()
+    summary = SyncSummary(SOURCE_ID, str(tmp_path), False)
+    engine = SyncEngine(api, state)  # type: ignore[arg-type]
+
+    engine._recover_supported_description_skips(_binding(tmp_path), summary)
+    engine._recover_supported_description_skips(_binding(tmp_path), summary)
+
+    assert summary.descriptions_recovered == 1
+    assert len(api.retried_jobs) == 1
+    assert state.list_description_outbox(state="Pending")[0].job_id == JOB_ID
+    assert (
+        state.get_setting("scene-preview-capability-version")
+        == SCENE_PREVIEW_CAPABILITY_VERSION
+    )
 
 
 def test_manifest_ack_atomically_queues_account_scoped_photo_and_source_removal_clears_it(
