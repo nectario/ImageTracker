@@ -64,7 +64,12 @@ def _admin_environment() -> dict[str, Any] | None:
     return {**values, "database": "ImageTracker", "tls": True}
 
 
-def _connect(secret: dict[str, Any]) -> pymysql.Connection:
+def _connect(
+    secret: dict[str, Any],
+    *,
+    local_infile: bool = False,
+    timeout_seconds: int = 30,
+) -> pymysql.Connection:
     user = secret.get("user") or secret.get("username")
     password = secret.get("password")
     host = secret.get("host")
@@ -82,9 +87,10 @@ def _connect(secret: dict[str, Any]) -> pymysql.Connection:
         charset="utf8mb4",
         autocommit=False,
         connect_timeout=10,
-        read_timeout=30,
-        write_timeout=30,
+        read_timeout=timeout_seconds,
+        write_timeout=timeout_seconds,
         cursorclass=DictCursor,
+        local_infile=local_infile,
         **options,
     )
 

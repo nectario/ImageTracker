@@ -571,6 +571,32 @@ def test_empty_media_placeholder_is_skipped_without_failing_library_scan(
     assert len(result.entries) == 1
 
 
+def test_one_file_import_can_suspend_and_restore_pending_manifest_batches(
+    tmp_path: Path,
+):
+    state = LocalState(tmp_path / "suspend-state.sqlite3")
+    scan_id = state.begin_scan(SOURCE_ID, tmp_path)
+    state.queue_batches(
+        SOURCE_ID,
+        scan_id,
+        (
+            {"kind": "Incremental", "entries": []},
+            {"kind": "Incremental", "entries": []},
+        ),
+    )
+
+    batch_ids = state.suspend_pending_batches(SOURCE_ID)
+
+    assert len(batch_ids) == 2
+    assert state.pending_count() == 0
+    assert len(state.list_outbox(state="Discarded")) == 2
+
+    state.restore_suspended_batches(batch_ids)
+
+    assert state.pending_count() == 2
+    assert state.list_outbox(state="Discarded") == []
+
+
 def test_local_sync_links_exact_duplicates_and_is_idempotent(tmp_path: Path):
     root = tmp_path / "library"
     root.mkdir()

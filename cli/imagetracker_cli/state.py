@@ -522,6 +522,43 @@ class LocalState:
             for row in rows
         }
 
+    def record_known_occurrences(
+        self,
+        source_id: str,
+        entries: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """Record an acknowledged one-file MySQL import in one SQLite batch."""
+
+        values = [
+            (
+                source_id,
+                str(entry["sourceItemId"]),
+                str(entry["sourceRevision"]),
+                str(entry.get("localLocator") or entry["fileName"]),
+                utc_now_text(),
+            )
+            for entry in entries
+            if entry.get("sourceItemId")
+            and entry.get("sourceRevision")
+            and entry.get("fileName")
+        ]
+        if not values:
+            return
+        with self._connect() as connection:
+            connection.execute("PRAGMA synchronous = NORMAL")
+            connection.executemany(
+                """
+                INSERT INTO KnownOccurrence
+                    (SourceId, SourceItemId, SourceRevision, RelativePath, UpdatedAtUtc)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT (SourceId, SourceItemId) DO UPDATE SET
+                    SourceRevision = excluded.SourceRevision,
+                    RelativePath = excluded.RelativePath,
+                    UpdatedAtUtc = excluded.UpdatedAtUtc
+                """,
+                values,
+            )
+
     def begin_scan(self, source_id: str, root: Path) -> str:
         scan_id = str(uuid.uuid4())
         with self._connect() as connection:
@@ -1423,6 +1460,83 @@ class LocalState:
                 connection.execute(
                     "SELECT COUNT(*) FROM ManifestOutbox WHERE State = 'Pending'"
                 ).fetchone()[0]
+            )
+
+    def suspend_pending_batches(self, source_id: str) -> tuple[str, ...]:
+        """Atomically supersede one source's pending API batches."""
+
+        now = utc_now_text()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT BatchId, ScanId
+                FROM ManifestOutbox
+                WHERE SourceId = ? AND State = 'Pending'
+                ORDER BY CreatedAtUtc, SequenceNumber
+                """,
+                (source_id,),
+            ).fetchall()
+            batch_ids = tuple(str(row["BatchId"]) for row in rows)
+            scan_ids = {str(row["ScanId"]) for row in rows}
+            if batch_ids:
+                connection.executemany(
+                    """
+                    UPDATE ManifestOutbox
+                    SET State = 'Discarded',
+                        FailureJson = ?,
+                        DiscardedAtUtc = ?
+                    WHERE BatchId = ? AND State = 'Pending'
+                    """,
+                    (
+                        (
+                            json.dumps(
+                                {"reason": "SupersededByOneFileMySqlImport"},
+                                sort_keys=True,
+                            ),
+                            now,
+                            batch_id,
+                        )
+                        for batch_id in batch_ids
+                    ),
+                )
+                connection.executemany(
+                    """
+                    UPDATE ScanRun
+                    SET Status = 'SupersededByOneFileImport'
+                    WHERE ScanId = ?
+                    """,
+                    ((scan_id,) for scan_id in scan_ids),
+                )
+        return batch_ids
+
+    def restore_suspended_batches(self, batch_ids: Sequence[str]) -> None:
+        """Restore a superseded batch set when the MySQL transaction fails."""
+
+        if not batch_ids:
+            return
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT DISTINCT ScanId
+                FROM ManifestOutbox
+                WHERE BatchId IN ({",".join("?" for _ in batch_ids)})
+                  AND State = 'Discarded'
+                """,
+                tuple(batch_ids),
+            ).fetchall()
+            connection.executemany(
+                """
+                UPDATE ManifestOutbox
+                SET State = 'Pending',
+                    FailureJson = NULL,
+                    DiscardedAtUtc = NULL
+                WHERE BatchId = ? AND State = 'Discarded'
+                """,
+                ((batch_id,) for batch_id in batch_ids),
+            )
+            connection.executemany(
+                "UPDATE ScanRun SET Status = 'Queued' WHERE ScanId = ?",
+                ((str(row["ScanId"]),) for row in rows),
             )
 
     def failed_count(self) -> int:

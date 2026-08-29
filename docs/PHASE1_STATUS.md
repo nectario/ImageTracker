@@ -7,7 +7,7 @@ description are now deployed in the bounded production worker. Only a synthetic
 disposable photo—not the user's production library—was used for acceptance.
 
 Production schema migrations `012` and `013` were applied and verified on
-2026-08-28. The enrichment package subsequently passed the complete 262-test
+2026-08-28. The enrichment package subsequently passed the complete 268-test
 suite, repository artifact validation, and AWS CloudFormation validation. The
 authorized application/worker deployment completed successfully.
 
@@ -17,6 +17,13 @@ progressive fast-add with parallel discovery and file metadata reads. On the
 96-core/192-thread workstation, 160,769 media files were prepared in 31.04
 seconds at 5,180 files/second; 64 workers outperformed 96 and remains the
 auto-tuned cap.
+
+The trusted WSL one-file importer was exercised against the real source on
+2026-08-29: one 46.17 MiB CSV carried 160,767 rows through one
+`LOAD DATA LOCAL INFILE` operation and one commit. The set merge inserted
+95,267 missing occurrences and left 65,500 existing rows untouched. Local
+known-occurrence state reconciled to 160,767, pending API batches fell to zero,
+and the Local media S3 bucket remained empty.
 
 ## Scope delivered in the repository
 

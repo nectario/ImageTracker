@@ -94,8 +94,9 @@ imagetracker doctor --json
 
 See [`scripts/README.md`](scripts/README.md) for the individual WSL shell
 wrappers and their safety boundaries. Deployment remains outside the shell
-toolkit; the one write-capable database wrapper is the narrowly scoped,
-dry-run-by-default enrichment migration command.
+toolkit. Database-writing wrappers are explicit and dry-run by default: one is
+limited to enrichment schema migration, and one performs the trusted WSL
+one-file manifest import.
 
 ## Configure the CLI
 
@@ -155,6 +156,20 @@ their contents, so a very large library appears quickly. A later normal sync
 performs exact SHA-256 deduplication, EXIF extraction, and video probing in the
 background-friendly deep-index phase. Worker selection is auto-tuned up to 64;
 use `--scan-workers`/`-j` to benchmark another bounded value.
+
+For trusted WSL administration on the shared DeepTrading infrastructure, the
+one-file path bypasses API transport batching while preserving account/source
+scope and local originals:
+
+```bash
+./scripts/mysql-one-file-import.sh "Camera Uploads" --apply \
+  --admin-env-file /path/to/ignored/.env.prod
+```
+
+It creates one ignored CSV, executes one MySQL `LOAD DATA LOCAL INFILE`, merges
+only missing pending-hash occurrences and their change rows set-wise, and
+commits once. It refuses to race a live manifest sender unless the stopped
+outbox is explicitly replaced with `--replace-pending-outbox`.
 
 `--dry-run` scans and hashes without sending a manifest. A normal sync saves
 manifest batches locally before sending them, so rerunning the command resumes

@@ -18,6 +18,7 @@ EXPECTED_SCRIPTS = {
     "setup.sh",
     "store-openai-key.sh",
     "migrate-db.sh",
+    "mysql-one-file-import.sh",
     "test.sh",
 }
 
@@ -57,6 +58,15 @@ def test_migration_wrapper_is_explicit_and_never_runs_legacy_importer():
     assert "migrate_enrichment.py" in text
     assert '"$@"' in text
     assert "ImageTracker.py" not in text
+
+
+def test_mysql_one_file_wrapper_is_explicit_and_not_in_playground():
+    text = (SCRIPTS / "mysql-one-file-import.sh").read_text(encoding="utf-8")
+    assert "mysql_one_file_import.py" in text
+    assert '"$@"' in text
+    assert "mysql-one-file-import" not in (SCRIPTS / "play.sh").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_store_openai_key_updates_env_without_printing_secret(tmp_path: Path):
