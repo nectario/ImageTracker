@@ -76,7 +76,7 @@ def _error(message: str, code: ExitCode) -> None:
 
 
 @contextmanager
-def command_errors() -> Iterator[None]:
+def command_errors(*, interrupt_message: str = "Stopped.") -> Iterator[None]:
     try:
         yield
     except typer.Exit:
@@ -102,7 +102,7 @@ def command_errors() -> Iterator[None]:
     except (ValueError, OSError) as exc:
         _error(str(exc), ExitCode.CONFIGURATION)
     except KeyboardInterrupt:
-        console.print("[dim]Stopped. Saved work will resume safely.[/dim]")
+        console.print(f"[dim]{interrupt_message}[/dim]")
         raise typer.Exit(0) from None
 
 
@@ -545,7 +545,12 @@ def sync(
     """Hash and synchronize a Local folder with safe deletion detection."""
 
     del no_input  # Sync is deliberately non-interactive.
-    with command_errors():
+    with command_errors(
+        interrupt_message=(
+            "Stopped. The current discovery/stat pass restarts on the next run; "
+            "completed hash-cache batches and queued manifests remain saved."
+        )
+    ):
         if fast_add and force_rehash:
             raise ValueError("--fast-add cannot be combined with --force-rehash")
         runtime = _runtime()

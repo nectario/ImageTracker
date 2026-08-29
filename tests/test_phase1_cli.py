@@ -13,6 +13,7 @@ from typing import Any, Mapping
 
 import httpx
 import pytest
+import typer
 from typer.testing import CliRunner
 
 import cli.imagetracker_cli.app as cli_app_module
@@ -38,6 +39,19 @@ SOURCE_ID = "c132f11e-976c-42f0-b2d8-61e88f1757d2"
 def fake_id_token(subject: str) -> str:
     payload = base64.urlsafe_b64encode(json.dumps({"sub": subject}).encode()).decode().rstrip("=")
     return f"header.{payload}.signature"
+
+
+def test_interrupt_message_does_not_claim_in_progress_scan_was_saved(capsys):
+    message = (
+        "Stopped. The current discovery/stat pass restarts; "
+        "completed cache batches remain saved."
+    )
+    with pytest.raises(typer.Exit) as raised:
+        with cli_app_module.command_errors(interrupt_message=message):
+            raise KeyboardInterrupt
+
+    assert raised.value.exit_code == 0
+    assert message == " ".join(capsys.readouterr().out.split())
 
 
 class FakeCloudFormation:
