@@ -25,7 +25,8 @@ The trusted WSL one-file importer was exercised against the real source on
 known-occurrence state reconciled to 160,767, pending API batches fell to zero,
 and the Local media S3 bucket remained empty.
 
-The CLI now uses a high-contrast bright terminal palette. Scene previews also
+The CLI now mirrors the user's Ubuntu Powerlevel10k palette with warm burnt
+orange, ochre, muted teal, sage green, cream, and graphite. Scene previews also
 accept MPO multi-picture JPEGs commonly emitted by Sony cameras, use their
 primary frame, and automatically retry jobs previously cancelled as
 `UnsupportedPhoto` when the upgraded decoder can now read the file.

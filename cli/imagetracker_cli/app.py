@@ -59,17 +59,19 @@ app.add_typer(jobs_app, name="jobs")
 
 CLI_THEME = Theme(
     {
-        "accent": "bold bright_cyan",
-        "count": "bold bright_cyan",
-        "error": "bold bright_red",
-        "info": "bright_blue",
-        "key": "bold bright_white",
-        "muted": "grey82",
-        "path": "bright_blue",
-        "progress": "bright_cyan",
-        "success": "bold bright_green",
-        "title": "bold bright_magenta",
-        "warning": "bold bright_yellow",
+        # Exact warm/muted colors from the user's Ubuntu Powerlevel10k prompt.
+        # The muted teal already identifies Codex in that theme.
+        "accent": "bold #D45C0C",
+        "count": "bold #D79921",
+        "error": "bold #E74856",
+        "info": "#448487",
+        "key": "bold #FBF1C7",
+        "muted": "#A8A8A8",
+        "path": "#D79921",
+        "progress": "#448487",
+        "success": "bold #5A8A5A",
+        "title": "bold #D45C0C",
+        "warning": "bold #D79921",
     }
 )
 console = Console(theme=CLI_THEME)
@@ -85,8 +87,8 @@ def _table(
         title=title,
         show_header=show_header,
         title_style="title",
-        header_style="bold bright_cyan",
-        border_style="bright_blue",
+        header_style="accent",
+        border_style="#767676",
     )
 
 
@@ -118,7 +120,7 @@ def _emit(payload: Any) -> None:
 
 
 def _error(message: str, code: ExitCode) -> None:
-    error_console.print(f"[error]Error:[/error] [bright_white]{message}[/bright_white]")
+    error_console.print(f"[error]Error:[/error] [key]{message}[/key]")
     raise typer.Exit(int(code))
 
 
@@ -524,7 +526,7 @@ def source_remove(
 def _print_sync(summary: SyncSummary) -> None:
     table = _table(title="ImageTracker sync")
     table.add_column("Result", style="accent")
-    table.add_column("Count", justify="right", style="bright_white")
+    table.add_column("Count", justify="right", style="key")
     rows = {
         "Scanned": summary.scanned,
         "Hashed": summary.hashed,
@@ -666,7 +668,7 @@ def status(
                 )
                 table = _table(title="Processing activity")
                 table.add_column("Type", style="accent")
-                table.add_column("State", style="bright_white")
+                table.add_column("State", style="key")
                 table.add_column("Attempts", justify="right")
                 table.add_column("Message")
                 for job in payload["jobs"]:

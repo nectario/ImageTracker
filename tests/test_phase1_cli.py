@@ -57,10 +57,29 @@ def test_interrupt_message_does_not_claim_in_progress_scan_was_saved(capsys):
 def test_cli_uses_bright_accessible_status_palette():
     styles = cli_app_module.CLI_THEME.styles
 
-    assert "bright_cyan" in str(styles["progress"])
-    assert "bright_green" in str(styles["success"])
-    assert "bright_yellow" in str(styles["warning"])
-    assert "bright_red" in str(styles["error"])
+    assert "#448487" in str(styles["progress"]).casefold()
+    assert "#5a8a5a" in str(styles["success"]).casefold()
+    assert "#d79921" in str(styles["warning"]).casefold()
+    assert "#e74856" in str(styles["error"]).casefold()
+    assert "#d45c0c" in str(styles["accent"]).casefold()
+    assert "#fbf1c7" in str(styles["key"]).casefold()
+    custom_names = {
+        "accent",
+        "count",
+        "error",
+        "info",
+        "key",
+        "muted",
+        "path",
+        "progress",
+        "success",
+        "title",
+        "warning",
+    }
+    assert all(
+        "blue" not in str(styles[name]).casefold()
+        for name in custom_names
+    )
     assert cli_app_module._state_text("Succeeded").startswith("[success]")
     assert cli_app_module._state_text("Preparing").startswith("[progress]")
     assert cli_app_module._state_text("Failed").startswith("[error]")
