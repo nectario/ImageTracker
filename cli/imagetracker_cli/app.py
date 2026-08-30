@@ -604,33 +604,35 @@ def sync(
         if fast_add and force_rehash:
             raise ValueError("--fast-add cannot be combined with --force-rehash")
         runtime = _runtime()
-        while True:
-            binding = runtime.state.resolve_binding(source)
-            progress = (lambda message: None) if json_output else (
-                lambda message: console.print(f"[progress]{message}[/progress]")
-            )
-            engine = SyncEngine(runtime.api, runtime.state, progress=progress)
-            summary = engine.sync(
-                binding,
-                dry_run=dry_run,
-                force_rehash=force_rehash,
-                scan_workers=scan_workers,
-                fast_add=fast_add,
-            )
-            if json_output:
-                _emit(summary.as_dict())
-            else:
-                _print_sync(summary)
-            if summary.failed > 0:
-                _error(
-                    "Sync completed with work needing attention or a later retry. "
-                    "Inspect it with 'imagetracker outbox list' and "
-                    "'imagetracker outbox descriptions'.",
-                    ExitCode.PARTIAL_SYNC,
+        binding = runtime.state.resolve_binding(source)
+        with runtime.state.source_sync_lock(binding.source_id):
+            while True:
+                progress = (lambda message: None) if json_output else (
+                    lambda message: console.print(f"[progress]{message}[/progress]")
                 )
-            if not watch:
-                break
-            time.sleep(30)
+                engine = SyncEngine(runtime.api, runtime.state, progress=progress)
+                summary = engine.sync(
+                    binding,
+                    dry_run=dry_run,
+                    force_rehash=force_rehash,
+                    scan_workers=scan_workers,
+                    fast_add=fast_add,
+                )
+                if json_output:
+                    _emit(summary.as_dict())
+                else:
+                    _print_sync(summary)
+                if summary.failed > 0:
+                    _error(
+                        "Sync completed with work needing attention. "
+                        "Inspect manifest failures with 'imagetracker outbox list' "
+                        "and scene failures with "
+                        "'imagetracker outbox descriptions --state Failed'.",
+                        ExitCode.PARTIAL_SYNC,
+                    )
+                if not watch:
+                    break
+                time.sleep(30)
 
 
 @app.command()

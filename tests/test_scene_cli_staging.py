@@ -660,7 +660,7 @@ def test_transient_staging_failure_stays_pending_and_permanent_is_quarantined(tm
         assert str(photo) not in json.dumps(task.error)
         assert task.error["retryable"] is (status == 503)
         if status == 503:
-            assert summary.failed == 1
+            assert summary.failed == 0
 
 
 def test_status_and_description_outbox_never_render_local_paths(tmp_path: Path, monkeypatch):

@@ -16,7 +16,7 @@ from .scene_preview import (
 from .state import DescriptionOutboxItem, LocalState, SourceBinding
 
 
-MANIFEST_BATCH_SIZE = 500
+MANIFEST_BATCH_SIZE = 100
 
 
 @dataclass
@@ -94,16 +94,18 @@ class SyncEngine:
                 "Remote upload will be enabled with the resumable upload phase."
             )
 
-        if not dry_run:
-            self._flush_description_outbox(binding, summary)
-
         pending = self.state.pending_batches(binding.source_id)
         summary.resumed_batches = len(pending)
         if pending and not dry_run:
             self.progress(f"Resuming {len(pending)} saved manifest batch(es)")
-            self._flush_pending(binding, summary)
+            if not self._flush_pending(binding, summary):
+                self._add_description_attention_counts(binding, summary)
+                return summary
         elif pending:
             summary.queued_batches += len(pending)
+
+        if not dry_run:
+            self._flush_description_outbox(binding, summary)
 
         root = Path(binding.root_path)
         self.progress(f"Scanning {root}")
@@ -186,12 +188,30 @@ class SyncEngine:
             summary={**scan.summary(), "upserts": len(changed_entries), "deletions": len(deleted_entries)},
         )
         summary.queued_batches = len(batches)
-        self._flush_pending(binding, summary)
+        if not self._flush_pending(binding, summary):
+            self._add_description_attention_counts(binding, summary)
+            return summary
         self._flush_description_outbox(binding, summary)
         self._add_description_attention_counts(binding, summary)
         return summary
 
-    def _flush_pending(self, binding: SourceBinding, summary: SyncSummary) -> None:
+    def _flush_pending(
+        self,
+        binding: SourceBinding,
+        summary: SyncSummary,
+    ) -> bool:
+        split_batches, replacement_batches = (
+            self.state.split_oversized_pending_batches(
+                binding.source_id,
+                Path(binding.root_path),
+                max_entries=MANIFEST_BATCH_SIZE,
+            )
+        )
+        if split_batches:
+            self.progress(
+                f"Replaced {split_batches} oversized manifest batch(es) with "
+                f"{replacement_batches} timeout-safe batch(es)"
+            )
         for batch in self.state.pending_batches(binding.source_id):
             try:
                 response = self.api.submit_manifest(
@@ -201,7 +221,18 @@ class SyncEngine:
                 )
             except ApiError as exc:
                 if not self._is_permanent_request_error(exc):
-                    raise
+                    if exc.problem.status == 401:
+                        raise
+                    remaining = len(
+                        self.state.pending_batches(binding.source_id)
+                    )
+                    summary.queued_batches = remaining
+                    self.progress(
+                        "Manifest delivery paused because the service is "
+                        f"temporarily unavailable · {remaining} batch(es) "
+                        "remain safely queued"
+                    )
+                    return False
                 resolution = self.state.quarantine_request_error(
                     batch,
                     status=exc.problem.status,
@@ -245,6 +276,10 @@ class SyncEngine:
                         "The service requested object upload for a Local source; the batch was quarantined.",
                     )
                 )
+        summary.queued_batches = len(
+            self.state.pending_batches(binding.source_id)
+        )
+        return True
 
     def _flush_description_outbox(
         self,
@@ -326,7 +361,6 @@ class SyncEngine:
                         code=code,
                         message="Scene preview staging is temporarily unavailable.",
                     )
-                    summary.failed += 1
                     self.progress(f"Scene preview for {task.file_name} will retry later")
                 continue
 

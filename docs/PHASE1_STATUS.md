@@ -7,7 +7,7 @@ description are now deployed in the bounded production worker. Only a synthetic
 disposable photo—not the user's production library—was used for acceptance.
 
 Production schema migrations `012` and `013` were applied and verified on
-2026-08-28. The enrichment package subsequently passed the complete 271-test
+2026-08-28. The enrichment package subsequently passed the complete 273-test
 suite, repository artifact validation, and AWS CloudFormation validation. The
 authorized application/worker deployment completed successfully.
 
@@ -30,6 +30,15 @@ orange, ochre, muted teal, sage green, cream, and graphite. Scene previews also
 accept MPO multi-picture JPEGs commonly emitted by Sony cameras, use their
 primary frame, and automatically retry jobs previously cancelled as
 `UnsupportedPhoto` when the upgraded decoder can now read the file.
+
+A real deep-index replay exposed the API's synchronous ceiling: a 500-entry
+hash-enriched manifest reached the Lambda timeout at exactly 28.0 seconds and
+returned HTTP 500. The CLI now uses 100-entry transport batches, automatically
+replaced 238 saved oversized requests with 1,188 durable smaller requests, and
+successfully processed measured production batches in 4.7–8.4 seconds. Saved
+manifests resume before optional scene enrichment, retryable preview deferrals
+no longer produce a false failure exit, and a per-source process lock prevents
+overlapping CLI syncs.
 
 ## Scope delivered in the repository
 

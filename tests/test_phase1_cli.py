@@ -628,6 +628,21 @@ def test_one_file_import_can_suspend_and_restore_pending_manifest_batches(
     assert state.list_outbox(state="Discarded") == []
 
 
+def test_source_sync_lock_prevents_overlapping_cli_processes(tmp_path: Path):
+    state = LocalState(tmp_path / "locked-state.sqlite3")
+
+    with state.source_sync_lock(SOURCE_ID):
+        with pytest.raises(
+            ValueError,
+            match="A sync is already running for this source",
+        ):
+            with state.source_sync_lock(SOURCE_ID):
+                pass
+
+    with state.source_sync_lock(SOURCE_ID):
+        pass
+
+
 def test_local_sync_links_exact_duplicates_and_is_idempotent(tmp_path: Path):
     root = tmp_path / "library"
     root.mkdir()
@@ -676,7 +691,7 @@ def test_remove_then_readd_resubmits_occurrences_but_reuses_hash_cache(tmp_path:
     assert len(state.known_occurrences(SOURCE_ID)) == 1
 
 
-def test_manifest_batches_never_exceed_500_entries():
+def test_manifest_batches_use_timeout_safe_request_size():
     entries = [
         {
             "operation": "Deleted",
@@ -686,8 +701,52 @@ def test_manifest_batches_never_exceed_500_entries():
         for index in range(1001)
     ]
     batches = SyncEngine._manifest_payloads(scan_id=str(uuid.uuid4()), entries=entries, complete_read=True)
-    assert [len(item["entries"]) for item in batches] == [MANIFEST_BATCH_SIZE, 500, 1]
+    assert [len(item["entries"]) for item in batches] == (
+        [MANIFEST_BATCH_SIZE] * 10 + [1]
+    )
+    assert MANIFEST_BATCH_SIZE == 100
     assert all(item["deletionDetectionReliable"] for item in batches)
+
+
+def test_oversized_saved_manifests_are_durably_split_for_retry(
+    tmp_path: Path,
+):
+    state = LocalState(tmp_path / "split-state.sqlite3")
+    entries = [
+        {
+            "operation": "Deleted",
+            "sourceItemId": f"path:{index}",
+            "sourceRevision": "a" * 64,
+        }
+        for index in range(267)
+    ]
+    scan_id = state.begin_scan(SOURCE_ID, tmp_path)
+    state.queue_batches(
+        SOURCE_ID,
+        scan_id,
+        (
+            {
+                "snapshotId": scan_id,
+                "kind": "Full",
+                "permissionState": "NotApplicable",
+                "deletionDetectionReliable": True,
+                "entries": entries,
+            },
+        ),
+    )
+
+    originals, replacements = state.split_oversized_pending_batches(
+        SOURCE_ID,
+        tmp_path,
+        max_entries=100,
+    )
+
+    assert (originals, replacements) == (1, 3)
+    pending = state.pending_batches(SOURCE_ID)
+    assert [len(batch.payload["entries"]) for batch in pending] == [100, 100, 67]
+    assert len({batch.scan_id for batch in pending}) == 1
+    assert len({batch.idempotency_key for batch in pending}) == 3
+    assert len(state.list_outbox(state="Discarded")) == 1
 
 
 def test_interrupted_manifest_resumes_with_same_idempotency_key(tmp_path: Path):
@@ -699,9 +758,10 @@ def test_interrupted_manifest_resumes_with_same_idempotency_key(tmp_path: Path):
     scanner = MediaScanner(state, metadata_extractor=FakeMetadata())  # type: ignore[arg-type]
     failing_api = FakeManifestApi(fail_first=True)
 
-    with pytest.raises(ApiError, match="connection lost"):
-        SyncEngine(failing_api, state, scanner).sync(binding)  # type: ignore[arg-type]
+    paused = SyncEngine(failing_api, state, scanner).sync(binding)  # type: ignore[arg-type]
     assert state.pending_count() == 1
+    assert paused.failed == 0
+    assert paused.queued_batches == 1
     original_key = failing_api.calls[0][2]
 
     recovered_api = FakeManifestApi()
@@ -790,7 +850,6 @@ def test_permanent_request_errors_quarantine_whole_batch(
     ("status", "code"),
     [
         (0, "NETWORK_ERROR"),
-        (401, "UNAUTHORIZED"),
         (408, "TIMEOUT"),
         (429, "RATE_LIMITED"),
         (500, "SERVER_ERROR"),
@@ -807,14 +866,32 @@ def test_transient_request_errors_remain_pending(
     state = LocalState(tmp_path / f"state-{status}-{code}.sqlite3")
     binding = state.bind_source(source_payload(root), root)
     api = RequestErrorApi(status, code)
+    summary = SyncEngine(
+        api,  # type: ignore[arg-type]
+        state,
+        MediaScanner(state, metadata_extractor=FakeMetadata()),  # type: ignore[arg-type]
+    ).sync(binding)
+    assert summary.failed == 0
+    assert summary.queued_batches == 1
+    assert state.pending_count() == 1
+    assert state.failed_count() == 0
+
+
+def test_unauthorized_manifest_delivery_requires_sign_in(tmp_path: Path):
+    root = tmp_path / "library-unauthorized"
+    root.mkdir()
+    (root / "one.jpg").write_bytes(b"data")
+    state = LocalState(tmp_path / "state-unauthorized.sqlite3")
+    binding = state.bind_source(source_payload(root), root)
+
     with pytest.raises(ApiError):
         SyncEngine(
-            api,  # type: ignore[arg-type]
+            RequestErrorApi(401, "UNAUTHORIZED"),  # type: ignore[arg-type]
             state,
             MediaScanner(state, metadata_extractor=FakeMetadata()),  # type: ignore[arg-type]
         ).sync(binding)
+
     assert state.pending_count() == 1
-    assert state.failed_count() == 0
 
 
 def test_cli_renders_permanent_request_quarantine_then_exits_partial(

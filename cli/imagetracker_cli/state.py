@@ -91,6 +91,45 @@ class LocalState:
         self._initialize()
 
     @contextmanager
+    def source_sync_lock(self, source_id: str) -> Iterator[None]:
+        """Prevent two CLI processes from synchronizing one source at once."""
+
+        lock_path = self.path.parent / f"sync-{source_id}.lock"
+        with lock_path.open("a+b") as handle:
+            if os.name == "nt":
+                import msvcrt
+
+                if lock_path.stat().st_size == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                except OSError:
+                    raise ValueError(
+                        "A sync is already running for this source."
+                    ) from None
+                try:
+                    yield
+                finally:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                return
+
+            import fcntl
+
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ValueError(
+                    "A sync is already running for this source."
+                ) from None
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
@@ -639,6 +678,133 @@ class LocalState:
             )
             for row in rows
         ]
+
+    def split_oversized_pending_batches(
+        self,
+        source_id: str,
+        root: Path,
+        *,
+        max_entries: int,
+    ) -> tuple[int, int]:
+        """Replace oversized pending requests with durable smaller requests."""
+
+        if not 1 <= max_entries <= 500:
+            raise ValueError("Manifest split size must be between 1 and 500")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT BatchId, ScanId, PayloadJson
+                FROM ManifestOutbox
+                WHERE SourceId = ? AND State = 'Pending'
+                ORDER BY CreatedAtUtc, SequenceNumber
+                """,
+                (source_id,),
+            ).fetchall()
+            oversized: list[tuple[str, str, dict[str, Any]]] = []
+            for row in rows:
+                payload = json.loads(row["PayloadJson"])
+                if len(payload.get("entries") or []) > max_entries:
+                    oversized.append(
+                        (
+                            str(row["BatchId"]),
+                            str(row["ScanId"]),
+                            payload,
+                        )
+                    )
+            if not oversized:
+                return 0, 0
+
+            replacement_scan_id = str(uuid.uuid4())
+            now = utc_now_text()
+            connection.execute(
+                """
+                INSERT INTO ScanRun
+                    (ScanId, SourceId, RootPath, Status, CompleteRead,
+                     SummaryJson, StartedAtUtc, CompletedAtUtc)
+                VALUES (?, ?, ?, 'Queued', 1, ?, ?, ?)
+                """,
+                (
+                    replacement_scan_id,
+                    source_id,
+                    normalized_path(root),
+                    json.dumps(
+                        {
+                            "reason": "SplitOversizedManifestRequests",
+                            "originalBatches": len(oversized),
+                            "maxEntries": max_entries,
+                        },
+                        sort_keys=True,
+                    ),
+                    now,
+                    now,
+                ),
+            )
+
+            sequence = 0
+            replacement_values: list[tuple[Any, ...]] = []
+            for _batch_id, _scan_id, payload in oversized:
+                entries = list(payload.get("entries") or [])
+                for start in range(0, len(entries), max_entries):
+                    replacement = dict(payload)
+                    replacement["snapshotId"] = replacement_scan_id
+                    replacement["entries"] = entries[start : start + max_entries]
+                    replacement_values.append(
+                        (
+                            str(uuid.uuid4()),
+                            source_id,
+                            replacement_scan_id,
+                            sequence,
+                            f"manifest:{replacement_scan_id}:{sequence}",
+                            json.dumps(
+                                replacement,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ),
+                            now,
+                        )
+                    )
+                    sequence += 1
+            connection.executemany(
+                """
+                INSERT INTO ManifestOutbox
+                    (BatchId, SourceId, ScanId, SequenceNumber, IdempotencyKey,
+                     PayloadJson, CreatedAtUtc)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                replacement_values,
+            )
+
+            split_note = json.dumps(
+                {
+                    "reason": "SplitAfterApiTimeout",
+                    "replacementScanId": replacement_scan_id,
+                    "maxEntries": max_entries,
+                },
+                sort_keys=True,
+            )
+            connection.executemany(
+                """
+                UPDATE ManifestOutbox
+                SET State = 'Discarded', FailureJson = ?, DiscardedAtUtc = ?
+                WHERE BatchId = ? AND State = 'Pending'
+                """,
+                (
+                    (split_note, now, batch_id)
+                    for batch_id, _scan_id, _payload in oversized
+                ),
+            )
+            original_scan_ids = {
+                scan_id for _batch_id, scan_id, _payload in oversized
+            }
+            connection.executemany(
+                """
+                UPDATE ScanRun
+                SET Status = 'SplitForApiTimeout'
+                WHERE ScanId = ?
+                """,
+                ((scan_id,) for scan_id in original_scan_ids),
+            )
+        return len(oversized), sequence
 
     def acknowledge_batch(
         self,

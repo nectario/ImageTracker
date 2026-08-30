@@ -38,8 +38,9 @@ The deployed Local core provides:
   deduplication in MySQL.
 - EXIF photo metadata and GPS extraction; `ffprobe` adds available video
   dimensions, duration, capture time, and embedded coordinates when installed.
-- Batched manifest upserts and explicit deletion events with durable local
-  outbox state, stable idempotency keys, and safe interruption recovery.
+- Timeout-safe 100-row manifest upserts and explicit deletion events with
+  durable local outbox state, stable idempotency keys, automatic splitting of
+  older oversized requests, and safe interruption recovery.
 - Authenticated change-feed, media timeline/search/detail, and processing-job
   API surfaces.
 - Read-only legacy `ImageAsset` audit and paged migration preview.
