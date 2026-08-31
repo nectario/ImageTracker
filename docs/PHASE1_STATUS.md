@@ -40,15 +40,24 @@ manifests resume before optional scene enrichment, retryable preview deferrals
 no longer produce a false failure exit, and a per-source process lock prevents
 overlapping CLI syncs.
 
-The 2026-08-30 repository fast path, validated but not yet deployed, removes
-the next bottleneck inside each hash-enriched manifest transaction. Existing
-descriptions and jobs are prefetched once, new hash-addressed assets are
-prepared as a batch, and new occurrences, description jobs, and their change
-rows flush at batch boundaries instead of repeatedly per photo. A 50-photo
-regression test bounds the manifest to six SELECT statements, and mixed valid
-and rejected entries retain their original outcomes without creating stray
-assets, occurrences, or jobs. Production MySQL latency remains to be measured
-after an authorized deployment.
+The 2026-08-30 repository fast path was deployed to production at 02:18 UTC on
+2026-08-31. Existing descriptions and jobs are prefetched once, new
+hash-addressed assets are prepared as a batch, and new occurrences,
+description jobs, and their change rows flush at batch boundaries instead of
+repeatedly per photo. A 50-photo regression test bounds the manifest to six
+SELECT statements, and mixed valid and rejected entries retain their original
+outcomes without creating stray assets, occurrences, or jobs.
+
+Two bounded production runs then exercised 16 new 100-entry manifests plus one
+idempotent replay. The new non-replay calls averaged 8.91 seconds and peaked at
+16.28 seconds, compared with 10.10 seconds average and 18.07 seconds maximum
+for the final 36 successful pre-deployment manifests: a measured improvement
+of about 12 percent on this mixed workload. All post-deployment API requests
+avoided 5xx responses, the local manifest failure count remained zero, and an
+interrupted committed request replayed safely. This is a useful reduction, but
+not yet the desired WOW result; MySQL auto-increment/ORM insert work now
+dominates, so the next large gain requires a truly set-based staging-table or
+asynchronous bulk-ingest path.
 
 ## Scope delivered in the repository
 
