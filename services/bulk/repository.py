@@ -1061,41 +1061,41 @@ class MySqlManifestImportRepository:
               AND Later.StageId IS NULL
             ON DUPLICATE KEY UPDATE
                 LocationDisplayName = IF(
-                    Latitude <=> VALUES(Latitude)
-                    AND Longitude <=> VALUES(Longitude), LocationDisplayName, NULL),
+                    MediaLocation.Latitude <=> VALUES(Latitude)
+                    AND MediaLocation.Longitude <=> VALUES(Longitude), MediaLocation.LocationDisplayName, NULL),
                 StreetAddress = IF(
-                    Latitude <=> VALUES(Latitude)
-                    AND Longitude <=> VALUES(Longitude), StreetAddress, NULL),
+                    MediaLocation.Latitude <=> VALUES(Latitude)
+                    AND MediaLocation.Longitude <=> VALUES(Longitude), MediaLocation.StreetAddress, NULL),
                 OriginalStreetNumber = IF(
-                    Latitude <=> VALUES(Latitude)
-                    AND Longitude <=> VALUES(Longitude), OriginalStreetNumber, NULL),
+                    MediaLocation.Latitude <=> VALUES(Latitude)
+                    AND MediaLocation.Longitude <=> VALUES(Longitude), MediaLocation.OriginalStreetNumber, NULL),
                 Neighborhood = IF(
-                    Latitude <=> VALUES(Latitude)
-                    AND Longitude <=> VALUES(Longitude), Neighborhood, NULL),
-                City = IF(Latitude <=> VALUES(Latitude)
-                    AND Longitude <=> VALUES(Longitude), City, NULL),
-                County = IF(Latitude <=> VALUES(Latitude)
-                    AND Longitude <=> VALUES(Longitude), County, NULL),
-                State = IF(Latitude <=> VALUES(Latitude)
-                    AND Longitude <=> VALUES(Longitude), State, NULL),
-                PostalCode = IF(Latitude <=> VALUES(Latitude)
-                    AND Longitude <=> VALUES(Longitude), PostalCode, NULL),
-                Country = IF(Latitude <=> VALUES(Latitude)
-                    AND Longitude <=> VALUES(Longitude), Country, NULL),
-                CountryCode = IF(Latitude <=> VALUES(Latitude)
-                    AND Longitude <=> VALUES(Longitude), CountryCode, NULL),
-                Provider = IF(Latitude <=> VALUES(Latitude)
-                    AND Longitude <=> VALUES(Longitude), Provider, NULL),
-                ProviderPlaceId = IF(Latitude <=> VALUES(Latitude)
-                    AND Longitude <=> VALUES(Longitude), ProviderPlaceId, NULL),
-                NormalizationRuleVersion = IF(Latitude <=> VALUES(Latitude)
-                    AND Longitude <=> VALUES(Longitude), NormalizationRuleVersion, NULL),
-                Confidence = IF(Latitude <=> VALUES(Latitude)
-                    AND Longitude <=> VALUES(Longitude), Confidence, NULL),
-                RawProviderJson = IF(Latitude <=> VALUES(Latitude)
-                    AND Longitude <=> VALUES(Longitude), RawProviderJson, NULL),
-                ProviderUpdatedAtUtc = IF(Latitude <=> VALUES(Latitude)
-                    AND Longitude <=> VALUES(Longitude), ProviderUpdatedAtUtc, NULL),
+                    MediaLocation.Latitude <=> VALUES(Latitude)
+                    AND MediaLocation.Longitude <=> VALUES(Longitude), MediaLocation.Neighborhood, NULL),
+                City = IF(MediaLocation.Latitude <=> VALUES(Latitude)
+                    AND MediaLocation.Longitude <=> VALUES(Longitude), MediaLocation.City, NULL),
+                County = IF(MediaLocation.Latitude <=> VALUES(Latitude)
+                    AND MediaLocation.Longitude <=> VALUES(Longitude), MediaLocation.County, NULL),
+                State = IF(MediaLocation.Latitude <=> VALUES(Latitude)
+                    AND MediaLocation.Longitude <=> VALUES(Longitude), MediaLocation.State, NULL),
+                PostalCode = IF(MediaLocation.Latitude <=> VALUES(Latitude)
+                    AND MediaLocation.Longitude <=> VALUES(Longitude), MediaLocation.PostalCode, NULL),
+                Country = IF(MediaLocation.Latitude <=> VALUES(Latitude)
+                    AND MediaLocation.Longitude <=> VALUES(Longitude), MediaLocation.Country, NULL),
+                CountryCode = IF(MediaLocation.Latitude <=> VALUES(Latitude)
+                    AND MediaLocation.Longitude <=> VALUES(Longitude), MediaLocation.CountryCode, NULL),
+                Provider = IF(MediaLocation.Latitude <=> VALUES(Latitude)
+                    AND MediaLocation.Longitude <=> VALUES(Longitude), MediaLocation.Provider, NULL),
+                ProviderPlaceId = IF(MediaLocation.Latitude <=> VALUES(Latitude)
+                    AND MediaLocation.Longitude <=> VALUES(Longitude), MediaLocation.ProviderPlaceId, NULL),
+                NormalizationRuleVersion = IF(MediaLocation.Latitude <=> VALUES(Latitude)
+                    AND MediaLocation.Longitude <=> VALUES(Longitude), MediaLocation.NormalizationRuleVersion, NULL),
+                Confidence = IF(MediaLocation.Latitude <=> VALUES(Latitude)
+                    AND MediaLocation.Longitude <=> VALUES(Longitude), MediaLocation.Confidence, NULL),
+                RawProviderJson = IF(MediaLocation.Latitude <=> VALUES(Latitude)
+                    AND MediaLocation.Longitude <=> VALUES(Longitude), MediaLocation.RawProviderJson, NULL),
+                ProviderUpdatedAtUtc = IF(MediaLocation.Latitude <=> VALUES(Latitude)
+                    AND MediaLocation.Longitude <=> VALUES(Longitude), MediaLocation.ProviderUpdatedAtUtc, NULL),
                 Latitude = VALUES(Latitude), Longitude = VALUES(Longitude),
                 AltitudeMeters = VALUES(AltitudeMeters),
                 AccuracyMeters = VALUES(AccuracyMeters),

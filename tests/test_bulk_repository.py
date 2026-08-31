@@ -307,7 +307,41 @@ def test_location_merge_preserves_resolved_evidence_and_jobs_filter_unresolved()
     statements = [sql for sql, _ in connection.cursor_value.calls]
     location = next(sql for sql in statements if sql.startswith("INSERT INTO MediaLocation"))
     assert "LocationDisplayName = IF(" in location
-    assert "Latitude <=> VALUES(Latitude)" in location
+    latitude_comparison = "Latitude <=> VALUES(Latitude)"
+    longitude_comparison = "Longitude <=> VALUES(Longitude)"
+    assert "MediaLocation.Latitude <=> VALUES(Latitude)" in location
+    assert "MediaLocation.Longitude <=> VALUES(Longitude)" in location
+    assert location.count(latitude_comparison) == location.count(
+        f"MediaLocation.{latitude_comparison}"
+    )
+    assert location.count(longitude_comparison) == location.count(
+        f"MediaLocation.{longitude_comparison}"
+    )
+    preserved_location_fields = (
+        "LocationDisplayName",
+        "StreetAddress",
+        "OriginalStreetNumber",
+        "Neighborhood",
+        "City",
+        "County",
+        "State",
+        "PostalCode",
+        "Country",
+        "CountryCode",
+        "Provider",
+        "ProviderPlaceId",
+        "NormalizationRuleVersion",
+        "Confidence",
+        "RawProviderJson",
+        "ProviderUpdatedAtUtc",
+    )
+    assert all(
+        f"MediaLocation.{field}, NULL)" in location
+        for field in preserved_location_fields
+    )
+    assert location.index("ProviderUpdatedAtUtc = IF") < location.index(
+        "Latitude = VALUES(Latitude)"
+    )
     geocode = [sql for sql in statements if "'geocode:'" in sql]
     assert geocode
     assert all("StoredLocation.Provider IS NULL" in sql for sql in geocode)
