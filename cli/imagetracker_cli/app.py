@@ -645,6 +645,18 @@ def sync(
             ),
         ),
     ] = "auto",
+    bulk_max_rows: Annotated[
+        int | None,
+        typer.Option(
+            "--bulk-max-rows",
+            min=100,
+            max=250_000,
+            help=(
+                "Process at most this many rows in one bulk segment, then stop "
+                "with remaining batches saved. Intended for staged rollouts."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Synchronize Local metadata with safe deletion detection."""
 
@@ -676,6 +688,7 @@ def sync(
                     with_enrichment=with_enrichment,
                     enrichment_limit=DEFAULT_ENRICHMENT_LIMIT,
                     transport=transport,
+                    bulk_max_rows=bulk_max_rows,
                 )
                 if json_output:
                     _emit(summary.as_dict())

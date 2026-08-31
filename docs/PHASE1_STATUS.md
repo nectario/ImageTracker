@@ -70,13 +70,15 @@ uses bulk above 10 batches or 1,000 eligible rows and preserves the existing
 batch outbox for all fallbacks. Ordinary sync is metadata-only; paid preview
 staging now requires `enrich --limit N` or `--with-enrichment` explicitly.
 
-The complete candidate passes 360 tests, validates 33 OpenAPI operations/93
+The complete candidate passes 361 tests, validates 33 OpenAPI operations/93
 schemas/29 paths, and produces a valid production CloudFormation/Lambda
 package. The remaining release gate is intentionally operational: apply
 migration 014 with the existing administrative MySQL credential, run a tiny
 disposable real-MySQL canary, inspect its rows/result/CloudWatch duration, then
 scale through 1,000 and 10,000 rows before allowing the saved production
 backlog to use bulk transport.
+The CLI supports that gate directly through `--bulk-max-rows`; a completed
+segment stops before rescanning and leaves uncaptured batches pending.
 
 ## Scope delivered in the repository
 

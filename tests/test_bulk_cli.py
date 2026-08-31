@@ -1025,6 +1025,44 @@ def test_sync_auto_bulk_success_applies_result_and_exposes_summary(tmp_path: Pat
     assert len(state.known_occurrences(SOURCE_ID)) == 10
 
 
+def test_bulk_row_limit_processes_one_segment_and_stops_before_rescan(
+    tmp_path: Path,
+):
+    state = _bound_state(tmp_path)
+    entries = [_entry(index) for index in range(200)]
+    _queue_transport_batches(state, entries, batches=20)
+    pending = state.pending_batches(SOURCE_ID)
+    captured_entries = [
+        dict(entry)
+        for batch in pending[:10]
+        for entry in (batch.payload.get("entries") or [])
+    ]
+    assert len(captured_entries) == 100
+    result_path = tmp_path / "segment-result.gz"
+    _server_result(result_path, captured_entries)
+    api = _BulkTransportApi(result_path)
+    scanner = _NoopScanner()
+
+    summary = SyncEngine(  # type: ignore[arg-type]
+        api,
+        state,
+        scanner,
+        sleep=lambda _seconds: None,
+    ).sync(
+        state.resolve_binding(SOURCE_ID),
+        transport="bulk",
+        bulk_max_rows=100,
+    )
+
+    assert summary.bulk_completed is True
+    assert summary.bulk_total == 100
+    assert summary.queued_batches == 10
+    assert api.create_payload is not None
+    assert api.create_payload["entryCount"] == 100
+    assert state.pending_count() == 10
+    assert scanner.calls == 0
+
+
 def test_sync_bulk_resumes_after_transient_poll_without_reupload(tmp_path: Path):
     state = _bound_state(tmp_path)
     entries = [_entry(1)]

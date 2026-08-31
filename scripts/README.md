@@ -19,6 +19,7 @@ Individual commands:
 ./scripts/cli.sh doctor --json
 ./scripts/cli.sh sync "My Photos"
 ./scripts/cli.sh sync "My Photos" --transport bulk
+./scripts/cli.sh sync "My Photos" --transport bulk --bulk-max-rows 1000
 ./scripts/cli.sh sync "My Photos" --transport batch
 ./scripts/cli.sh enrich "My Photos" --limit 100
 ./scripts/test.sh
@@ -45,6 +46,8 @@ stopping with `Ctrl+C` leaves completed work saved.
 eligible rows. `bulk` requests that path explicitly, while `batch` is the safe
 escape hatch for small deltas, deletions, pending hashes, or a terminal bulk
 failure. A submitted server import is never raced by batch delivery.
+Use `--bulk-max-rows 1000` or `10000` for staged production rollout; the CLI
+finishes that segment and leaves the remaining batches saved for the next run.
 
 Safety boundaries:
 

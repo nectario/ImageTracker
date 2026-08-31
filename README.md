@@ -173,6 +173,7 @@ or return to the batch path without discarding saved work:
 ```bash
 imagetracker sync "Camera Uploads" --transport auto
 imagetracker sync "Camera Uploads" --transport bulk
+imagetracker sync "Camera Uploads" --transport bulk --bulk-max-rows 1000
 imagetracker sync "Camera Uploads" --transport batch
 ```
 
@@ -181,6 +182,9 @@ the authoritative server phase before deciding whether to upload, continue,
 apply the result, or fall back. `imagetracker status --follow` shows the bulk
 phase, processed rows, percentage, and whether a value is freshly fetched or
 cached.
+`--bulk-max-rows` processes one bounded prefix and stops before rescanning, so
+production rollout can advance deliberately through 1,000-row and 10,000-row
+canaries before removing the limit.
 
 For trusted WSL administration on the shared DeepTrading infrastructure, the
 one-file path bypasses API transport batching while preserving account/source

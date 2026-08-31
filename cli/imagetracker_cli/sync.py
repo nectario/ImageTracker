@@ -129,10 +129,19 @@ class SyncEngine:
         with_enrichment: bool = False,
         enrichment_limit: int = DEFAULT_ENRICHMENT_LIMIT,
         transport: str = "auto",
+        bulk_max_rows: int | None = None,
     ) -> SyncSummary:
         self._validate_enrichment_limit(enrichment_limit)
         if transport not in {"auto", "bulk", "batch"}:
             raise ValueError("Sync transport must be auto, bulk, or batch")
+        if bulk_max_rows is not None and (
+            isinstance(bulk_max_rows, bool)
+            or not isinstance(bulk_max_rows, int)
+            or not 100 <= bulk_max_rows <= 250_000
+        ):
+            raise ValueError("Bulk row limit must be between 100 and 250000")
+        if transport == "batch" and bulk_max_rows is not None:
+            raise ValueError("--bulk-max-rows cannot be used with batch transport")
         summary = SyncSummary(
             source_id=binding.source_id,
             root_path=binding.root_path,
@@ -149,7 +158,12 @@ class SyncEngine:
         summary.resumed_batches = len(pending)
         if pending and not dry_run:
             self.progress(f"Resuming {len(pending)} saved manifest batch(es)")
-            if not self._deliver_pending(binding, summary, transport=transport):
+            if not self._deliver_pending(
+                binding,
+                summary,
+                transport=transport,
+                bulk_max_rows=bulk_max_rows,
+            ):
                 self._add_description_attention_counts(
                     binding,
                     summary,
@@ -249,7 +263,12 @@ class SyncEngine:
             summary={**scan.summary(), "upserts": len(changed_entries), "deletions": len(deleted_entries)},
         )
         summary.queued_batches = len(batches)
-        if not self._deliver_pending(binding, summary, transport=transport):
+        if not self._deliver_pending(
+            binding,
+            summary,
+            transport=transport,
+            bulk_max_rows=bulk_max_rows,
+        ):
             self._add_description_attention_counts(
                 binding,
                 summary,
@@ -301,6 +320,7 @@ class SyncEngine:
         summary: SyncSummary,
         *,
         transport: str,
+        bulk_max_rows: int | None,
     ) -> bool:
         active = self.state.active_bulk_manifest(binding.source_id)
         if active is not None:
@@ -319,7 +339,7 @@ class SyncEngine:
             if outcome == "Paused":
                 return False
             if outcome == "Complete":
-                return True
+                return self._bulk_segment_finished(binding, summary)
             self.progress(
                 "Bulk metadata import could not complete cleanly · "
                 "falling back to timeout-safe batches"
@@ -333,18 +353,22 @@ class SyncEngine:
         if transport == "batch":
             return self._flush_pending(binding, summary)
 
+        selected_batches = self._bounded_bulk_batches(
+            batches,
+            maximum_rows=bulk_max_rows,
+        )
         entries = [
             dict(entry)
-            for batch in batches
+            for batch in selected_batches
             for entry in (batch.payload.get("entries") or [])
         ]
         threshold_met = (
-            len(batches) >= BULK_AUTO_BATCH_THRESHOLD
+            len(selected_batches) >= BULK_AUTO_BATCH_THRESHOLD
             or len(entries) >= BULK_AUTO_ROW_THRESHOLD
         )
         if transport == "auto" and not threshold_met:
             return self._flush_pending(binding, summary)
-        if not self._bulk_entries_eligible(batches, entries):
+        if not self._bulk_entries_eligible(selected_batches, entries):
             self.progress(
                 "Bulk metadata requires hash-enriched additions only · "
                 "using timeout-safe batches for deletions or pending hashes"
@@ -364,12 +388,12 @@ class SyncEngine:
                 snapshot_id=snapshot_id,
                 entries=entries,
                 permission_state=str(
-                    batches[0].payload.get("permissionState")
+                    selected_batches[0].payload.get("permissionState")
                     or "NotApplicable"
                 ),
                 client_cursor=(
-                    str(batches[0].payload["clientCursor"])
-                    if batches[0].payload.get("clientCursor") is not None
+                    str(selected_batches[0].payload["clientCursor"])
+                    if selected_batches[0].payload.get("clientCursor") is not None
                     else None
                 ),
             )
@@ -380,7 +404,9 @@ class SyncEngine:
                 artifact_sha256=artifact.compressed_sha256,
                 artifact_bytes=artifact.compressed_bytes,
                 entry_count=artifact.entry_count,
-                superseded_batch_ids=tuple(batch.batch_id for batch in batches),
+                superseded_batch_ids=tuple(
+                    batch.batch_id for batch in selected_batches
+                ),
             )
         except (BulkArtifactError, OSError, ValueError) as exc:
             self.progress(
@@ -398,12 +424,48 @@ class SyncEngine:
         if outcome == "Paused":
             return False
         if outcome == "Complete":
-            return True
+            return self._bulk_segment_finished(binding, summary)
         self.progress(
             "Bulk metadata import could not complete cleanly · "
             "falling back to timeout-safe batches"
         )
         return self._flush_pending(binding, summary)
+
+    @staticmethod
+    def _bounded_bulk_batches(
+        batches: Sequence[OutboxBatch],
+        *,
+        maximum_rows: int | None,
+    ) -> list[OutboxBatch]:
+        if maximum_rows is None:
+            return list(batches)
+        selected: list[OutboxBatch] = []
+        rows = 0
+        for batch in batches:
+            batch_rows = len(batch.payload.get("entries") or [])
+            if selected and rows + batch_rows > maximum_rows:
+                break
+            if not selected and batch_rows > maximum_rows:
+                selected.append(batch)
+                break
+            selected.append(batch)
+            rows += batch_rows
+        return selected
+
+    def _bulk_segment_finished(
+        self,
+        binding: SourceBinding,
+        summary: SyncSummary,
+    ) -> bool:
+        remaining = len(self.state.pending_batches(binding.source_id))
+        summary.queued_batches = remaining
+        if remaining:
+            self.progress(
+                "Bulk metadata segment complete · "
+                f"{remaining} saved batch(es) remain; rerun sync to continue"
+            )
+            return False
+        return True
 
     def _escape_active_bulk_to_batch(
         self,
