@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from functools import lru_cache
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from services.enrichment.openai_scene import scene_description_maximum_cost_usd
 
 
 class AppSettings(BaseSettings):
@@ -52,7 +55,22 @@ class AppSettings(BaseSettings):
     )
     scene_description_max_words: int = Field(default=24, ge=8, le=24)
     scene_description_monthly_call_limit: int = Field(
-        default=1000, ge=0, le=100000
+        default=100000, ge=0, le=100000
+    )
+    scene_description_monthly_usd_limit: Decimal = Field(
+        default=Decimal("230.000000"), ge=0, le=Decimal("10000")
+    )
+    scene_description_reserved_usd_per_request: Decimal = Field(
+        default=Decimal("0.010000"), gt=0, le=Decimal("100")
+    )
+    scene_description_input_usd_per_million: Decimal = Field(
+        default=Decimal("2.000000"), ge=0, le=Decimal("1000")
+    )
+    scene_description_cached_input_usd_per_million: Decimal = Field(
+        default=Decimal("0.200000"), ge=0, le=Decimal("1000")
+    )
+    scene_description_output_usd_per_million: Decimal = Field(
+        default=Decimal("12.000000"), ge=0, le=Decimal("1000")
     )
     api_url: str = ""
     log_level: str = Field(default="INFO", pattern=r"^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$")
@@ -63,6 +81,29 @@ class AppSettings(BaseSettings):
         if value != "ImageTracker":
             raise ValueError("The app service may connect only to the ImageTracker database")
         return value
+
+    @model_validator(mode="after")
+    def validate_scene_cost_guardrail(self) -> "AppSettings":
+        if (
+            self.scene_description_monthly_usd_limit > 0
+            and self.scene_description_reserved_usd_per_request
+            > self.scene_description_monthly_usd_limit
+        ):
+            raise ValueError(
+                "The scene-description request reservation exceeds its monthly USD limit"
+            )
+        required_reservation = scene_description_maximum_cost_usd(
+            input_usd_per_million=self.scene_description_input_usd_per_million,
+            cached_input_usd_per_million=(
+                self.scene_description_cached_input_usd_per_million
+            ),
+            output_usd_per_million=self.scene_description_output_usd_per_million,
+        )
+        if self.scene_description_reserved_usd_per_request < required_reservation:
+            raise ValueError(
+                "The scene-description USD reservation is below the maximum request cost"
+            )
+        return self
 
 
 @lru_cache(maxsize=1)

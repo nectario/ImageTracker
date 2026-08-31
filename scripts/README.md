@@ -25,6 +25,8 @@ Individual commands:
 ./scripts/api-smoke.sh
 ./scripts/aws-smoke.sh
 ./scripts/db-smoke.sh
+./scripts/bulk-db-canary.sh
+./scripts/bulk-db-canary.sh --apply
 ./scripts/package-infra.sh
 ./scripts/store-openai-key.sh
 ./scripts/migrate-db.sh
@@ -50,6 +52,14 @@ Safety boundaries:
   unauthenticated API health request to return HTTP 401.
 - `db-smoke.sh` retrieves the dedicated application credential from SSM in
   memory and opens an explicitly read-only transaction. It prints counts only.
+- `bulk-db-canary.sh` is a WSL-only, self-cleaning acceptance test for the
+  set-based MySQL importer. It is read-only by default. `--apply` requires
+  migration 014, exactly one active account, the SSM-scoped ImageTracker app
+  credential, and an empty UUID-prefixed synthetic target. It imports exactly
+  four no-GPS `.nef` metadata rows, verifies two assets, three occurrences, one
+  rejected row, zero jobs/locations/uploads, and terminal redelivery safety,
+  then deletes only those exact synthetic public IDs, hashes, and source keys
+  in an assertion-guarded transaction. It never accepts or targets `My Photos`.
 - `package-infra.sh` builds ignored `.build` output and never deploys it.
 - `store-openai-key.sh` copies a non-empty `OPENAI_API_KEY` from the current
   WSL process into the ignored repository `.env` without displaying it. It does

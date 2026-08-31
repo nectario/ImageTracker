@@ -62,6 +62,21 @@ def build_default_processor(
         scene_description_monthly_call_limit=(
             selected_settings.scene_description_monthly_call_limit
         ),
+        scene_description_monthly_usd_limit=(
+            selected_settings.scene_description_monthly_usd_limit
+        ),
+        scene_description_reserved_usd_per_request=(
+            selected_settings.scene_description_reserved_usd_per_request
+        ),
+        scene_description_input_usd_per_million=(
+            selected_settings.scene_description_input_usd_per_million
+        ),
+        scene_description_cached_input_usd_per_million=(
+            selected_settings.scene_description_cached_input_usd_per_million
+        ),
+        scene_description_output_usd_per_million=(
+            selected_settings.scene_description_output_usd_per_million
+        ),
         location_normalizer=location_normalizer,
     )
 
@@ -103,6 +118,19 @@ def build_default_processor(
             ),
             monthly_call_limit=(
                 selected_settings.scene_description_monthly_call_limit
+            ),
+            monthly_usd_limit=selected_settings.scene_description_monthly_usd_limit,
+            reserved_usd_per_request=(
+                selected_settings.scene_description_reserved_usd_per_request
+            ),
+            input_usd_per_million=(
+                selected_settings.scene_description_input_usd_per_million
+            ),
+            cached_input_usd_per_million=(
+                selected_settings.scene_description_cached_input_usd_per_million
+            ),
+            output_usd_per_million=(
+                selected_settings.scene_description_output_usd_per_million
             ),
         )
 

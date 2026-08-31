@@ -73,9 +73,13 @@ only `geo-places:ReverseGeocode`, scoped to the regional
 `provider/default` resource.
 
 Scene descriptions use `gpt-5.6-terra` with high-detail, 1024-pixel previews,
-Flex processing, and a separate 1,000-call per-user monthly ceiling. Local
-originals remain on-device; only metadata-free temporary JPEG previews enter
-the one-day staging prefix.
+Flex processing, a 100,000-request safety ceiling, and a harder USD 230
+per-user monthly ceiling. Before staging, MySQL atomically reserves one request
+and USD 0.010. After a provider attempt, the worker charges sanitized usage at
+USD 2.00/M ordinary input tokens, USD 0.20/M cached input tokens, and USD
+12.00/M output tokens; a missing usage report or called-provider failure is
+charged the conservative reservation. Local originals remain on-device; only
+metadata-free temporary JPEG previews enter the one-day staging prefix.
 
 Geocode jobs use the Lambda execution role rather than a provider key. The
 worker lazily reads `/imagetracker/<stage>/openai` only for description jobs, so
@@ -156,6 +160,7 @@ cd /mnt/c/Development/Projects/ImageTracker
 ./scripts/migrate-db.sh
 ./scripts/migrate-db.sh --apply
 ./scripts/db-smoke.sh
+./scripts/bulk-db-canary.sh
 ```
 
 Migration 012 adds the provider circuit columns, migration 013 widens
@@ -166,6 +171,20 @@ reconciles DDL that committed before its ledger marker. The earlier table-
 rewriting ALTERs still require processing to be idle; migration 014 uses
 replay-safe `CREATE TABLE IF NOT EXISTS` statements and a `LOCK=NONE` index, so
 queued enrichment jobs do not block that additive rollout.
+
+After migration 014 is present, preview the dedicated bulk database canary and
+then opt into its self-cleaning synthetic write:
+
+```bash
+./scripts/bulk-db-canary.sh
+./scripts/bulk-db-canary.sh --apply
+```
+
+The canary uses only the application SSM MySQL credential. It refuses anything
+other than one active account and a fresh UUID-prefixed synthetic Local source,
+uses four no-GPS `.nef` rows so no provider work or uploads are created, and
+rolls back cleanup rather than broadening beyond its exact IDs and hashes. It
+does not accept a source argument and cannot target `My Photos`.
 
 Bulk manifests use the existing private media bucket under `manifests/input/`
 and `manifests/result/`, plus a dedicated encrypted queue, dead-letter queue,

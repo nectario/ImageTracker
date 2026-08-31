@@ -11,6 +11,7 @@ EXPECTED_SCRIPTS = {
     "_common.sh",
     "api-smoke.sh",
     "aws-smoke.sh",
+    "bulk-db-canary.sh",
     "cli.sh",
     "db-smoke.sh",
     "package-infra.sh",
@@ -65,6 +66,16 @@ def test_mysql_one_file_wrapper_is_explicit_and_not_in_playground():
     assert "mysql_one_file_import.py" in text
     assert '"$@"' in text
     assert "mysql-one-file-import" not in (SCRIPTS / "play.sh").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_bulk_db_canary_is_explicit_dry_run_wrapper_not_in_playground():
+    text = (SCRIPTS / "bulk-db-canary.sh").read_text(encoding="utf-8")
+    assert "live_bulk_mysql_canary.py" in text
+    assert '"$@"' in text
+    assert "--apply" not in text
+    assert "bulk-db-canary" not in (SCRIPTS / "play.sh").read_text(
         encoding="utf-8"
     )
 

@@ -178,7 +178,15 @@ def test_worker_infrastructure_is_bounded_and_schedules_stay_disabled():
     assert "IMAGETRACKER_GEOCODE_MONTHLY_CALL_LIMIT: '1000'" in serverless
     assert "IMAGETRACKER_SCENE_DESCRIPTION_MODEL: gpt-5.6-terra" in serverless
     assert "IMAGETRACKER_SCENE_DESCRIPTION_SERVICE_TIER: flex" in serverless
-    assert "IMAGETRACKER_SCENE_DESCRIPTION_MONTHLY_CALL_LIMIT: '1000'" in serverless
+    assert "IMAGETRACKER_SCENE_DESCRIPTION_MONTHLY_CALL_LIMIT: '100000'" in serverless
+    assert "IMAGETRACKER_SCENE_DESCRIPTION_MONTHLY_USD_LIMIT: '230.000000'" in serverless
+    assert "IMAGETRACKER_SCENE_DESCRIPTION_RESERVED_USD_PER_REQUEST: '0.010000'" in serverless
+    assert "IMAGETRACKER_SCENE_DESCRIPTION_INPUT_USD_PER_MILLION: '2.000000'" in serverless
+    assert (
+        "IMAGETRACKER_SCENE_DESCRIPTION_CACHED_INPUT_USD_PER_MILLION: '0.200000'"
+        in serverless
+    )
+    assert "IMAGETRACKER_SCENE_DESCRIPTION_OUTPUT_USD_PER_MILLION: '12.000000'" in serverless
     assert serverless.count("State: ${self:custom.maintenanceSchedulesState}") == 3
     assert "retryScheduleState: ${param:retryScheduleState, 'ENABLED'}" in serverless
     assert "State: ${self:custom.retryScheduleState}" in serverless

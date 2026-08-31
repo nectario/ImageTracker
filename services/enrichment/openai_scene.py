@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_CEILING
 import json
 import re
 import socket
@@ -19,6 +20,14 @@ OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 OPENAI_SCENE_PROVIDER = "OpenAI"
 SCENE_DESCRIPTION_PROMPT_VERSION = "scene-search-v1"
 DEFAULT_SCENE_DESCRIPTION_MODEL = "gpt-5.6-terra"
+USD_QUANTUM = Decimal("0.000001")
+MAX_SAFE_USAGE_TOKENS = 10_000_000
+SCENE_HIGH_DETAIL_1024_MAX_IMAGE_TOKENS = 2_048
+SCENE_PROMPT_MAX_INPUT_TOKENS = 512
+SCENE_MAX_BILLABLE_INPUT_TOKENS = (
+    SCENE_HIGH_DETAIL_1024_MAX_IMAGE_TOKENS + SCENE_PROMPT_MAX_INPUT_TOKENS
+)
+SCENE_MAX_OUTPUT_TOKENS = 100
 
 
 @dataclass(frozen=True)
@@ -32,12 +41,120 @@ class SceneDescriptionResult:
     usage: Mapping[str, int] | None = None
 
 
+def sanitize_scene_description_usage(value: Any) -> dict[str, int] | None:
+    """Return only bounded billing fields from an untrusted provider payload."""
+
+    if not isinstance(value, Mapping):
+        return None
+    safe: dict[str, int] = {}
+
+    def add(target: str, candidate: Any) -> None:
+        if (
+            isinstance(candidate, int)
+            and not isinstance(candidate, bool)
+            and 0 <= candidate <= MAX_SAFE_USAGE_TOKENS
+        ):
+            safe[target] = candidate
+
+    add("input_tokens", value.get("input_tokens"))
+    add("output_tokens", value.get("output_tokens"))
+    add("total_tokens", value.get("total_tokens"))
+    input_details = value.get("input_tokens_details")
+    if isinstance(input_details, Mapping):
+        add("cached_input_tokens", input_details.get("cached_tokens"))
+    else:
+        add("cached_input_tokens", value.get("cached_input_tokens"))
+    output_details = value.get("output_tokens_details")
+    if isinstance(output_details, Mapping):
+        add("reasoning_output_tokens", output_details.get("reasoning_tokens"))
+    else:
+        add("reasoning_output_tokens", value.get("reasoning_output_tokens"))
+    return safe or None
+
+
+def scene_description_cost_usd(
+    usage: Mapping[str, Any] | None,
+    *,
+    input_usd_per_million: Decimal,
+    cached_input_usd_per_million: Decimal,
+    output_usd_per_million: Decimal,
+) -> tuple[Decimal, dict[str, int]] | None:
+    """Calculate a conservative six-decimal USD charge from Responses usage.
+
+    OpenAI reports cached tokens inside ``input_tokens``. Cached input is
+    therefore subtracted before applying the ordinary input rate, then billed
+    once at the cached rate. Output tokens already include reasoning tokens.
+    """
+
+    safe = sanitize_scene_description_usage(usage)
+    if safe is None or "input_tokens" not in safe or "output_tokens" not in safe:
+        return None
+    input_tokens = safe["input_tokens"]
+    cached_tokens = safe.get("cached_input_tokens", 0)
+    if (
+        cached_tokens > input_tokens
+        or input_tokens > SCENE_MAX_BILLABLE_INPUT_TOKENS
+        or safe["output_tokens"] > SCENE_MAX_OUTPUT_TOKENS
+    ):
+        return None
+    rates = (
+        input_usd_per_million,
+        cached_input_usd_per_million,
+        output_usd_per_million,
+    )
+    if any(not rate.is_finite() or rate < 0 for rate in rates):
+        raise ValueError("Scene-description rates must be finite and non-negative")
+    million = Decimal("1000000")
+    amount = (
+        Decimal(input_tokens - cached_tokens) * input_usd_per_million
+        + Decimal(cached_tokens) * cached_input_usd_per_million
+        + Decimal(safe["output_tokens"]) * output_usd_per_million
+    ) / million
+    return amount.quantize(USD_QUANTUM, rounding=ROUND_CEILING), safe
+
+
+def scene_description_usage_within_bounds(
+    usage: Mapping[str, Any] | None,
+) -> bool:
+    safe = sanitize_scene_description_usage(usage)
+    if safe is None:
+        return True
+    input_tokens = safe.get("input_tokens")
+    output_tokens = safe.get("output_tokens")
+    cached_tokens = safe.get("cached_input_tokens", 0)
+    if input_tokens is None or output_tokens is None:
+        return True
+    return (
+        cached_tokens <= input_tokens <= SCENE_MAX_BILLABLE_INPUT_TOKENS
+        and output_tokens <= SCENE_MAX_OUTPUT_TOKENS
+    )
+
+
+def scene_description_maximum_cost_usd(
+    *,
+    input_usd_per_million: Decimal,
+    cached_input_usd_per_million: Decimal,
+    output_usd_per_million: Decimal,
+) -> Decimal:
+    """Bound one 1024px/high request including prompt and 100 output tokens."""
+
+    input_rate = max(input_usd_per_million, cached_input_usd_per_million)
+    return (
+        (
+            Decimal(SCENE_MAX_BILLABLE_INPUT_TOKENS) * input_rate
+            + Decimal(SCENE_MAX_OUTPUT_TOKENS) * output_usd_per_million
+        )
+        / Decimal("1000000")
+    ).quantize(USD_QUANTUM, rounding=ROUND_CEILING)
+
+
 class SceneDescriptionProviderError(RuntimeError):
     """A sanitized provider failure safe to persist or display."""
 
-    def __init__(self, failure: ProviderFailure) -> None:
+    def __init__(self, failure: ProviderFailure, *, provider_called: bool = True) -> None:
         super().__init__(failure.user_message)
         self.failure = failure
+        self.provider_called = provider_called
 
 
 @dataclass(frozen=True)
@@ -65,6 +182,7 @@ def _failure(
     message: str,
     *,
     retryable: bool,
+    provider_called: bool = True,
 ) -> SceneDescriptionProviderError:
     return SceneDescriptionProviderError(
         ProviderFailure(
@@ -72,7 +190,8 @@ def _failure(
             code=code,
             user_message=message,
             retryable=retryable,
-        )
+        ),
+        provider_called=provider_called,
     )
 
 
@@ -235,7 +354,7 @@ class OpenAISceneDescriptionProvider:
                         ],
                     }
                 ],
-                "max_output_tokens": 100,
+                "max_output_tokens": SCENE_MAX_OUTPUT_TOKENS,
             },
             timeout_seconds=self._timeout_seconds,
         )
@@ -260,7 +379,7 @@ class OpenAISceneDescriptionProvider:
             provider=self.provider,
             model=self._model,
             prompt_version=self.prompt_version,
-            usage=self._sanitize_usage(response.payload.get("usage")),
+            usage=sanitize_scene_description_usage(response.payload.get("usage")),
         )
 
     def _current_api_key(self) -> str:
@@ -272,6 +391,7 @@ class OpenAISceneDescriptionProvider:
                 "OpenAICredentialUnavailable",
                 "Scene description is unavailable because its provider credential could not be loaded.",
                 retryable=False,
+                provider_called=False,
             )
         try:
             loaded = self._api_key_loader().strip()
@@ -283,6 +403,7 @@ class OpenAISceneDescriptionProvider:
                 "OpenAICredentialUnavailable",
                 "Scene description is unavailable because its provider credential could not be loaded.",
                 retryable=False,
+                provider_called=False,
             )
         self._api_key = loaded
         return loaded
@@ -352,25 +473,7 @@ class OpenAISceneDescriptionProvider:
 
     @staticmethod
     def _sanitize_usage(value: Any) -> Mapping[str, int] | None:
-        if not isinstance(value, Mapping):
-            return None
-
-        safe: dict[str, int] = {}
-
-        def add(target: str, candidate: Any) -> None:
-            if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0:
-                safe[target] = candidate
-
-        add("input_tokens", value.get("input_tokens"))
-        add("output_tokens", value.get("output_tokens"))
-        add("total_tokens", value.get("total_tokens"))
-        input_details = value.get("input_tokens_details")
-        if isinstance(input_details, Mapping):
-            add("cached_input_tokens", input_details.get("cached_tokens"))
-        output_details = value.get("output_tokens_details")
-        if isinstance(output_details, Mapping):
-            add("reasoning_output_tokens", output_details.get("reasoning_tokens"))
-        return safe or None
+        return sanitize_scene_description_usage(value)
 
     @staticmethod
     def _raise_for_http_status(response: JsonHttpResponse) -> None:

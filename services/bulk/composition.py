@@ -187,6 +187,21 @@ def build_default_processor(
                 description_monthly_call_limit=(
                     selected.scene_description_monthly_call_limit
                 ),
+                description_monthly_usd_limit=(
+                    selected.scene_description_monthly_usd_limit
+                ),
+                description_reserved_usd_per_request=(
+                    selected.scene_description_reserved_usd_per_request
+                ),
+                description_input_usd_per_million=(
+                    selected.scene_description_input_usd_per_million
+                ),
+                description_cached_input_usd_per_million=(
+                    selected.scene_description_cached_input_usd_per_million
+                ),
+                description_output_usd_per_million=(
+                    selected.scene_description_output_usd_per_million
+                ),
             ),
         ),
         job_dispatcher=processing_dispatcher,

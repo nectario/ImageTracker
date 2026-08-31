@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import Enum
 from typing import Any, Mapping, Protocol
 from uuid import UUID
@@ -64,6 +65,11 @@ class DescriptionJob:
     lease_owner: str
     attempt_count: int
     max_attempts: int
+    monthly_usd_limit: Decimal = Decimal("230.000000")
+    reserved_usd_per_request: Decimal = Decimal("0.010000")
+    input_usd_per_million: Decimal = Decimal("2.000000")
+    cached_input_usd_per_million: Decimal = Decimal("0.200000")
+    output_usd_per_million: Decimal = Decimal("12.000000")
 
 
 @dataclass(frozen=True)

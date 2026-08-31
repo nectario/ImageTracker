@@ -83,6 +83,21 @@ class LazyConfiguredPhase1Service:
                             scene_description_monthly_call_limit=(
                                 self._settings.scene_description_monthly_call_limit
                             ),
+                            scene_description_monthly_usd_limit=(
+                                self._settings.scene_description_monthly_usd_limit
+                            ),
+                            scene_description_reserved_usd_per_request=(
+                                self._settings.scene_description_reserved_usd_per_request
+                            ),
+                            scene_description_input_usd_per_million=(
+                                self._settings.scene_description_input_usd_per_million
+                            ),
+                            scene_description_cached_input_usd_per_million=(
+                                self._settings.scene_description_cached_input_usd_per_million
+                            ),
+                            scene_description_output_usd_per_million=(
+                                self._settings.scene_description_output_usd_per_million
+                            ),
                             scene_description_model=(
                                 self._settings.scene_description_model
                             ),

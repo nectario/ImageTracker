@@ -53,7 +53,10 @@ The deployed enrichment build adds:
   is within 5 metres.
 - Automatic photo scene descriptions using `gpt-5.6-terra`, high image detail,
   Flex processing, reasoning effort `none`, and a versioned search prompt
-  capped at 24 words.
+  capped at 24 words. Each provider attempt reserves both one request and
+  USD 0.010 before staging; the worker reconciles that reservation to sanitized
+  token usage at USD 2.00/M input, USD 0.20/M cached input, and USD 12.00/M
+  output. The per-user monthly USD ceiling is USD 230.
 - A durable CLI scene-preview outbox, signed temporary uploads, bounded SQS
   processing, quota deferral, visible retry states, and safe staging cleanup.
 
@@ -332,9 +335,11 @@ are separate from the Phase 1 legacy migration preview.
   Responses API request uses `store: false`; the worker deletes the S3 preview
   after a safe terminal outcome, and the bucket's one-day lifecycle rule is the
   cleanup backstop.
-- Scene descriptions have their own 1,000-call per-user monthly hard ceiling.
-  Requests are reserved before a preview upload URL is issued, Flex processing
-  lowers unit cost, and the single-concurrency worker prevents request bursts.
+- Scene descriptions have a 100,000-call secondary ceiling and a harder USD
+  230 per-user monthly ceiling. Each attempt reserves USD 0.010 before a
+  preview upload URL is issued, then settles against bounded provider usage;
+  Flex processing lowers unit cost and single-worker concurrency prevents
+  request bursts.
 - A Local asset remains `LocalOnly`: its path remains the original reference,
   while its durable S3 bucket, original-object key, and preview-object key stay
   null. Temporary staging does not silently convert it to Remote mode.
@@ -367,6 +372,9 @@ The production geocode controls are deliberately small and explicit:
 ```text
 IMAGETRACKER_GEOCODE_REUSE_RADIUS_METERS=5
 IMAGETRACKER_GEOCODE_MONTHLY_CALL_LIMIT=1000
+IMAGETRACKER_SCENE_DESCRIPTION_MONTHLY_CALL_LIMIT=100000
+IMAGETRACKER_SCENE_DESCRIPTION_MONTHLY_USD_LIMIT=230.000000
+IMAGETRACKER_SCENE_DESCRIPTION_RESERVED_USD_PER_REQUEST=0.010000
 ```
 
 ## Architecture boundaries

@@ -70,7 +70,7 @@ uses bulk above 10 batches or 1,000 eligible rows and preserves the existing
 batch outbox for all fallbacks. Ordinary sync is metadata-only; paid preview
 staging now requires `enrich --limit N` or `--with-enrichment` explicitly.
 
-The complete candidate passes 341 tests, validates 33 OpenAPI operations/93
+The complete candidate passes 360 tests, validates 33 OpenAPI operations/93
 schemas/29 paths, and produces a valid production CloudFormation/Lambda
 package. The remaining release gate is intentionally operational: apply
 migration 014 with the existing administrative MySQL credential, run a tiny
@@ -116,9 +116,13 @@ backlog to use bulk transport.
   reasoning effort `none`, `store: false`, prompt version `scene-search-v1`,
   and at most 24 words. Provider/model/prompt provenance is stored with the
   resulting description.
-- Scene requests have a separate 1,000-call per-user monthly hard limit.
-  Reservation happens before the service issues an upload URL, so quota
-  exhaustion does not cause the CLI to stage an unbounded backlog.
+- Scene requests reserve both one request and USD 0.010 before the service
+  issues an upload URL. A 100,000-request ceiling remains as a secondary
+  guardrail, while the hard per-user monthly spend ceiling is USD 230. Success
+  reconciles the reservation from sanitized input/cached-input/output usage at
+  USD 2.00/M, USD 0.20/M, and USD 12.00/M respectively. Missing usage or a
+  called-provider failure consumes the conservative USD reservation; failures
+  before a provider call release it.
 - The worker deletes the staging preview after successful or safe terminal
   processing. A one-day S3 lifecycle policy handles cleanup if an immediate
   delete fails.
@@ -166,7 +170,9 @@ and the existing MySQL database.
   and has a 1,000-call monthly per-user ceiling. At the 2026-08-28 `us-east-2`
   list price, that caps this component at about USD 4 per user per month.
 - OpenAI scene descriptions use reduced 1,024-pixel previews, Flex processing,
-  and an independent 1,000-call monthly per-user ceiling.
+  a 100,000-call secondary ceiling, and a harder USD 230 monthly per-user
+  ceiling enforced through conservative pre-call reservation and actual usage
+  settlement.
 - Exact deduplication avoids repeated asset records now and repeated S3
   originals when Remote mode is implemented.
 - The existing tag-filtered USD 50 monthly AWS budget remains the initial

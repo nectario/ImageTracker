@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from decimal import Decimal
 from threading import Lock
 from typing import Any, Callable, Mapping
 from uuid import UUID
@@ -15,6 +16,7 @@ from services.enrichment.normalization import LocationNormalizer
 from services.enrichment.openai_scene import (
     OpenAISceneDescriptionProvider,
     SceneDescriptionProviderError,
+    scene_description_maximum_cost_usd,
 )
 from services.worker.contracts import (
     DescriptionCleanupDecision,
@@ -184,11 +186,35 @@ class DescriptionMessageProcessor:
         repository: DescriptionJobRepository,
         provider: OpenAISceneDescriptionProvider,
         preview_store: ScenePreviewStore,
-        monthly_call_limit: int = 1_000,
+        monthly_call_limit: int = 100_000,
+        monthly_usd_limit: Decimal = Decimal("230.000000"),
+        reserved_usd_per_request: Decimal = Decimal("0.010000"),
+        input_usd_per_million: Decimal = Decimal("2.000000"),
+        cached_input_usd_per_million: Decimal = Decimal("0.200000"),
+        output_usd_per_million: Decimal = Decimal("12.000000"),
         preview_url_ttl_seconds: int = 300,
     ) -> None:
         if monthly_call_limit < 0:
             raise ValueError("The monthly scene-description limit cannot be negative")
+        cost_values = (
+            Decimal(monthly_usd_limit),
+            Decimal(reserved_usd_per_request),
+            Decimal(input_usd_per_million),
+            Decimal(cached_input_usd_per_million),
+            Decimal(output_usd_per_million),
+        )
+        if any(not value.is_finite() or value < 0 for value in cost_values):
+            raise ValueError("Scene-description USD settings must be finite and non-negative")
+        if cost_values[1] <= 0 or (cost_values[0] > 0 and cost_values[1] > cost_values[0]):
+            raise ValueError("The scene-description USD reservation is invalid")
+        if cost_values[1] < scene_description_maximum_cost_usd(
+            input_usd_per_million=cost_values[2],
+            cached_input_usd_per_million=cost_values[3],
+            output_usd_per_million=cost_values[4],
+        ):
+            raise ValueError(
+                "The scene-description USD reservation is below the maximum request cost"
+            )
         if (
             isinstance(preview_url_ttl_seconds, bool)
             or not isinstance(preview_url_ttl_seconds, int)
@@ -199,6 +225,13 @@ class DescriptionMessageProcessor:
         self._provider = provider
         self._preview_store = preview_store
         self._monthly_call_limit = monthly_call_limit
+        (
+            self._monthly_usd_limit,
+            self._reserved_usd_per_request,
+            self._input_usd_per_million,
+            self._cached_input_usd_per_million,
+            self._output_usd_per_million,
+        ) = cost_values
         self._preview_url_ttl_seconds = preview_url_ttl_seconds
 
     def process_message(
@@ -222,6 +255,12 @@ class DescriptionMessageProcessor:
             or job.service_tier != self._provider.service_tier
             or job.max_words != self._provider.max_words
             or job.monthly_call_limit != self._monthly_call_limit
+            or job.monthly_usd_limit != self._monthly_usd_limit
+            or job.reserved_usd_per_request != self._reserved_usd_per_request
+            or job.input_usd_per_million != self._input_usd_per_million
+            or job.cached_input_usd_per_million
+            != self._cached_input_usd_per_million
+            or job.output_usd_per_million != self._output_usd_per_million
         ):
             outcome = self._repository.fail_description(
                 job=job,
@@ -294,7 +333,7 @@ class DescriptionMessageProcessor:
                     user_message=exc.failure.user_message,
                     retryable=exc.failure.retryable,
                 ),
-                provider_called=True,
+                provider_called=exc.provider_called,
             )
 
         cleanup = self._repository.complete_description(job=job, result=result)

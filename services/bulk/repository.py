@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 import hashlib
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
@@ -10,6 +11,7 @@ from uuid import UUID
 from pymysql.cursors import SSDictCursor
 
 from services.bulk.manifest import ParsedManifest
+from services.enrichment.openai_scene import scene_description_maximum_cost_usd
 
 
 TERMINAL_IMPORT_STATUSES = {
@@ -57,8 +59,25 @@ class MergeSettings:
     description_detail: str = "high"
     description_service_tier: str = "flex"
     description_max_words: int = 24
-    description_monthly_call_limit: int = 1_000
+    description_monthly_call_limit: int = 100_000
+    description_monthly_usd_limit: Decimal = Decimal("230.000000")
+    description_reserved_usd_per_request: Decimal = Decimal("0.010000")
+    description_input_usd_per_million: Decimal = Decimal("2.000000")
+    description_cached_input_usd_per_million: Decimal = Decimal("0.200000")
+    description_output_usd_per_million: Decimal = Decimal("12.000000")
     trash_retention_days: int = 30
+
+    def __post_init__(self) -> None:
+        if self.description_reserved_usd_per_request < scene_description_maximum_cost_usd(
+            input_usd_per_million=self.description_input_usd_per_million,
+            cached_input_usd_per_million=(
+                self.description_cached_input_usd_per_million
+            ),
+            output_usd_per_million=self.description_output_usd_per_million,
+        ):
+            raise ValueError(
+                "Bulk scene-description reservation is below maximum request cost"
+            )
 
 
 @dataclass(frozen=True)
@@ -1234,7 +1253,12 @@ class MySqlManifestImportRepository:
                        'assetRevision', LOWER(Asset.ContentSha256),
                        'sourceId', %s, 'model', %s, 'promptVersion', %s,
                        'detail', %s, 'serviceTier', %s, 'maxWords', %s,
-                       'monthlyCallLimit', %s),
+                       'monthlyCallLimit', %s,
+                       'monthlyUsdLimit', %s,
+                       'reservedUsdPerRequest', %s,
+                       'inputUsdPerMillion', %s,
+                       'cachedInputUsdPerMillion', %s,
+                       'outputUsdPerMillion', %s),
                    @ImportNow, @ImportNow
             FROM ({eligible}) AS Eligible
             JOIN MediaAsset AS Asset
@@ -1254,6 +1278,11 @@ class MySqlManifestImportRepository:
                 settings.description_service_tier,
                 settings.description_max_words,
                 settings.description_monthly_call_limit,
+                str(settings.description_monthly_usd_limit),
+                str(settings.description_reserved_usd_per_request),
+                str(settings.description_input_usd_per_million),
+                str(settings.description_cached_input_usd_per_million),
+                str(settings.description_output_usd_per_million),
                 claim.internal_id,
                 claim.user_id,
                 claim.user_id,

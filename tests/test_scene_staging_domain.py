@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID, uuid4
 
@@ -200,6 +200,43 @@ def upload_command(source, result) -> UploadPlanCommand:
     )
 
 
+def stage_and_claim(
+    service: Phase1DomainService,
+    store: MemoryTemporaryStore,
+    user,
+    source,
+    result,
+    *,
+    key: str,
+    message_id: str,
+):
+    planned = run(
+        service.create_upload_plan(
+            user.user_id,
+            upload_command(source, result),
+            context(f"{key}-plan"),
+        )
+    ).value
+    object_key = f"staging/{planned.upload_session_id}.jpg"
+    store.objects[("test-staging-bucket", object_key)] = TemporaryObjectMetadata(
+        byte_size=512,
+        content_type="image/jpeg",
+        checksum_sha256_hex=PREVIEW_HASH,
+    )
+    run(
+        service.complete_upload(
+            user.user_id,
+            planned.upload_session_id,
+            UploadCompleteCommand(object_sha256=PREVIEW_HASH),
+            context(f"{key}-complete"),
+        )
+    )
+    return service.claim_description_job(
+        job_id=result.description_job_id,
+        message_id=message_id,
+    )
+
+
 def test_duplicate_manifest_paths_share_one_preparing_description_job(
     session_factory,
 ) -> None:
@@ -378,6 +415,63 @@ def test_quota_defers_without_creating_upload_or_presigned_url(session_factory) 
     )
     assert public_job.state == "WaitingForMonthlyQuota"
     assert public_job.can_retry is True
+
+
+def test_usd_ceiling_blocks_preview_before_any_provider_or_s3_work(
+    session_factory,
+) -> None:
+    store = MemoryTemporaryStore()
+    service = Phase1DomainService(
+        session_factory,
+        clock=lambda: NOW,
+        temporary_object_store=store,
+        scene_description_monthly_call_limit=100_000,
+        scene_description_monthly_usd_limit=Decimal("230.000000"),
+        scene_description_reserved_usd_per_request=Decimal("0.010000"),
+    )
+    user, source, manifest = setup_photo(service)
+    with transaction_scope(session_factory) as session:
+        job = session.scalar(select(ProcessingJob))
+        session.add(
+            ProviderUsageMonth(
+                user_id=job.user_id,
+                provider="OpenAI",
+                usage_month=date(2026, 8, 1),
+                unit_type="Usd",
+                processed_units=Decimal("229.998000"),
+                reserved_units=Decimal("0.000000"),
+                hard_limit_units=Decimal("230.000000"),
+                created_at_utc=NOW,
+                updated_at_utc=NOW,
+            )
+        )
+
+    planned = run(
+        service.create_upload_plan(
+            user.user_id,
+            upload_command(source, manifest.results[0]),
+            context("usd-limit-plan"),
+        )
+    ).value
+
+    assert planned.disposition == "Deferred"
+    assert store.plans == []
+    with transaction_scope(session_factory) as session:
+        usages = {
+            row.unit_type: row
+            for row in session.scalars(select(ProviderUsageMonth))
+        }
+        assert usages["Usd"].processed_units == Decimal("229.998000")
+        assert usages["Usd"].reserved_units == Decimal("0.000000")
+        assert usages["Request"].reserved_units == Decimal("0.000000")
+
+
+def test_reservation_must_cover_provable_maximum_scene_request(session_factory) -> None:
+    with pytest.raises(ValueError, match="below the maximum request cost"):
+        Phase1DomainService(
+            session_factory,
+            scene_description_reserved_usd_per_request=Decimal("0.006000"),
+        )
 
 
 def test_cancel_and_expiry_release_reserved_quota(session_factory) -> None:
@@ -568,10 +662,9 @@ def test_description_failure_releases_or_consumes_prereservation_exactly_once(
     assert service.reserve_description_provider_call(
         job=claimed, provider="OpenAI", monthly_limit=1
     )
-    if provider_called:
-        assert service.consume_description_provider_call(
-            job=claimed, provider="OpenAI"
-        )
+    assert service.consume_description_provider_call(
+        job=claimed, provider="OpenAI"
+    )
     outcome = service.fail_description(
         job=claimed,
         failure=DescriptionJobFailure(
@@ -585,9 +678,77 @@ def test_description_failure_releases_or_consumes_prereservation_exactly_once(
     assert outcome.cleanup is DescriptionCleanupDecision.DELETE
     assert outcome.retry_requested is False
     with transaction_scope(session_factory) as session:
-        usage = session.scalar(select(ProviderUsageMonth))
-        assert usage.reserved_units == Decimal("0.000000")
-        assert usage.processed_units == expected_processed
+        usages = {
+            row.unit_type: row
+            for row in session.scalars(select(ProviderUsageMonth))
+        }
+        assert usages["Request"].reserved_units == Decimal("0.000000")
+        assert usages["Request"].processed_units == expected_processed
+        assert usages["Usd"].reserved_units == Decimal("0.000000")
+        assert usages["Usd"].processed_units == (
+            Decimal("0.010000") if provider_called else Decimal("0.000000")
+        )
+        stored_job = session.scalar(select(ProcessingJob))
+        assert stored_job.request_json["providerCost"]["basis"] == (
+            "ConservativeReservation"
+            if provider_called
+            else "ReleasedNoProviderCall"
+        )
+        assert stored_job.request_json["providerRequestConsumption"]["state"] == (
+            "Consumed" if provider_called else "Reversed"
+        )
+
+
+def test_expired_running_lease_conservatively_settles_started_cost_before_retry(
+    session_factory,
+) -> None:
+    clock = [NOW]
+    store = MemoryTemporaryStore()
+    service = Phase1DomainService(
+        session_factory,
+        clock=lambda: clock[0],
+        temporary_object_store=store,
+    )
+    user, source, manifest = setup_photo(service)
+    result = manifest.results[0]
+    claimed = stage_and_claim(
+        service,
+        store,
+        user,
+        source,
+        result,
+        key="expired-cost",
+        message_id="expired-first",
+    )
+    assert claimed is not None
+    assert service.reserve_description_provider_call(
+        job=claimed, provider="OpenAI", monthly_limit=100_000
+    )
+    assert service.consume_description_provider_call(job=claimed, provider="OpenAI")
+    with transaction_scope(session_factory) as session:
+        job = session.scalar(select(ProcessingJob))
+        job.lease_expires_at_utc = NOW - timedelta(seconds=1)
+    clock[0] = NOW + timedelta(minutes=1)
+
+    reclaimed = service.claim_description_job(
+        job_id=result.description_job_id,
+        message_id="expired-second",
+    )
+
+    assert reclaimed is not None
+    assert reclaimed.attempt_count == 2
+    with transaction_scope(session_factory) as session:
+        usages = {
+            row.unit_type: row
+            for row in session.scalars(select(ProviderUsageMonth))
+        }
+        job = session.scalar(select(ProcessingJob))
+        assert usages["Request"].processed_units == Decimal("1.000000")
+        assert usages["Usd"].processed_units == Decimal("0.010000")
+        assert usages["Usd"].reserved_units == Decimal("0.000000")
+        assert job.request_json["providerCost"]["basis"] == (
+            "ConservativeReservation"
+        )
 
 
 def test_description_success_persists_current_result_usage_and_settles_quota(
@@ -623,10 +784,24 @@ def test_description_success_persists_current_result_usage_and_settles_quota(
             context("success-complete"),
         )
     )
+    with transaction_scope(session_factory) as session:
+        stored = session.scalar(select(ProcessingJob))
+        request = dict(stored.request_json)
+        for key in (
+            "monthlyUsdLimit",
+            "reservedUsdPerRequest",
+            "inputUsdPerMillion",
+            "cachedInputUsdPerMillion",
+            "outputUsdPerMillion",
+        ):
+            request.pop(key, None)
+        stored.request_json = request
     claimed = service.claim_description_job(
         job_id=result.description_job_id, message_id="success-message"
     )
     assert claimed is not None
+    assert claimed.monthly_usd_limit == Decimal("230.000000")
+    assert claimed.reserved_usd_per_request == Decimal("0.010000")
     assert service.reserve_description_provider_call(
         job=claimed, provider="OpenAI", monthly_limit=1
     )
@@ -647,15 +822,79 @@ def test_description_success_persists_current_result_usage_and_settles_quota(
     with transaction_scope(session_factory) as session:
         description = session.scalar(select(MediaDescription))
         job = session.scalar(select(ProcessingJob))
-        usage = session.scalar(select(ProviderUsageMonth))
+        usages = {
+            row.unit_type: row
+            for row in session.scalars(select(ProviderUsageMonth))
+        }
         assert description.status == "Succeeded"
         assert description.is_current == 1
         assert description.description.startswith("A red bicycle")
         assert job.status == "Succeeded"
         assert job.request_json["providerUsage"]["total_tokens"] == 812
         assert "providerUsageReservation" not in job.request_json
-        assert usage.reserved_units == Decimal("0.000000")
-        assert usage.processed_units == Decimal("1.000000")
+        assert usages["Request"].reserved_units == Decimal("0.000000")
+        assert usages["Request"].processed_units == Decimal("1.000000")
+        assert usages["Usd"].reserved_units == Decimal("0.000000")
+        assert usages["Usd"].processed_units == Decimal("0.001744")
+        assert job.request_json["providerCost"] == {
+            "currency": "USD",
+            "amount": "0.001744",
+            "basis": "ActualUsage",
+            "ratesPerMillion": {
+                "input": "2.000000",
+                "cachedInput": "0.200000",
+                "output": "12.000000",
+            },
+        }
+
+
+def test_out_of_bound_provider_usage_fails_and_charges_only_reservation(
+    session_factory,
+) -> None:
+    store = MemoryTemporaryStore()
+    service = Phase1DomainService(
+        session_factory,
+        clock=lambda: NOW,
+        temporary_object_store=store,
+    )
+    user, source, manifest = setup_photo(service)
+    result = manifest.results[0]
+    claimed = stage_and_claim(
+        service,
+        store,
+        user,
+        source,
+        result,
+        key="usage-bound",
+        message_id="usage-bound-worker",
+    )
+    assert claimed is not None
+    assert service.reserve_description_provider_call(
+        job=claimed, provider="OpenAI", monthly_limit=100_000
+    )
+    assert service.consume_description_provider_call(job=claimed, provider="OpenAI")
+
+    cleanup = service.complete_description(
+        job=claimed,
+        result=SceneDescriptionResult(
+            description="A red bicycle rests beside a sunny lakeside path.",
+            provider="OpenAI",
+            model="gpt-5.6-terra",
+            prompt_version="scene-search-v1",
+            usage={"input_tokens": 3_000, "output_tokens": 12},
+        ),
+    )
+
+    assert cleanup is DescriptionCleanupDecision.DELETE
+    with transaction_scope(session_factory) as session:
+        job = session.scalar(select(ProcessingJob))
+        usd = session.scalar(
+            select(ProviderUsageMonth).where(ProviderUsageMonth.unit_type == "Usd")
+        )
+        assert job.status == "Failed"
+        assert job.failure_code == "InvalidSceneDescriptionResult"
+        assert job.request_json["providerCost"]["amount"] == "0.010000"
+        assert usd.processed_units == Decimal("0.010000")
 
 
 def test_provider_auth_failure_opens_circuit_until_explicit_retry(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -18,7 +19,46 @@ from services.enrichment.openai_scene import (
     OpenAISceneDescriptionProvider,
     SceneDescriptionProviderError,
     UrllibJsonTransport,
+    scene_description_cost_usd,
+    scene_description_maximum_cost_usd,
+    sanitize_scene_description_usage,
 )
+
+
+def test_terra_cost_uses_uncached_cached_and_output_rates_exactly() -> None:
+    assert scene_description_maximum_cost_usd(
+        input_usd_per_million=Decimal("2.00"),
+        cached_input_usd_per_million=Decimal("0.20"),
+        output_usd_per_million=Decimal("12.00"),
+    ) == Decimal("0.006320")
+    calculated = scene_description_cost_usd(
+        {
+            "input_tokens": 1_000,
+            "output_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 400},
+        },
+        input_usd_per_million=Decimal("2.00"),
+        cached_input_usd_per_million=Decimal("0.20"),
+        output_usd_per_million=Decimal("12.00"),
+    )
+
+    assert calculated == (
+        Decimal("0.002480"),
+        {
+            "input_tokens": 1_000,
+            "output_tokens": 100,
+            "cached_input_tokens": 400,
+        },
+    )
+    assert scene_description_cost_usd(
+        {"input_tokens": 10, "cached_input_tokens": 11, "output_tokens": 1},
+        input_usd_per_million=Decimal("2"),
+        cached_input_usd_per_million=Decimal("0.2"),
+        output_usd_per_million=Decimal("12"),
+    ) is None
+    assert sanitize_scene_description_usage(
+        {"input_tokens": True, "output_tokens": 1}
+    ) == {"output_tokens": 1}
 from services.enrichment.openai_secrets import (
     OpenAIApiKeyResolver,
     OpenAISecretConfigurationError,
@@ -314,6 +354,22 @@ def test_authentication_failure_invalidates_key_for_warm_worker_retry() -> None:
     assert invalidations == [True]
     assert transport.authorizations == ["Bearer old-key", "Bearer new-key"]
     assert result.description.startswith("A lighthouse")
+
+
+def test_missing_rotated_credential_is_classified_before_provider_call() -> None:
+    provider = OpenAISceneDescriptionProvider(
+        "old-key",
+        transport=FakeTransport(JsonHttpResponse(status_code=401, payload=None)),
+        api_key_loader=lambda: "",
+    )
+    with pytest.raises(SceneDescriptionProviderError) as first:
+        provider.describe("https://example.test/preview.jpg?sig=one")
+    with pytest.raises(SceneDescriptionProviderError) as second:
+        provider.describe("https://example.test/preview.jpg?sig=two")
+
+    assert first.value.provider_called is True
+    assert second.value.failure.code == "OpenAICredentialUnavailable"
+    assert second.value.provider_called is False
 
 
 @pytest.mark.parametrize(

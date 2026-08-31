@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from decimal import Decimal
 import json
 from typing import Any
 from uuid import UUID
@@ -189,6 +190,7 @@ def provider_error(
     failure_class: ProviderFailureClass,
     *,
     retryable: bool,
+    provider_called: bool = True,
 ) -> SceneDescriptionProviderError:
     return SceneDescriptionProviderError(
         ProviderFailure(
@@ -196,7 +198,8 @@ def provider_error(
             code=f"{failure_class.value}Code",
             user_message="Safe scene-description failure.",
             retryable=retryable,
-        )
+        ),
+        provider_called=provider_called,
     )
 
 
@@ -294,6 +297,31 @@ def test_server_owned_model_version_mismatch_fails_before_paid_work() -> None:
     assert store.presign_calls == []
     assert repository.last_failure is not None
     assert repository.last_failure.code == "SceneDescriptionConfigurationChanged"
+    assert repository.last_provider_called is False
+
+
+def test_server_owned_cost_configuration_mismatch_fails_before_paid_work() -> None:
+    events: list[str] = []
+    repository = FakeDescriptionRepository(events)
+    assert repository.job is not None
+    repository.job = replace(
+        repository.job, reserved_usd_per_request=Decimal("0.006000")
+    )
+    repository.failure_outcome = DescriptionFailureOutcome(
+        retry_requested=False,
+        cleanup=DescriptionCleanupDecision.DELETE,
+    )
+    provider = FakeSceneProvider(description_result(), events)
+    store = FakePreviewStore(events)
+
+    disposition = processor(repository, provider, store).process_message(
+        message_id="cost-configuration-changed",
+        body=body(),
+    )
+
+    assert disposition is MessageDisposition.ACK
+    assert events == ["claim", "fail", "delete"]
+    assert provider.urls == []
     assert repository.last_provider_called is False
 
 
@@ -430,6 +458,33 @@ def test_terminal_auth_or_internal_failure_deletes_only_after_durable_decision(
     assert events[-2:] == ["fail", "delete"]
     assert len(store.delete_calls) == 1
     assert repository.last_provider_called is True
+
+
+def test_pre_network_credential_failure_releases_cost_reservation() -> None:
+    events: list[str] = []
+    repository = FakeDescriptionRepository(events)
+    repository.failure_outcome = DescriptionFailureOutcome(
+        retry_requested=False,
+        cleanup=DescriptionCleanupDecision.DELETE,
+    )
+    provider = FakeSceneProvider(
+        provider_error(
+            ProviderFailureClass.AUTHENTICATION,
+            retryable=False,
+            provider_called=False,
+        ),
+        events,
+    )
+    store = FakePreviewStore(events)
+
+    disposition = processor(repository, provider, store).process_message(
+        message_id="credential-missing-before-network",
+        body=body(),
+    )
+
+    assert disposition is MessageDisposition.ACK
+    assert repository.last_provider_called is False
+    assert events[-2:] == ["fail", "delete"]
 
 
 def test_store_authentication_failure_is_safely_persisted_and_cleaned() -> None:

@@ -4,7 +4,7 @@ from copy import deepcopy
 import base64
 from dataclasses import fields, is_dataclass
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 import hashlib
 import logging
 import re
@@ -94,6 +94,10 @@ from services.enrichment.normalization import (
 from services.enrichment.openai_scene import (
     SCENE_DESCRIPTION_PROMPT_VERSION,
     SceneDescriptionResult,
+    USD_QUANTUM,
+    scene_description_cost_usd,
+    scene_description_maximum_cost_usd,
+    scene_description_usage_within_bounds,
 )
 from services.domain.repositories import (
     AccountRepository,
@@ -239,7 +243,12 @@ class Phase1DomainService:
         scene_description_detail: str = "high",
         scene_description_service_tier: str = "flex",
         scene_description_max_words: int = 24,
-        scene_description_monthly_call_limit: int = 1_000,
+        scene_description_monthly_call_limit: int = 100_000,
+        scene_description_monthly_usd_limit: Decimal = Decimal("230.000000"),
+        scene_description_reserved_usd_per_request: Decimal = Decimal("0.010000"),
+        scene_description_input_usd_per_million: Decimal = Decimal("2.000000"),
+        scene_description_cached_input_usd_per_million: Decimal = Decimal("0.200000"),
+        scene_description_output_usd_per_million: Decimal = Decimal("12.000000"),
         geocode_reuse_radius_meters: float = DEFAULT_GEOCODE_REUSE_RADIUS_METERS,
         location_normalizer: LocationNormalizer | None = None,
     ) -> None:
@@ -247,6 +256,36 @@ class Phase1DomainService:
             raise ValueError("The geocode reuse radius must be between 0 and 100 meters")
         if scene_description_monthly_call_limit < 0:
             raise ValueError("The scene-description monthly limit cannot be negative")
+        cost_values = {
+            "monthly USD limit": Decimal(scene_description_monthly_usd_limit),
+            "request USD reservation": Decimal(
+                scene_description_reserved_usd_per_request
+            ),
+            "input rate": Decimal(scene_description_input_usd_per_million),
+            "cached input rate": Decimal(
+                scene_description_cached_input_usd_per_million
+            ),
+            "output rate": Decimal(scene_description_output_usd_per_million),
+        }
+        if any(not value.is_finite() or value < 0 for value in cost_values.values()):
+            raise ValueError("Scene-description USD settings must be finite and non-negative")
+        if cost_values["request USD reservation"] <= 0:
+            raise ValueError("The scene-description USD reservation must be positive")
+        if (
+            cost_values["monthly USD limit"] > 0
+            and cost_values["request USD reservation"]
+            > cost_values["monthly USD limit"]
+        ):
+            raise ValueError("The scene-description USD reservation exceeds its limit")
+        maximum_scene_cost = scene_description_maximum_cost_usd(
+            input_usd_per_million=cost_values["input rate"],
+            cached_input_usd_per_million=cost_values["cached input rate"],
+            output_usd_per_million=cost_values["output rate"],
+        )
+        if cost_values["request USD reservation"] < maximum_scene_cost:
+            raise ValueError(
+                "The scene-description USD reservation is below the maximum request cost"
+            )
         if not scene_description_model or len(scene_description_model) > 128:
             raise ValueError("The scene-description model identity is invalid")
         if scene_description_detail not in {"low", "high"}:
@@ -269,6 +308,21 @@ class Phase1DomainService:
         self._scene_description_monthly_call_limit = (
             scene_description_monthly_call_limit
         )
+        self._scene_description_monthly_usd_limit = cost_values[
+            "monthly USD limit"
+        ].quantize(USD_QUANTUM)
+        self._scene_description_reserved_usd_per_request = cost_values[
+            "request USD reservation"
+        ].quantize(USD_QUANTUM)
+        self._scene_description_input_usd_per_million = cost_values[
+            "input rate"
+        ]
+        self._scene_description_cached_input_usd_per_million = cost_values[
+            "cached input rate"
+        ]
+        self._scene_description_output_usd_per_million = cost_values[
+            "output rate"
+        ]
         self._geocode_reuse_radius_meters = geocode_reuse_radius_meters
         self._location_normalizer = location_normalizer or LocationNormalizer(
             LocationNormalizationRuleset(rules=(), version="none")
@@ -1732,6 +1786,19 @@ class Phase1DomainService:
                 "serviceTier": self._scene_description_service_tier,
                 "maxWords": self._scene_description_max_words,
                 "monthlyCallLimit": self._scene_description_monthly_call_limit,
+                "monthlyUsdLimit": str(self._scene_description_monthly_usd_limit),
+                "reservedUsdPerRequest": str(
+                    self._scene_description_reserved_usd_per_request
+                ),
+                "inputUsdPerMillion": str(
+                    self._scene_description_input_usd_per_million
+                ),
+                "cachedInputUsdPerMillion": str(
+                    self._scene_description_cached_input_usd_per_million
+                ),
+                "outputUsdPerMillion": str(
+                    self._scene_description_output_usd_per_million
+                ),
             }
             configuration_changed = any(
                 request.get(key) != value for key, value in configured.items()
@@ -1778,6 +1845,19 @@ class Phase1DomainService:
                 "serviceTier": self._scene_description_service_tier,
                 "maxWords": self._scene_description_max_words,
                 "monthlyCallLimit": self._scene_description_monthly_call_limit,
+                "monthlyUsdLimit": str(self._scene_description_monthly_usd_limit),
+                "reservedUsdPerRequest": str(
+                    self._scene_description_reserved_usd_per_request
+                ),
+                "inputUsdPerMillion": str(
+                    self._scene_description_input_usd_per_million
+                ),
+                "cachedInputUsdPerMillion": str(
+                    self._scene_description_cached_input_usd_per_million
+                ),
+                "outputUsdPerMillion": str(
+                    self._scene_description_output_usd_per_million
+                ),
             },
             created_at_utc=now,
             updated_at_utc=now,
@@ -1953,66 +2033,147 @@ class Phase1DomainService:
         job: ProcessingJob,
         now: datetime,
     ) -> bool:
+        return self._reserve_description_usage(
+            session=session,
+            user_id=account.id,
+            job=job,
+            provider=DESCRIPTION_PROVIDER,
+            monthly_request_limit=self._scene_description_monthly_call_limit,
+            monthly_usd_limit=self._scene_description_monthly_usd_limit,
+            reserved_usd=self._scene_description_reserved_usd_per_request,
+            now=now,
+        )
+
+    def _reserve_description_usage(
+        self,
+        *,
+        session: Session,
+        user_id: int,
+        job: ProcessingJob,
+        provider: str,
+        monthly_request_limit: int,
+        monthly_usd_limit: Decimal,
+        reserved_usd: Decimal,
+        now: datetime,
+    ) -> bool:
+        """Atomically reserve both the provider request and conservative USD."""
+
         request = dict(job.request_json) if isinstance(job.request_json, dict) else {}
-        existing = request.get("providerUsageReservation")
+        existing_request = request.get("providerUsageReservation")
+        existing_cost = request.get("providerCostReservation")
         usage_month = date(now.year, now.month, 1)
-        if isinstance(existing, dict) and existing.get("state") == "Reserved":
-            if (
-                existing.get("provider") == DESCRIPTION_PROVIDER
-                and existing.get("usageMonth") == usage_month.isoformat()
-                and existing.get("unitType") == "Request"
-                and existing.get("units") == "1"
-            ):
-                usage = ProviderUsageRepository(session).get(
-                    user_id=account.id,
-                    provider=DESCRIPTION_PROVIDER,
-                    usage_month=usage_month,
-                    unit_type="Request",
-                    for_update=True,
+        try:
+            existing_cost_units = Decimal(
+                str(
+                    existing_cost.get("units", "-1")
+                    if isinstance(existing_cost, dict)
+                    else "-1"
                 )
-                if usage is not None and usage.circuit_state == "Open":
+            )
+        except (ValueError, InvalidOperation):
+            existing_cost_units = Decimal("-1")
+        request_matches = (
+            isinstance(existing_request, dict)
+            and existing_request.get("state") == "Reserved"
+            and existing_request.get("provider") == provider
+            and existing_request.get("usageMonth") == usage_month.isoformat()
+            and existing_request.get("unitType") == "Request"
+            and existing_request.get("units") == "1"
+        )
+        cost_matches = (
+            isinstance(existing_cost, dict)
+            and existing_cost.get("state") == "Reserved"
+            and existing_cost.get("provider") == provider
+            and existing_cost.get("usageMonth") == usage_month.isoformat()
+            and existing_cost.get("unitType") == "Usd"
+            and existing_cost_units == reserved_usd
+        )
+        if request_matches and cost_matches:
+            request_usage = ProviderUsageRepository(session).get(
+                user_id=user_id,
+                provider=provider,
+                usage_month=usage_month,
+                unit_type="Request",
+                for_update=True,
+            )
+            cost_usage = ProviderUsageRepository(session).get(
+                user_id=user_id,
+                provider=provider,
+                usage_month=usage_month,
+                unit_type="Usd",
+                for_update=True,
+            )
+            if request_usage is not None and cost_usage is not None:
+                if request_usage.circuit_state == "Open":
                     request["quotaBlockReason"] = "CircuitOpen"
                     job.request_json = request
                     return False
                 request.pop("quotaBlockReason", None)
                 job.request_json = request
-                return usage is not None
+                return True
+        if request_matches or cost_matches:
             self._release_description_provider_request(
                 session=session, job=job, now=now
             )
             request = dict(job.request_json or {})
 
-        limit = Decimal(self._scene_description_monthly_call_limit)
-        usage = ProviderUsageRepository(session).get_or_create(
-            user_id=account.id,
-            provider=DESCRIPTION_PROVIDER,
+        request_limit = Decimal(monthly_request_limit)
+        request_usage = ProviderUsageRepository(session).get_or_create(
+            user_id=user_id,
+            provider=provider,
             usage_month=usage_month,
             unit_type="Request",
-            hard_limit_units=limit,
+            hard_limit_units=request_limit,
             now=now,
         )
-        usage.hard_limit_units = limit
-        if usage.circuit_state == "Open":
+        cost_usage = ProviderUsageRepository(session).get_or_create(
+            user_id=user_id,
+            provider=provider,
+            usage_month=usage_month,
+            unit_type="Usd",
+            hard_limit_units=monthly_usd_limit,
+            now=now,
+        )
+        request_usage.hard_limit_units = request_limit
+        cost_usage.hard_limit_units = monthly_usd_limit
+        if request_usage.circuit_state == "Open":
             request["quotaBlockReason"] = "CircuitOpen"
             job.request_json = request
-            usage.updated_at_utc = now
+            request_usage.updated_at_utc = now
+            cost_usage.updated_at_utc = now
             session.flush()
             return False
         request.pop("quotaBlockReason", None)
         if (
-            self._scene_description_monthly_call_limit == 0
-            or usage.processed_units + usage.reserved_units + Decimal("1") > limit
+            monthly_request_limit == 0
+            or request_usage.processed_units
+            + request_usage.reserved_units
+            + Decimal("1")
+            > request_limit
+            or monthly_usd_limit == 0
+            or cost_usage.processed_units + cost_usage.reserved_units + reserved_usd
+            > monthly_usd_limit
         ):
-            usage.updated_at_utc = now
+            request_usage.updated_at_utc = now
+            cost_usage.updated_at_utc = now
             session.flush()
             return False
-        usage.reserved_units += Decimal("1")
-        usage.updated_at_utc = now
+        request_usage.reserved_units += Decimal("1")
+        request_usage.updated_at_utc = now
+        cost_usage.reserved_units += reserved_usd
+        cost_usage.updated_at_utc = now
         request["providerUsageReservation"] = {
-            "provider": DESCRIPTION_PROVIDER,
+            "provider": provider,
             "usageMonth": usage_month.isoformat(),
             "unitType": "Request",
             "units": "1",
+            "state": "Reserved",
+        }
+        request["providerCostReservation"] = {
+            "provider": provider,
+            "usageMonth": usage_month.isoformat(),
+            "unitType": "Usd",
+            "units": str(reserved_usd.quantize(USD_QUANTUM)),
             "state": "Reserved",
         }
         job.request_json = request
@@ -2025,28 +2186,41 @@ class Phase1DomainService:
         *, session: Session, job: ProcessingJob, now: datetime
     ) -> None:
         request = dict(job.request_json) if isinstance(job.request_json, dict) else {}
-        reservation = request.get("providerUsageReservation")
-        if not isinstance(reservation, dict) or reservation.get("state") != "Reserved":
+        changed = False
+        for key, default_unit in (
+            ("providerUsageReservation", "Request"),
+            ("providerCostReservation", "Usd"),
+        ):
+            reservation = request.get(key)
+            if (
+                not isinstance(reservation, dict)
+                or reservation.get("state") != "Reserved"
+            ):
+                continue
+            try:
+                usage_month = date.fromisoformat(str(reservation["usageMonth"]))
+                units = Decimal(str(reservation.get("units", "1")))
+            except (KeyError, ValueError, InvalidOperation):
+                continue
+            usage = ProviderUsageRepository(session).get(
+                user_id=job.user_id,
+                provider=str(reservation.get("provider") or DESCRIPTION_PROVIDER),
+                usage_month=usage_month,
+                unit_type=str(reservation.get("unitType") or default_unit),
+                for_update=True,
+            )
+            if usage is not None:
+                usage.reserved_units -= min(
+                    usage.reserved_units, max(Decimal("0"), units)
+                )
+                usage.updated_at_utc = now
+            released = dict(reservation)
+            released["state"] = "Released"
+            released["releasedAtUtc"] = (_utc(now) or now).isoformat()
+            request[key] = released
+            changed = True
+        if not changed:
             return
-        try:
-            usage_month = date.fromisoformat(str(reservation["usageMonth"]))
-            units = Decimal(str(reservation.get("units", "1")))
-        except (KeyError, ValueError):
-            return
-        usage = ProviderUsageRepository(session).get(
-            user_id=job.user_id,
-            provider=str(reservation.get("provider") or DESCRIPTION_PROVIDER),
-            usage_month=usage_month,
-            unit_type=str(reservation.get("unitType") or "Request"),
-            for_update=True,
-        )
-        if usage is not None:
-            usage.reserved_units -= min(usage.reserved_units, max(Decimal("0"), units))
-            usage.updated_at_utc = now
-        reservation = dict(reservation)
-        reservation["state"] = "Released"
-        reservation["releasedAtUtc"] = (_utc(now) or now).isoformat()
-        request["providerUsageReservation"] = reservation
         job.request_json = request
         job.updated_at_utc = now
 
@@ -2204,12 +2378,27 @@ class Phase1DomainService:
             )
         )
         for job in jobs:
+            description_provider_called = (
+                job.job_type == "Description"
+                and self._description_provider_call_started(job)
+            )
             self._settle_provider_reservation(
                 session,
                 job=job,
                 now=now,
-                consumed=job.status == "Running",
+                consumed=(
+                    description_provider_called
+                    if job.job_type == "Description"
+                    else job.status == "Running"
+                ),
             )
+            if job.job_type == "Description":
+                self._settle_description_cost_reservation(
+                    session,
+                    job=job,
+                    now=now,
+                    provider_called=description_provider_called,
+                )
             job.status = "Cancelled"
             job.next_attempt_at_utc = None
             job.lease_token_hash = None
@@ -2523,8 +2712,8 @@ class Phase1DomainService:
                     and job.next_attempt_at_utc is not None
                     and job.next_attempt_at_utc <= now
                 ):
-                    self._settle_provider_reservation(
-                        session, job=job, now=now, consumed=False
+                    self._release_description_provider_request(
+                        session=session, job=job, now=now
                     )
                     job.status = "Preparing"
                     job.attempt_count = 0
@@ -3115,8 +3304,8 @@ class Phase1DomainService:
                         )
                     )
                 if description_requires_restage:
-                    self._settle_provider_reservation(
-                        session, job=job, now=now, consumed=False
+                    self._release_description_provider_request(
+                        session=session, job=job, now=now
                     )
                     self._clear_description_staging_request(job)
                 job.status = "Preparing" if description_requires_restage else "Queued"
@@ -3200,11 +3389,18 @@ class Phase1DomainService:
                 if job.status == "Cancelled":
                     return self._job_record(session, account.id, job), 200
                 now = self._now()
+                provider_called = self._description_provider_call_started(job)
                 self._settle_provider_reservation(
                     session,
                     job=job,
                     now=now,
-                    consumed=job.status == "Running",
+                    consumed=provider_called,
+                )
+                self._settle_description_cost_reservation(
+                    session,
+                    job=job,
+                    now=now,
+                    provider_called=provider_called,
                 )
                 uploads = list(
                     session.scalars(
@@ -3310,13 +3506,36 @@ class Phase1DomainService:
                 original_status = job.status
                 if original_status == "Running":
                     # The provider may already have accepted this attempt.
-                    self._settle_provider_reservation(
-                        session, job=job, now=now, consumed=True
+                    description_provider_called = (
+                        job.job_type == "Description"
+                        and self._description_provider_call_started(job)
                     )
+                    self._settle_provider_reservation(
+                        session,
+                        job=job,
+                        now=now,
+                        consumed=(
+                            description_provider_called
+                            if job.job_type == "Description"
+                            else True
+                        ),
+                    )
+                    if job.job_type == "Description":
+                        self._settle_description_cost_reservation(
+                            session,
+                            job=job,
+                            now=now,
+                            provider_called=description_provider_called,
+                        )
                 elif original_status == "DeferredQuota":
-                    self._settle_provider_reservation(
-                        session, job=job, now=now, consumed=False
-                    )
+                    if job.job_type == "Description":
+                        self._release_description_provider_request(
+                            session=session, job=job, now=now
+                        )
+                    else:
+                        self._settle_provider_reservation(
+                            session, job=job, now=now, consumed=False
+                        )
                     job.attempt_count = 0
 
                 if (
@@ -3472,10 +3691,50 @@ class Phase1DomainService:
                 service_tier = str(request["serviceTier"])
                 max_words = int(request["maxWords"])
                 monthly_call_limit = int(request["monthlyCallLimit"])
-            except (KeyError, TypeError, ValueError):
+                monthly_usd_limit = Decimal(
+                    str(
+                        request.get(
+                            "monthlyUsdLimit",
+                            self._scene_description_monthly_usd_limit,
+                        )
+                    )
+                )
+                reserved_usd_per_request = Decimal(
+                    str(
+                        request.get(
+                            "reservedUsdPerRequest",
+                            self._scene_description_reserved_usd_per_request,
+                        )
+                    )
+                )
+                input_usd_per_million = Decimal(
+                    str(
+                        request.get(
+                            "inputUsdPerMillion",
+                            self._scene_description_input_usd_per_million,
+                        )
+                    )
+                )
+                cached_input_usd_per_million = Decimal(
+                    str(
+                        request.get(
+                            "cachedInputUsdPerMillion",
+                            self._scene_description_cached_input_usd_per_million,
+                        )
+                    )
+                )
+                output_usd_per_million = Decimal(
+                    str(
+                        request.get(
+                            "outputUsdPerMillion",
+                            self._scene_description_output_usd_per_million,
+                        )
+                    )
+                )
+            except (KeyError, TypeError, ValueError, InvalidOperation):
                 self._fail_invalid_description_job(job, now=now)
-                self._settle_provider_reservation(
-                    session, job=job, now=now, consumed=False
+                self._release_description_provider_request(
+                    session=session, job=job, now=now
                 )
                 return None
             if (
@@ -3497,12 +3756,41 @@ class Phase1DomainService:
                 or service_tier not in {"auto", "default", "flex"}
                 or not 8 <= max_words <= 24
                 or monthly_call_limit < 0
+                or not monthly_usd_limit.is_finite()
+                or monthly_usd_limit < 0
+                or not reserved_usd_per_request.is_finite()
+                or reserved_usd_per_request <= 0
+                or (
+                    monthly_usd_limit > 0
+                    and reserved_usd_per_request > monthly_usd_limit
+                )
+                or any(
+                    not rate.is_finite() or rate < 0
+                    for rate in (
+                        input_usd_per_million,
+                        cached_input_usd_per_million,
+                        output_usd_per_million,
+                    )
+                )
             ):
                 self._fail_invalid_description_job(job, now=now)
-                self._settle_provider_reservation(
-                    session, job=job, now=now, consumed=False
+                self._release_description_provider_request(
+                    session=session, job=job, now=now
                 )
                 return None
+            cost_configuration = {
+                "monthlyUsdLimit": str(monthly_usd_limit.quantize(USD_QUANTUM)),
+                "reservedUsdPerRequest": str(
+                    reserved_usd_per_request.quantize(USD_QUANTUM)
+                ),
+                "inputUsdPerMillion": str(input_usd_per_million),
+                "cachedInputUsdPerMillion": str(cached_input_usd_per_million),
+                "outputUsdPerMillion": str(output_usd_per_million),
+            }
+            if any(request.get(key) != value for key, value in cost_configuration.items()):
+                request = {**request, **cost_configuration}
+                job.request_json = request
+                job.updated_at_utc = now
             asset = session.scalar(
                 select(MediaAsset).where(
                     MediaAsset.user_id == job.user_id,
@@ -3515,8 +3803,8 @@ class Phase1DomainService:
                 )
             except NotFoundError:
                 self._fail_stale_description_job(job, now=now)
-                self._settle_provider_reservation(
-                    session, job=job, now=now, consumed=False
+                self._release_description_provider_request(
+                    session=session, job=job, now=now
                 )
                 return None
             if (
@@ -3536,8 +3824,8 @@ class Phase1DomainService:
                 or upload.expected_byte_size != preview_byte_size
             ):
                 self._fail_stale_description_job(job, now=now)
-                self._settle_provider_reservation(
-                    session, job=job, now=now, consumed=False
+                self._release_description_provider_request(
+                    session=session, job=job, now=now
                 )
                 return None
             current = AssetRepository(session).current_description(
@@ -3549,8 +3837,8 @@ class Phase1DomainService:
                 and current.is_current == 1
                 and bool(current.description and current.description.strip())
             ):
-                self._settle_provider_reservation(
-                    session, job=job, now=now, consumed=False
+                self._release_description_provider_request(
+                    session=session, job=job, now=now
                 )
                 self._finish_description_job(job, status="Succeeded", now=now)
                 return None
@@ -3570,14 +3858,29 @@ class Phase1DomainService:
                         or job.lease_expires_at_utc <= now
                     )
                 )
+                if expired_running_lease and self._description_provider_call_started(job):
+                    self._settle_description_cost_reservation(
+                        session,
+                        job=job,
+                        now=now,
+                        provider_called=True,
+                    )
                 if job.status != "Queued" and not expired_running_lease:
                     return None
                 if job.next_attempt_at_utc is not None and job.next_attempt_at_utc > now:
                     return None
                 if job.attempt_count >= job.max_attempts:
-                    self._settle_provider_reservation(
-                        session, job=job, now=now, consumed=False
-                    )
+                    if self._description_provider_call_started(job):
+                        self._settle_description_cost_reservation(
+                            session,
+                            job=job,
+                            now=now,
+                            provider_called=True,
+                        )
+                    else:
+                        self._release_description_provider_request(
+                            session=session, job=job, now=now
+                        )
                     job.status = "Failed"
                     job.failure_class = "Internal"
                     job.failure_code = "AttemptsExhausted"
@@ -3616,6 +3919,13 @@ class Phase1DomainService:
                 service_tier=service_tier,
                 max_words=max_words,
                 monthly_call_limit=monthly_call_limit,
+                monthly_usd_limit=monthly_usd_limit.quantize(USD_QUANTUM),
+                reserved_usd_per_request=reserved_usd_per_request.quantize(
+                    USD_QUANTUM
+                ),
+                input_usd_per_million=input_usd_per_million,
+                cached_input_usd_per_million=cached_input_usd_per_million,
+                output_usd_per_million=output_usd_per_million,
                 lease_owner=message_id,
                 attempt_count=job.attempt_count,
                 max_attempts=job.max_attempts,
@@ -3642,70 +3952,17 @@ class Phase1DomainService:
             stored_job, _, _ = claimed
             if stored_job.provider != provider:
                 raise ValueError("The provider does not match the claimed job")
-            request = dict(stored_job.request_json or {})
-            existing = request.get("providerUsageReservation")
             now = self._now()
-            usage_month = date(now.year, now.month, 1)
-            if isinstance(existing, dict) and existing.get("state") == "Reserved":
-                current_reservation = (
-                    existing.get("provider") == provider
-                    and existing.get("unitType") == "Request"
-                    and existing.get("units") == "1"
-                    and existing.get("usageMonth") == usage_month.isoformat()
-                )
-                if current_reservation:
-                    usage = ProviderUsageRepository(session).get(
-                        user_id=stored_job.user_id,
-                        provider=provider,
-                        usage_month=usage_month,
-                        unit_type="Request",
-                        for_update=True,
-                    )
-                    if usage is not None and usage.circuit_state == "Open":
-                        request["quotaBlockReason"] = "CircuitOpen"
-                        stored_job.request_json = request
-                        return False
-                    request.pop("quotaBlockReason", None)
-                    stored_job.request_json = request
-                    return usage is not None
-                self._settle_provider_reservation(
-                    session, job=stored_job, now=now, consumed=False
-                )
-                request = dict(stored_job.request_json or {})
-            limit = Decimal(monthly_limit)
-            usage = ProviderUsageRepository(session).get_or_create(
+            return self._reserve_description_usage(
+                session=session,
                 user_id=stored_job.user_id,
+                job=stored_job,
                 provider=provider,
-                usage_month=usage_month,
-                unit_type="Request",
-                hard_limit_units=limit,
+                monthly_request_limit=monthly_limit,
+                monthly_usd_limit=job.monthly_usd_limit,
+                reserved_usd=job.reserved_usd_per_request,
                 now=now,
             )
-            usage.hard_limit_units = limit
-            if usage.circuit_state == "Open":
-                request["quotaBlockReason"] = "CircuitOpen"
-                stored_job.request_json = request
-                usage.updated_at_utc = now
-                return False
-            request.pop("quotaBlockReason", None)
-            if monthly_limit == 0 or (
-                usage.processed_units + usage.reserved_units + Decimal("1") > limit
-            ):
-                usage.updated_at_utc = now
-                return False
-            usage.reserved_units += Decimal("1")
-            usage.updated_at_utc = now
-            request["providerUsageReservation"] = {
-                "provider": provider,
-                "usageMonth": usage_month.isoformat(),
-                "unitType": "Request",
-                "units": "1",
-                "state": "Reserved",
-            }
-            stored_job.request_json = request
-            stored_job.updated_at_utc = now
-            session.flush()
-            return True
 
     def consume_description_provider_call(
         self,
@@ -3731,9 +3988,20 @@ class Phase1DomainService:
             ):
                 return False
             now = self._now()
+            consumption = {
+                "provider": provider,
+                "usageMonth": str(reservation.get("usageMonth")),
+                "unitType": "Request",
+                "units": str(reservation.get("units", "1")),
+                "state": "Consumed",
+                "consumedAtUtc": (_utc(now) or now).isoformat(),
+            }
             self._settle_provider_reservation(
                 session, job=stored_job, now=now, consumed=True
             )
+            request = dict(stored_job.request_json or {})
+            request["providerRequestConsumption"] = consumption
+            stored_job.request_json = request
             stored_job.updated_at_utc = now
             session.flush()
             return True
@@ -3752,10 +4020,18 @@ class Phase1DomainService:
                 or result.model != job.model
                 or result.prompt_version != job.prompt_version
                 or not result.description.strip()
+                or not scene_description_usage_within_bounds(result.usage)
             ):
                 now = self._now()
                 self._settle_provider_reservation(
                     session, job=stored_job, now=now, consumed=True
+                )
+                self._settle_description_cost_reservation(
+                    session,
+                    job=stored_job,
+                    now=now,
+                    provider_called=True,
+                    usage=None,
                 )
                 stored_job.status = "Failed"
                 stored_job.next_attempt_at_utc = None
@@ -3797,11 +4073,15 @@ class Phase1DomainService:
             )
             session.add(description)
             session.flush()
-            if isinstance(result.usage, dict):
-                request["providerUsage"] = deepcopy(result.usage)
-                stored_job.request_json = request
             self._settle_provider_reservation(
                 session, job=stored_job, now=now, consumed=True
+            )
+            self._settle_description_cost_reservation(
+                session,
+                job=stored_job,
+                now=now,
+                provider_called=True,
+                usage=result.usage,
             )
             self._finish_description_job(stored_job, status="Succeeded", now=now)
             asset.last_processed_at_utc = now
@@ -3837,6 +4117,13 @@ class Phase1DomainService:
             now = self._now()
             self._settle_provider_reservation(
                 session, job=stored_job, now=now, consumed=provider_called
+            )
+            self._settle_description_cost_reservation(
+                session,
+                job=stored_job,
+                now=now,
+                provider_called=provider_called,
+                usage=None,
             )
             if provider_called and failure.failure_class in {
                 ProviderFailureClass.AUTHENTICATION,
@@ -3882,6 +4169,13 @@ class Phase1DomainService:
             now = self._now()
             self._settle_provider_reservation(
                 session, job=stored_job, now=now, consumed=provider_called
+            )
+            self._settle_description_cost_reservation(
+                session,
+                job=stored_job,
+                now=now,
+                provider_called=provider_called,
+                usage=None,
             )
             if provider_called:
                 self._open_provider_circuit(
@@ -3952,8 +4246,48 @@ class Phase1DomainService:
                 str(request["serviceTier"]),
                 int(request["maxWords"]),
                 int(request["monthlyCallLimit"]),
+                Decimal(
+                    str(
+                        request.get(
+                            "monthlyUsdLimit",
+                            self._scene_description_monthly_usd_limit,
+                        )
+                    )
+                ).quantize(USD_QUANTUM),
+                Decimal(
+                    str(
+                        request.get(
+                            "reservedUsdPerRequest",
+                            self._scene_description_reserved_usd_per_request,
+                        )
+                    )
+                ).quantize(USD_QUANTUM),
+                Decimal(
+                    str(
+                        request.get(
+                            "inputUsdPerMillion",
+                            self._scene_description_input_usd_per_million,
+                        )
+                    )
+                ),
+                Decimal(
+                    str(
+                        request.get(
+                            "cachedInputUsdPerMillion",
+                            self._scene_description_cached_input_usd_per_million,
+                        )
+                    )
+                ),
+                Decimal(
+                    str(
+                        request.get(
+                            "outputUsdPerMillion",
+                            self._scene_description_output_usd_per_million,
+                        )
+                    )
+                ),
             )
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError, InvalidOperation):
             return None
         claim_values = (
             claim.asset_revision,
@@ -3968,6 +4302,11 @@ class Phase1DomainService:
             claim.service_tier,
             claim.max_words,
             claim.monthly_call_limit,
+            claim.monthly_usd_limit,
+            claim.reserved_usd_per_request,
+            claim.input_usd_per_million,
+            claim.cached_input_usd_per_million,
+            claim.output_usd_per_million,
         )
         if request_values != claim_values:
             return None
@@ -4684,6 +5023,161 @@ class Phase1DomainService:
             usage.updated_at_utc = now
         request.pop("providerUsageReservation", None)
         job.request_json = request
+
+    def _settle_description_cost_reservation(
+        self,
+        session: Session,
+        *,
+        job: ProcessingJob,
+        now: datetime,
+        provider_called: bool,
+        usage: Mapping[str, Any] | None = None,
+    ) -> Decimal:
+        """Release reserved USD and charge actual or conservative provider cost."""
+
+        request = dict(job.request_json) if isinstance(job.request_json, dict) else {}
+        reservation = request.get("providerCostReservation")
+        if not isinstance(reservation, dict) or reservation.get("state") != "Reserved":
+            return Decimal("0.000000")
+        try:
+            usage_month = date.fromisoformat(str(reservation["usageMonth"]))
+            reserved = Decimal(str(reservation.get("units", "0"))).quantize(
+                USD_QUANTUM
+            )
+            provider = str(reservation.get("provider") or DESCRIPTION_PROVIDER)
+            input_rate = Decimal(
+                str(
+                    request.get(
+                        "inputUsdPerMillion",
+                        self._scene_description_input_usd_per_million,
+                    )
+                )
+            )
+            cached_rate = Decimal(
+                str(
+                    request.get(
+                        "cachedInputUsdPerMillion",
+                        self._scene_description_cached_input_usd_per_million,
+                    )
+                )
+            )
+            output_rate = Decimal(
+                str(
+                    request.get(
+                        "outputUsdPerMillion",
+                        self._scene_description_output_usd_per_million,
+                    )
+                )
+            )
+        except (KeyError, ValueError, InvalidOperation):
+            return Decimal("0.000000")
+        calculation = (
+            scene_description_cost_usd(
+                usage,
+                input_usd_per_million=input_rate,
+                cached_input_usd_per_million=cached_rate,
+                output_usd_per_million=output_rate,
+            )
+            if provider_called
+            else None
+        )
+        if not provider_called:
+            charged = Decimal("0.000000")
+            basis = "ReleasedNoProviderCall"
+            safe_usage = None
+        elif calculation is None:
+            charged = reserved
+            basis = "ConservativeReservation"
+            safe_usage = None
+        else:
+            charged, safe_usage = calculation
+            if charged > reserved:
+                charged = reserved
+                basis = "ConservativeReservation"
+            else:
+                basis = "ActualUsage"
+        if not provider_called:
+            consumption = request.get("providerRequestConsumption")
+            if (
+                isinstance(consumption, dict)
+                and consumption.get("state") == "Consumed"
+            ):
+                try:
+                    consumed_month = date.fromisoformat(
+                        str(consumption["usageMonth"])
+                    )
+                    consumed_units = Decimal(
+                        str(consumption.get("units", "1"))
+                    )
+                except (KeyError, ValueError, InvalidOperation):
+                    consumed_month = usage_month
+                    consumed_units = Decimal("0")
+                request_usage = ProviderUsageRepository(session).get(
+                    user_id=job.user_id,
+                    provider=str(consumption.get("provider") or provider),
+                    usage_month=consumed_month,
+                    unit_type="Request",
+                    for_update=True,
+                )
+                if request_usage is not None:
+                    request_usage.processed_units -= min(
+                        request_usage.processed_units,
+                        max(Decimal("0"), consumed_units),
+                    )
+                    request_usage.updated_at_utc = now
+                reversed_consumption = dict(consumption)
+                reversed_consumption["state"] = "Reversed"
+                reversed_consumption["reversedAtUtc"] = (
+                    _utc(now) or now
+                ).isoformat()
+                request["providerRequestConsumption"] = reversed_consumption
+        cost_usage = ProviderUsageRepository(session).get(
+            user_id=job.user_id,
+            provider=provider,
+            usage_month=usage_month,
+            unit_type="Usd",
+            for_update=True,
+        )
+        if cost_usage is not None:
+            cost_usage.reserved_units -= min(
+                cost_usage.reserved_units, max(Decimal("0"), reserved)
+            )
+            cost_usage.processed_units += charged
+            cost_usage.updated_at_utc = now
+        settled = dict(reservation)
+        settled["state"] = "Consumed" if provider_called else "Released"
+        settled["settledAtUtc"] = (_utc(now) or now).isoformat()
+        settled["chargedUsd"] = str(charged.quantize(USD_QUANTUM))
+        request["providerCostReservation"] = settled
+        request["providerCost"] = {
+            "currency": "USD",
+            "amount": str(charged.quantize(USD_QUANTUM)),
+            "basis": basis,
+            "ratesPerMillion": {
+                "input": str(input_rate),
+                "cachedInput": str(cached_rate),
+                "output": str(output_rate),
+            },
+        }
+        if safe_usage is not None:
+            request["providerUsage"] = deepcopy(safe_usage)
+        job.request_json = request
+        job.updated_at_utc = now
+        return charged
+
+    @staticmethod
+    def _description_provider_call_started(job: ProcessingJob) -> bool:
+        request = job.request_json if isinstance(job.request_json, dict) else {}
+        cost = request.get("providerCostReservation")
+        provider_request = request.get("providerUsageReservation")
+        return (
+            isinstance(cost, dict)
+            and cost.get("state") == "Reserved"
+            and not (
+                isinstance(provider_request, dict)
+                and provider_request.get("state") == "Reserved"
+            )
+        )
 
     @staticmethod
     def _open_provider_circuit(
