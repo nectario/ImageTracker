@@ -178,6 +178,12 @@ unacknowledged work after a network failure or interruption. Unchanged files
 reuse the local hash/metadata cache. Deletions are emitted only after the
 scanner completes a reliable read of the whole source.
 
+On the service side, each manifest prefetches existing assets, descriptions,
+and jobs once and batches new asset, occurrence, job, and change-feed writes at
+transaction boundaries. This keeps database round trips tied to the batch
+rather than multiplying them for every photo while preserving exact-hash
+deduplication and idempotent resume behavior.
+
 Useful operating commands:
 
 ```bash

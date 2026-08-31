@@ -710,6 +710,27 @@ class AssetRepository:
             .limit(1)
         )
 
+    def current_descriptions(
+        self, *, user_id: int, asset_ids: set[int]
+    ) -> dict[int, MediaDescription]:
+        """Prefetch current descriptions for a manifest batch."""
+
+        if not asset_ids:
+            return {}
+        rows = self.session.scalars(
+            select(MediaDescription)
+            .where(
+                MediaDescription.user_id == user_id,
+                MediaDescription.media_asset_id.in_(asset_ids),
+                MediaDescription.is_current == 1,
+            )
+            .order_by(MediaDescription.id.desc())
+        )
+        descriptions: dict[int, MediaDescription] = {}
+        for row in rows:
+            descriptions.setdefault(row.media_asset_id, row)
+        return descriptions
+
     def current_transcript(
         self, *, user_id: int, asset_id: int
     ) -> MediaTranscript | None:
@@ -934,6 +955,21 @@ class JobRepository:
                 ProcessingJob.idempotency_key == idempotency_key,
             )
         )
+
+    def by_idempotency_keys(
+        self, *, user_id: int, idempotency_keys: set[str]
+    ) -> dict[str, ProcessingJob]:
+        """Prefetch jobs used by every entry in one manifest batch."""
+
+        if not idempotency_keys:
+            return {}
+        rows = self.session.scalars(
+            select(ProcessingJob).where(
+                ProcessingJob.user_id == user_id,
+                ProcessingJob.idempotency_key.in_(idempotency_keys),
+            )
+        )
+        return {row.idempotency_key: row for row in rows}
 
     def list_after(
         self,

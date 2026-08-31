@@ -1,13 +1,13 @@
 # Phase 1 Local Mode and Enrichment Status
 
-Implementation snapshot: 2026-08-29. The Local-mode core is deployed to
+Implementation snapshot: 2026-08-30. The Local-mode core is deployed to
 `image-tracker-prod` in `us-east-2`; the original acceptance evidence below was
 measured against that stack on 2026-08-27. Reverse geocoding and scene
 description are now deployed in the bounded production worker. Only a synthetic
 disposable photo—not the user's production library—was used for acceptance.
 
 Production schema migrations `012` and `013` were applied and verified on
-2026-08-28. The enrichment package subsequently passed the complete 273-test
+2026-08-28. The enrichment package subsequently passed the complete 275-test
 suite, repository artifact validation, and AWS CloudFormation validation. The
 authorized application/worker deployment completed successfully.
 
@@ -39,6 +39,16 @@ successfully processed measured production batches in 4.7–8.4 seconds. Saved
 manifests resume before optional scene enrichment, retryable preview deferrals
 no longer produce a false failure exit, and a per-source process lock prevents
 overlapping CLI syncs.
+
+The 2026-08-30 repository fast path, validated but not yet deployed, removes
+the next bottleneck inside each hash-enriched manifest transaction. Existing
+descriptions and jobs are prefetched once, new hash-addressed assets are
+prepared as a batch, and new occurrences, description jobs, and their change
+rows flush at batch boundaries instead of repeatedly per photo. A 50-photo
+regression test bounds the manifest to six SELECT statements, and mixed valid
+and rejected entries retain their original outcomes without creating stray
+assets, occurrences, or jobs. Production MySQL latency remains to be measured
+after an authorized deployment.
 
 ## Scope delivered in the repository
 

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -588,6 +589,149 @@ def test_local_manifest_deduplicates_exact_bytes_and_replays_idempotently(
         assert session.scalar(select(func.count()).select_from(MediaAsset)) == 1
         assert session.scalar(select(func.count()).select_from(MediaOccurrence)) == 2
         assert session.scalar(select(func.count()).select_from(MediaLocation)) == 1
+
+
+def test_hash_manifest_batch_does_not_select_once_per_entry(
+    service, session_factory
+) -> None:
+    user = bootstrap(service)
+    device = register_device(
+        service,
+        user.user_id,
+        key="00000000-0000-0000-0000-000000000091",
+        name="Batch",
+    )
+    source = create_source(
+        service, user.user_id, device.device_id, source_key="batch-source"
+    )
+    entries = tuple(
+        replace(
+            manifest_upsert(
+                f"batch-{index}",
+                content_hash=f"{index + 1:064x}",
+            ),
+            location=None,
+        )
+        for index in range(50)
+    )
+    selects: list[str] = []
+    engine = session_factory.kw["bind"]
+
+    def record_select(
+        _connection, _cursor, statement, _parameters, _context, _executemany
+    ) -> None:
+        if statement.lstrip().upper().startswith("SELECT"):
+            selects.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record_select)
+    try:
+        result = run(
+            service.submit_manifest(
+                user.user_id,
+                source.source_id,
+                ManifestCommand(
+                    kind="Incremental",
+                    permission_state="NotApplicable",
+                    deletion_detection_reliable=True,
+                    entries=entries,
+                ),
+                context("manifest-batch-query-count"),
+            )
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", record_select)
+
+    assert result.value.counts.created == 50
+    assert len(selects) <= 6, "\n\n".join(selects)
+
+    with transaction_scope(session_factory) as session:
+        assert session.scalar(select(func.count()).select_from(MediaAsset)) == 50
+        assert session.scalar(select(func.count()).select_from(MediaOccurrence)) == 50
+        assert session.scalar(select(func.count()).select_from(ProcessingJob)) == 50
+        occurrence_changes = list(
+            session.scalars(
+                select(MediaChange).where(
+                    MediaChange.entity_type == "MediaOccurrence"
+                )
+            )
+        )
+        assert len(occurrence_changes) == 50
+        assert all(change.media_asset_id is not None for change in occurrence_changes)
+
+
+def test_hash_manifest_precreation_preserves_mixed_batch_rejections(
+    service, session_factory
+) -> None:
+    user = bootstrap(service)
+    device = register_device(
+        service,
+        user.user_id,
+        key="00000000-0000-0000-0000-000000000092",
+        name="Mixed Batch",
+    )
+    source = create_source(
+        service, user.user_id, device.device_id, source_key="mixed-batch-source"
+    )
+    accepted_hash = "b" * 64
+    entries = (
+        replace(
+            manifest_upsert("accepted", content_hash=accepted_hash),
+            location=None,
+        ),
+        replace(
+            manifest_upsert("accepted", content_hash="c" * 64),
+            file_name="duplicate.JPG",
+            local_locator="C:/Photos/duplicate.JPG",
+            location=None,
+        ),
+        replace(
+            manifest_upsert("invalid-hash", content_hash="not-a-sha256"),
+            location=None,
+        ),
+        replace(
+            manifest_upsert("size-mismatch", content_hash=accepted_hash),
+            byte_size=9999,
+            location=None,
+        ),
+    )
+
+    result = run(
+        service.submit_manifest(
+            user.user_id,
+            source.source_id,
+            ManifestCommand(
+                kind="Incremental",
+                permission_state="NotApplicable",
+                deletion_detection_reliable=True,
+                entries=entries,
+            ),
+            context("manifest-mixed-precreation"),
+        )
+    ).value
+
+    assert result.counts.created == 1
+    assert result.counts.rejected == 3
+    assert [item.outcome for item in result.results] == [
+        "CreatedOccurrence",
+        "Rejected",
+        "Rejected",
+        "Rejected",
+    ]
+    assert [item.error_code for item in result.results] == [
+        None,
+        "DuplicateManifestEntry",
+        "InvalidContentHash",
+        "ContentHashMetadataMismatch",
+    ]
+
+    with transaction_scope(session_factory) as session:
+        assert session.scalar(select(func.count()).select_from(MediaAsset)) == 1
+        occurrences = list(session.scalars(select(MediaOccurrence)))
+        assert [item.source_item_id for item in occurrences] == ["accepted"]
+        jobs = list(session.scalars(select(ProcessingJob)))
+        assert len(jobs) == 1
+        assert jobs[0].job_type == "Description"
+        assert jobs[0].media_asset_id == occurrences[0].media_asset_id
 
 
 def test_geocode_jobs_dispatch_once_and_reuse_full_nearby_resolution(

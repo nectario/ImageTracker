@@ -692,7 +692,33 @@ class Phase1DomainService:
                     user_id=account.id,
                     sha256_values=content_hashes,
                 )
+                new_asset_hashes = self._prepare_manifest_assets(
+                    session=session,
+                    source=source,
+                    entries=command.entries,
+                    asset_index=asset_index,
+                    now=now,
+                )
+                preexisting_asset_ids = {
+                    asset.id
+                    for content_hash, asset in asset_index.items()
+                    if content_hash not in new_asset_hashes
+                }
+                description_index = AssetRepository(session).current_descriptions(
+                    user_id=account.id,
+                    asset_ids=preexisting_asset_ids,
+                )
+                description_job_index = JobRepository(session).by_idempotency_keys(
+                    user_id=account.id,
+                    idempotency_keys={
+                        f"description:{asset.public_id}"
+                        for content_hash, asset in asset_index.items()
+                        if content_hash not in new_asset_hashes
+                    },
+                )
                 deferred_pending_occurrences: list[MediaOccurrence] = []
+                deferred_hashed_occurrences: list[MediaOccurrence] = []
+                deferred_description_jobs: list[ProcessingJob] = []
                 for entry in command.entries:
                     if entry.source_item_id in seen_item_ids:
                         result = ManifestEntryResult(
@@ -725,8 +751,17 @@ class Phase1DomainService:
                                     geocode_job_ids=geocode_job_ids,
                                     occurrence_index=occurrence_index,
                                     asset_index=asset_index,
+                                    new_asset_hashes=new_asset_hashes,
+                                    description_index=description_index,
+                                    description_job_index=description_job_index,
                                     deferred_pending_occurrences=(
                                         deferred_pending_occurrences
+                                    ),
+                                    deferred_hashed_occurrences=(
+                                        deferred_hashed_occurrences
+                                    ),
+                                    deferred_description_jobs=(
+                                        deferred_description_jobs
                                     ),
                                 )
                         except (ConflictError, ValueError) as exc:
@@ -749,15 +784,31 @@ class Phase1DomainService:
                     counts[count_key] += 1
                     results.append(result)
 
-                # New fast-add occurrences are flushed as one ORM batch, then
-                # their change-feed rows are flushed as a second batch.
+                # New occurrences and description jobs are flushed as ORM
+                # batches, then their ID-dependent change rows are queued.
                 session.flush()
                 changes = ChangeRepository(session)
-                for occurrence in deferred_pending_occurrences:
+                for job in deferred_description_jobs:
+                    changes.add(
+                        user_id=account.id,
+                        source_id=job.media_source_id,
+                        asset_id=job.media_asset_id,
+                        entity_type="ProcessingJob",
+                        entity_id=job.id,
+                        entity_public_id=job.public_id,
+                        change_type="Upsert",
+                        now=now,
+                        flush=False,
+                    )
+                for occurrence in (
+                    *deferred_pending_occurrences,
+                    *deferred_hashed_occurrences,
+                ):
                     changes.add(
                         user_id=account.id,
                         device_id=source.device_id,
                         source_id=source.id,
+                        asset_id=occurrence.media_asset_id,
                         occurrence_id=occurrence.id,
                         entity_type="MediaOccurrence",
                         entity_id=occurrence.id,
@@ -818,7 +869,12 @@ class Phase1DomainService:
         geocode_job_ids: list[UUID],
         occurrence_index: dict[str, MediaOccurrence] | None = None,
         asset_index: dict[str, MediaAsset] | None = None,
+        new_asset_hashes: set[str] | None = None,
+        description_index: dict[int, MediaDescription] | None = None,
+        description_job_index: dict[str, ProcessingJob] | None = None,
         deferred_pending_occurrences: list[MediaOccurrence] | None = None,
+        deferred_hashed_occurrences: list[MediaOccurrence] | None = None,
+        deferred_description_jobs: list[ProcessingJob] | None = None,
     ) -> ManifestEntryResult:
         if entry.byte_size <= 0:
             raise ConflictError("InvalidByteSize", "Media byte size must be positive")
@@ -1001,45 +1057,29 @@ class Phase1DomainService:
                 user_id=account.id, sha256=content_hash
             )
         )
-        asset_created = asset is None
+        asset_created = (
+            new_asset_hashes is not None and content_hash in new_asset_hashes
+        ) or asset is None
         if asset is not None and asset.byte_size != entry.byte_size:
             raise ConflictError(
                 "ContentHashMetadataMismatch",
                 "The content hash is already associated with a different byte size",
             )
         if asset is None:
-            capture_source, capture_confidence = self._capture_provenance(entry)
-            asset = MediaAsset(
-                user_id=account.id,
-                content_sha256=content_hash,
-                content_hash_source="ClientDeclared",
-                media_type=entry.media_type,
-                mime_type=entry.mime_type,
-                byte_size=entry.byte_size,
-                width_pixels=entry.width_pixels,
-                height_pixels=entry.height_pixels,
-                duration_milliseconds=entry.duration_ms,
-                capture_datetime_local=_db_datetime(entry.captured_at_local),
-                capture_datetime_utc=_db_datetime(entry.captured_at_utc),
-                time_zone=entry.time_zone_id,
-                utc_offset_minutes=entry.utc_offset_minutes,
-                capture_time_source=capture_source,
-                capture_time_confidence=capture_confidence,
-                metadata_json={
-                    "provenance": [item.as_json() for item in entry.provenance]
-                },
-                metadata_version="ManifestV1",
-                storage_state=(
-                    "UploadPending" if source.storage_mode == "Remote" else "LocalOnly"
-                ),
-                lifecycle_state="Active",
-                created_at_utc=now,
-                updated_at_utc=now,
+            asset = self._new_manifest_asset(
+                account_id=account.id,
+                source=source,
+                entry=entry,
+                content_hash=content_hash,
+                now=now,
             )
             session.add(asset)
             session.flush()
             if asset_index is not None:
                 asset_index[content_hash] = asset
+        if asset_created:
+            if new_asset_hashes is not None:
+                new_asset_hashes.discard(content_hash)
             ChangeRepository(session).add(
                 user_id=account.id,
                 device_id=source.device_id,
@@ -1050,6 +1090,7 @@ class Phase1DomainService:
                 entity_public_id=asset.public_id,
                 change_type="Upsert",
                 now=now,
+                flush=deferred_hashed_occurrences is None,
             )
         else:
             asset_enriched = self._merge_asset_metadata(asset, entry=entry, now=now)
@@ -1068,6 +1109,7 @@ class Phase1DomainService:
                     entity_public_id=asset.public_id,
                     change_type="Upsert",
                     now=now,
+                    flush=deferred_hashed_occurrences is None,
                 )
 
         if asset.lifecycle_state == "Trashed":
@@ -1082,6 +1124,7 @@ class Phase1DomainService:
                 entity_public_id=asset.public_id,
                 change_type="Upsert",
                 now=now,
+                flush=deferred_hashed_occurrences is None,
             )
 
         existing_unchanged = (
@@ -1096,6 +1139,7 @@ class Phase1DomainService:
         )
         if occurrence is None:
             occurrence = MediaOccurrence(
+                public_id=str(uuid4()),
                 user_id=account.id,
                 media_source_id=source.id,
                 media_asset_id=asset.id,
@@ -1126,7 +1170,13 @@ class Phase1DomainService:
             occurrence.deleted_at_utc = None
             occurrence.last_seen_at_utc = now
             occurrence.updated_at_utc = now
-        session.flush()
+        if occurrence_created and deferred_hashed_occurrences is not None:
+            deferred_hashed_occurrences.append(occurrence)
+        elif old_asset_id is not None and old_asset_id != asset.id:
+            # The orphan check below must observe the occurrence's new asset.
+            session.flush()
+        elif deferred_hashed_occurrences is None:
+            session.flush()
         if occurrence_index is not None:
             occurrence_index[entry.source_item_id] = occurrence
 
@@ -1158,20 +1208,25 @@ class Phase1DomainService:
             source=source,
             file_name=entry.file_name,
             now=now,
+            description_index=description_index,
+            job_index=description_job_index,
+            deferred_jobs=deferred_description_jobs,
         )
         if not existing_unchanged:
-            ChangeRepository(session).add(
-                user_id=account.id,
-                device_id=source.device_id,
-                source_id=source.id,
-                asset_id=asset.id,
-                occurrence_id=occurrence.id,
-                entity_type="MediaOccurrence",
-                entity_id=occurrence.id,
-                entity_public_id=occurrence.public_id,
-                change_type="Upsert",
-                now=now,
-            )
+            if not occurrence_created or deferred_hashed_occurrences is None:
+                ChangeRepository(session).add(
+                    user_id=account.id,
+                    device_id=source.device_id,
+                    source_id=source.id,
+                    asset_id=asset.id,
+                    occurrence_id=occurrence.id,
+                    entity_type="MediaOccurrence",
+                    entity_id=occurrence.id,
+                    entity_public_id=occurrence.public_id,
+                    change_type="Upsert",
+                    now=now,
+                    flush=deferred_hashed_occurrences is None,
+                )
         outcome = (
             "Unchanged"
             if existing_unchanged
@@ -1260,6 +1315,85 @@ class Phase1DomainService:
             }:
                 return provenance.source, provenance.confidence
         return ("Unknown" if entry.captured_at_local or entry.captured_at_utc else None, None)
+
+    def _prepare_manifest_assets(
+        self,
+        *,
+        session: Session,
+        source: MediaSource,
+        entries: Sequence[ManifestUpsert | ManifestDelete],
+        asset_index: dict[str, MediaAsset],
+        now: datetime,
+    ) -> set[str]:
+        """Create new hash-addressed assets with one batch-oriented flush."""
+
+        prepared_hashes: set[str] = set()
+        seen_item_ids: set[str] = set()
+        for entry in entries:
+            if entry.source_item_id in seen_item_ids:
+                continue
+            seen_item_ids.add(entry.source_item_id)
+            if (
+                not isinstance(entry, ManifestUpsert)
+                or entry.byte_size <= 0
+                or not isinstance(entry.content_sha256, str)
+            ):
+                continue
+            content_hash = entry.content_sha256.lower()
+            if not HEX_SHA256.fullmatch(content_hash) or content_hash in asset_index:
+                continue
+            asset = self._new_manifest_asset(
+                account_id=source.user_id,
+                source=source,
+                entry=entry,
+                content_hash=content_hash,
+                now=now,
+            )
+            session.add(asset)
+            asset_index[content_hash] = asset
+            prepared_hashes.add(content_hash)
+        if prepared_hashes:
+            session.flush()
+        return prepared_hashes
+
+    def _new_manifest_asset(
+        self,
+        *,
+        account_id: int,
+        source: MediaSource,
+        entry: ManifestUpsert,
+        content_hash: str,
+        now: datetime,
+    ) -> MediaAsset:
+        capture_source, capture_confidence = self._capture_provenance(entry)
+        return MediaAsset(
+            public_id=str(uuid4()),
+            user_id=account_id,
+            content_sha256=content_hash,
+            content_hash_source="ClientDeclared",
+            media_type=entry.media_type,
+            mime_type=entry.mime_type,
+            byte_size=entry.byte_size,
+            width_pixels=entry.width_pixels,
+            height_pixels=entry.height_pixels,
+            duration_milliseconds=entry.duration_ms,
+            capture_datetime_local=_db_datetime(entry.captured_at_local),
+            capture_datetime_utc=_db_datetime(entry.captured_at_utc),
+            time_zone=entry.time_zone_id,
+            utc_offset_minutes=entry.utc_offset_minutes,
+            capture_time_source=capture_source,
+            capture_time_confidence=capture_confidence,
+            metadata_json={
+                "provenance": [item.as_json() for item in entry.provenance]
+            },
+            metadata_version="ManifestV1",
+            storage_state=(
+                "UploadPending" if source.storage_mode == "Remote" else "LocalOnly"
+            ),
+            lifecycle_state="Active",
+            created_at_utc=now,
+            updated_at_utc=now,
+        )
 
     def _merge_asset_metadata(
         self, asset: MediaAsset, *, entry: ManifestUpsert, now: datetime
@@ -1548,6 +1682,9 @@ class Phase1DomainService:
         source: MediaSource,
         file_name: str,
         now: datetime,
+        description_index: dict[int, MediaDescription] | None = None,
+        job_index: dict[str, ProcessingJob] | None = None,
+        deferred_jobs: list[ProcessingJob] | None = None,
     ) -> UUID | None:
         """Return the one staging-gated scene-description job for a photo."""
 
@@ -1558,8 +1695,12 @@ class Phase1DomainService:
             or not normalized_name.endswith(SCENE_PREVIEW_EXTENSIONS)
         ):
             return None
-        current = AssetRepository(session).current_description(
-            user_id=account.id, asset_id=asset.id
+        current = (
+            description_index.get(asset.id)
+            if description_index is not None
+            else AssetRepository(session).current_description(
+                user_id=account.id, asset_id=asset.id
+            )
         )
         if (
             current is not None
@@ -1571,8 +1712,12 @@ class Phase1DomainService:
 
         idempotency_key = f"description:{asset.public_id}"
         repository = JobRepository(session)
-        existing = repository.by_idempotency_key(
-            user_id=account.id, idempotency_key=idempotency_key
+        existing = (
+            job_index.get(idempotency_key)
+            if job_index is not None
+            else repository.by_idempotency_key(
+                user_id=account.id, idempotency_key=idempotency_key
+            )
         )
         if existing is not None:
             request = (
@@ -1613,6 +1758,7 @@ class Phase1DomainService:
             return _uuid(existing.public_id)
 
         job = ProcessingJob(
+            public_id=str(uuid4()),
             user_id=account.id,
             media_asset_id=asset.id,
             media_source_id=source.id,
@@ -1637,17 +1783,22 @@ class Phase1DomainService:
             updated_at_utc=now,
         )
         session.add(job)
-        session.flush()
-        ChangeRepository(session).add(
-            user_id=account.id,
-            source_id=source.id,
-            asset_id=asset.id,
-            entity_type="ProcessingJob",
-            entity_id=job.id,
-            entity_public_id=job.public_id,
-            change_type="Upsert",
-            now=now,
-        )
+        if job_index is not None:
+            job_index[idempotency_key] = job
+        if deferred_jobs is not None:
+            deferred_jobs.append(job)
+        else:
+            session.flush()
+            ChangeRepository(session).add(
+                user_id=account.id,
+                source_id=source.id,
+                asset_id=asset.id,
+                entity_type="ProcessingJob",
+                entity_id=job.id,
+                entity_public_id=job.public_id,
+                change_type="Upsert",
+                now=now,
+            )
         return _uuid(job.public_id)
 
     def _require_temporary_object_store(self) -> TemporaryObjectStore:
