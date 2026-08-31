@@ -85,7 +85,12 @@ paused. Its production 10,000-row metadata gate completed in 10.30 seconds with
 job-state totals, either provider ledger, the general processing queue, or the
 local scene outbox. The CLI supports staged gates through `--bulk-max-rows`; a
 completed segment stops before rescanning and leaves uncaptured batches
-pending. The remaining 780 saved metadata batches were deliberately not run.
+pending. After explicit approval, one final 77,967-row import consumed all 780
+remaining batches in 72.25 seconds using 206 MiB of the 1,024 MiB worker. It
+also produced zero rejects and zero enrichment, provider-ledger, scene-outbox,
+or queue delta. No pending or failed manifest batches remain. The optional
+fresh filesystem rescan that follows an empty outbox was interrupted before it
+created a scan or manifest record, keeping this rollout scoped to saved work.
 
 ## Scope delivered in the repository
 
@@ -227,6 +232,7 @@ that subject, and confirms both Cognito and MySQL cleanup before returning.
 | Resume safety | An unacknowledged local outbox batch is sent successfully on the next sync | Pass in integration tests; failed entries are separately quarantined and releasable |
 | Bulk MySQL canary | Exact deduplication, rejection audit, replay, and cleanup pass | Pass live; four rows produced two assets, three occurrences, one duplicate link, one expected rejection, and zero residue |
 | Staged bulk metadata | 1,000 then 10,000 rows complete without metadata rejection | Pass live; 1,000/1,000 then 10,000/10,000, zero rejects and zero failed local batches |
+| Complete saved backlog | Remaining batches clear in one bounded import | Pass live; 77,967/77,967 updates from 780 batches in 72.25 seconds, zero rejects, pending batches `0`, failed batches `0` |
 | Metadata/enrichment boundary | Metadata changes no job, provider-ledger, scene-outbox, or general-queue state | Pass live at 10,000 rows; `ProcessingJob=73,155`, max ID `74,844`, provider rows and 240 paused messages remained exact |
 | Local storage boundary | Local sync performs zero original/preview writes to S3 | Pass live; bucket inventory remained 0 objects/0 bytes and every asset S3 locator was null |
 | Reliable deletion | Completed scan emits a deletion; incomplete traversal does not infer deletion | Pass in scanner/domain integration tests; unreadable traversal exits partial |
