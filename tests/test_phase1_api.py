@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from typing import Any
@@ -18,6 +18,11 @@ from sqlalchemy.pool import StaticPool
 from services.api.app import create_app
 from services.api.domain_adapter import DomainServiceAdapter
 from services.api.job_dispatcher import JobDispatchError, SqsJobDispatcher
+from services.api.manifest_store import (
+    MANIFEST_CONTENT_ENCODING,
+    MANIFEST_CONTENT_TYPE,
+    S3ManifestObjectStore,
+)
 from services.api.temporary_store import S3TemporaryObjectStore
 from services.api.models import (
     ChangePage,
@@ -471,6 +476,72 @@ def test_s3_temporary_store_signs_and_verifies_exact_preview_bytes():
     assert client.deleted == [
         {"Bucket": "media-bucket", "Key": upload.object_key}
     ]
+
+
+def test_s3_manifest_store_binds_private_gzip_bytes_and_result_download():
+    checksum_hex = "cd" * 32
+    checksum_base64 = base64.b64encode(bytes.fromhex(checksum_hex)).decode("ascii")
+
+    class FakeS3:
+        def __init__(self) -> None:
+            self.presigned: list[tuple[str, dict[str, Any]]] = []
+
+        def generate_presigned_url(self, operation: str, **kwargs: Any) -> str:
+            self.presigned.append((operation, kwargs))
+            return f"https://private.example/{operation}"
+
+        def head_object(self, **kwargs: Any) -> dict[str, Any]:
+            assert kwargs["ChecksumMode"] == "ENABLED"
+            return {
+                "ContentLength": 1234,
+                "ContentType": MANIFEST_CONTENT_TYPE,
+                "ContentEncoding": MANIFEST_CONTENT_ENCODING,
+                "ChecksumSHA256": checksum_base64,
+                "VersionId": "version-1",
+            }
+
+    client = FakeS3()
+    store = S3ManifestObjectStore(client=client, bucket="media-bucket")
+    expires = datetime.now(timezone.utc) + timedelta(minutes=10)
+    upload = store.create_input_upload(
+        user_id=UUID("00000000-0000-0000-0000-000000000001"),
+        source_id=UUID("00000000-0000-0000-0000-000000000002"),
+        import_id=UUID("00000000-0000-0000-0000-000000000003"),
+        checksum_sha256_hex=checksum_hex,
+        content_length=1234,
+        expires_at_utc=expires,
+    )
+
+    assert upload.object_key.startswith("manifests/input/")
+    assert upload.headers == {
+        "Content-Type": MANIFEST_CONTENT_TYPE,
+        "Content-Encoding": MANIFEST_CONTENT_ENCODING,
+        "Content-Length": "1234",
+        "x-amz-checksum-sha256": checksum_base64,
+        "x-amz-meta-imagetracker-schema-version": "ManifestNdjsonV1",
+    }
+    put_params = client.presigned[0][1]["Params"]
+    assert put_params["ContentLength"] == 1234
+    assert put_params["ChecksumSHA256"] == checksum_base64
+
+    metadata = store.head_object(
+        bucket=upload.bucket,
+        object_key=upload.object_key,
+    )
+    assert metadata is not None
+    assert metadata.checksum_sha256_hex == checksum_hex
+    assert metadata.content_encoding == "gzip"
+    assert metadata.version_id == "version-1"
+
+    download = store.create_result_download(
+        bucket="media-bucket",
+        object_key="manifests/result/user/import.result.ndjson.gz",
+        expires_at_utc=expires,
+    )
+    assert download.url.endswith("/get_object")
+    get_params = client.presigned[-1][1]["Params"]
+    assert get_params["ResponseContentType"] == MANIFEST_CONTENT_TYPE
+    assert get_params["ResponseContentEncoding"] == MANIFEST_CONTENT_ENCODING
 
 
 def test_cognito_claims_are_read_from_mangum_scope_not_raw_bearer_header():

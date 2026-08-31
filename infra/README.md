@@ -149,8 +149,7 @@ required reverse-geocode permission, and verify that requests retain
 `IntendedUse=Storage`. Provider values must never be placed in tracked `.env`
 files, Serverless parameters, CloudFormation output, or shell history.
 
-Before deploying this enrichment build, pause ImageTracker sync/importer work,
-verify the queue is empty, then preview and apply the two additive migrations:
+Before deploying this build, preview and apply the additive migrations:
 
 ```bash
 cd /mnt/c/Development/Projects/ImageTracker
@@ -159,10 +158,23 @@ cd /mnt/c/Development/Projects/ImageTracker
 ./scripts/db-smoke.sh
 ```
 
-Migration 012 adds the provider circuit columns and migration 013 widens
-international provider/address fields. The wrapper refuses a non-`ImageTracker`
-database or active processing rows and reconciles a DDL that committed before
-its ledger marker.
+Migration 012 adds the provider circuit columns, migration 013 widens
+international provider/address fields, and migration 014 creates the durable
+bulk-manifest import, raw staging, asset-work, and failure tables plus an online
+occurrence lookup index. The wrapper refuses a non-`ImageTracker` database and
+reconciles DDL that committed before its ledger marker. The earlier table-
+rewriting ALTERs still require processing to be idle; migration 014 uses
+replay-safe `CREATE TABLE IF NOT EXISTS` statements and a `LOCK=NONE` index, so
+queued enrichment jobs do not block that additive rollout.
+
+Bulk manifests use the existing private media bucket under `manifests/input/`
+and `manifests/result/`, plus a dedicated encrypted queue, dead-letter queue,
+five-minute recovery rule, and one-concurrent Lambda (1,024 MiB, 2 GiB `/tmp`,
+15-minute timeout). Inputs expire after seven days. Result artifacts are kept
+because they are the durable client-reconciliation source after the large
+staging rows are purged; they contain metadata identities and outcomes, never
+original photo/video bytes. A later explicit client-ack cleanup can replace
+that retention policy without weakening offline resume safety.
 
 After schema verification, deployment is explicit. CloudFormation parameters
 are rendered during packaging; the budget subscriber is updated in place after

@@ -85,6 +85,32 @@ class ManifestOutcome(StringEnum):
     REJECTED = "Rejected"
 
 
+class ManifestImportStatus(StringEnum):
+    AWAITING_UPLOAD = "AwaitingUpload"
+    QUEUED = "Queued"
+    RUNNING = "Running"
+    RETRY_DUE = "RetryDue"
+    SUCCEEDED = "Succeeded"
+    COMPLETED_WITH_ERRORS = "CompletedWithErrors"
+    FAILED_PERMANENT = "FailedPermanent"
+    CANCELLED = "Cancelled"
+    EXPIRED = "Expired"
+
+
+class ManifestImportPhase(StringEnum):
+    PREPARING = "Preparing"
+    WAITING_FOR_UPLOAD = "WaitingForUpload"
+    QUEUED = "Queued"
+    DOWNLOADING = "Downloading"
+    VALIDATING = "Validating"
+    LOADING = "Loading"
+    STAGED = "Staged"
+    MERGING = "Merging"
+    MERGED = "Merged"
+    WRITING_RESULT = "WritingResult"
+    COMPLETE = "Complete"
+
+
 class ProvenanceSource(StringEnum):
     EXIF = "Exif"
     DEVICE = "Device"
@@ -413,6 +439,18 @@ class ManifestResponse(ApiModel):
     results: list[ManifestEntryResult]
 
 
+class ManifestImportCreateRequest(ApiModel):
+    snapshot_id: UUID
+    kind: Literal["Full"] = "Full"
+    permission_state: PermissionState
+    deletion_detection_reliable: Literal[False] = False
+    client_cursor: str | None = Field(default=None, max_length=1024)
+    schema_version: Literal["ManifestNdjsonV1"] = "ManifestNdjsonV1"
+    checksum_sha256: str = Field(pattern=r"^[A-Fa-f0-9]{64}$")
+    byte_size: int = Field(ge=1, le=268_435_456)
+    entry_count: int = Field(ge=1, le=250_000)
+
+
 class UploadPlanRequest(ApiModel):
     source_id: UUID
     occurrence_id: UUID
@@ -440,6 +478,35 @@ class SignedUploadRequest(ApiModel):
     method: Literal["PUT"]
     headers: dict[str, str]
     expires_at_utc: datetime
+
+
+class ManifestImport(ApiModel):
+    import_id: UUID
+    source_id: UUID
+    snapshot_id: UUID
+    schema_version: Literal["ManifestNdjsonV1"]
+    status: ManifestImportStatus
+    phase: ManifestImportPhase
+    entry_count: int = Field(ge=1)
+    validated_entry_count: int = Field(ge=0)
+    processed_entry_count: int = Field(ge=0)
+    counts: ManifestCounts
+    upload: SignedUploadRequest | None = None
+    upload_expires_at_utc: datetime | None = None
+    next_attempt_at_utc: datetime | None = None
+    failure_code: str | None = None
+    failure_message: str | None = None
+    result_available: bool = False
+    created_at_utc: datetime
+    updated_at_utc: datetime
+    completed_at_utc: datetime | None = None
+
+
+class ManifestImportResultDownload(ApiModel):
+    url: str
+    expires_at_utc: datetime
+    checksum_sha256: str = Field(pattern=r"^[A-Fa-f0-9]{64}$")
+    byte_size: int = Field(ge=1)
 
 
 class MultipartUploadPlan(ApiModel):

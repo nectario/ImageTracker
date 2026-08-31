@@ -3,9 +3,19 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import time
 from typing import Any, Callable, Mapping, Sequence
+import uuid
 
 from .api_client import ApiClient, ApiError, ApiProblem
+from .bulk import (
+    MAX_COMPRESSED_BYTES,
+    MANIFEST_SCHEMA_VERSION,
+    BulkArtifactError,
+    iter_result_entries,
+    read_result_header,
+    write_manifest_gzip,
+)
 from .media import MediaScanner, stream_sha256
 from .scene_preview import (
     SCENE_PREVIEW_CAPABILITY_VERSION,
@@ -13,10 +23,21 @@ from .scene_preview import (
     ScenePreviewError,
     prepare_scene_preview,
 )
-from .state import DescriptionOutboxItem, LocalState, SourceBinding
+from .state import (
+    BulkManifestOutboxItem,
+    DescriptionOutboxItem,
+    LocalState,
+    OutboxBatch,
+    SourceBinding,
+)
 
 
 MANIFEST_BATCH_SIZE = 100
+DEFAULT_ENRICHMENT_LIMIT = 100
+BULK_AUTO_BATCH_THRESHOLD = 10
+BULK_AUTO_ROW_THRESHOLD = 1_000
+BULK_RESULT_APPLY_PAGE_SIZE = 500
+BULK_POLL_MAX_ATTEMPTS = 120
 
 
 @dataclass
@@ -50,6 +71,28 @@ class SyncSummary:
     scan_seconds: float = 0.0
     scan_files_per_second: float = 0.0
     hash_pending: int = 0
+    bulk_state: str | None = None
+    bulk_phase: str | None = None
+    bulk_processed: int = 0
+    bulk_total: int = 0
+    bulk_captured_batches: int = 0
+    bulk_completed: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class EnrichmentSummary:
+    source_id: str
+    root_path: str
+    limit: int
+    descriptions_staged: int = 0
+    descriptions_recovered: int = 0
+    description_pending: int = 0
+    description_deferred: int = 0
+    description_quarantined: int = 0
+    failed: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -65,6 +108,7 @@ class SyncEngine:
         progress: Callable[[str], None] | None = None,
         preview_factory: Callable[[str | Path], ScenePreview] = prepare_scene_preview,
         hash_file: Callable[[Path], str] = stream_sha256,
+        sleep: Callable[[float], None] = time.sleep,
     ):
         self.api = api
         self.state = state
@@ -72,6 +116,7 @@ class SyncEngine:
         self.progress = progress or (lambda _message: None)
         self.preview_factory = preview_factory
         self.hash_file = hash_file
+        self.sleep = sleep
 
     def sync(
         self,
@@ -81,7 +126,13 @@ class SyncEngine:
         force_rehash: bool = False,
         scan_workers: int | None = None,
         fast_add: bool = False,
+        with_enrichment: bool = False,
+        enrichment_limit: int = DEFAULT_ENRICHMENT_LIMIT,
+        transport: str = "auto",
     ) -> SyncSummary:
+        self._validate_enrichment_limit(enrichment_limit)
+        if transport not in {"auto", "bulk", "batch"}:
+            raise ValueError("Sync transport must be auto, bulk, or batch")
         summary = SyncSummary(
             source_id=binding.source_id,
             root_path=binding.root_path,
@@ -98,14 +149,15 @@ class SyncEngine:
         summary.resumed_batches = len(pending)
         if pending and not dry_run:
             self.progress(f"Resuming {len(pending)} saved manifest batch(es)")
-            if not self._flush_pending(binding, summary):
-                self._add_description_attention_counts(binding, summary)
+            if not self._deliver_pending(binding, summary, transport=transport):
+                self._add_description_attention_counts(
+                    binding,
+                    summary,
+                    count_as_failed=with_enrichment,
+                )
                 return summary
         elif pending:
             summary.queued_batches += len(pending)
-
-        if not dry_run:
-            self._flush_description_outbox(binding, summary)
 
         root = Path(binding.root_path)
         self.progress(f"Scanning {root}")
@@ -162,8 +214,17 @@ class SyncEngine:
         if not entries:
             self.progress("Library is already in sync")
             if not dry_run:
-                self._flush_description_outbox(binding, summary)
-                self._add_description_attention_counts(binding, summary)
+                if with_enrichment:
+                    self._flush_description_outbox(
+                        binding,
+                        summary,
+                        limit=enrichment_limit,
+                    )
+                self._add_description_attention_counts(
+                    binding,
+                    summary,
+                    count_as_failed=with_enrichment,
+                )
             return summary
 
         batches = self._manifest_payloads(
@@ -188,12 +249,701 @@ class SyncEngine:
             summary={**scan.summary(), "upserts": len(changed_entries), "deletions": len(deleted_entries)},
         )
         summary.queued_batches = len(batches)
-        if not self._flush_pending(binding, summary):
-            self._add_description_attention_counts(binding, summary)
+        if not self._deliver_pending(binding, summary, transport=transport):
+            self._add_description_attention_counts(
+                binding,
+                summary,
+                count_as_failed=with_enrichment,
+            )
             return summary
-        self._flush_description_outbox(binding, summary)
-        self._add_description_attention_counts(binding, summary)
+        if with_enrichment:
+            self._flush_description_outbox(
+                binding,
+                summary,
+                limit=enrichment_limit,
+            )
+        self._add_description_attention_counts(
+            binding,
+            summary,
+            count_as_failed=with_enrichment,
+        )
         return summary
+
+    def enrich(
+        self,
+        binding: SourceBinding,
+        *,
+        limit: int,
+    ) -> EnrichmentSummary:
+        """Stage bounded, already-queued scene previews without synchronizing."""
+
+        if binding.storage_mode != "Local":
+            raise ValueError(
+                "Scene-preview staging currently supports Local sources only."
+            )
+        self._validate_enrichment_limit(limit)
+        summary = EnrichmentSummary(
+            source_id=binding.source_id,
+            root_path=binding.root_path,
+            limit=limit,
+        )
+        self._flush_description_outbox(binding, summary, limit=limit)
+        self._add_description_attention_counts(
+            binding,
+            summary,
+            count_as_failed=True,
+        )
+        return summary
+
+    def _deliver_pending(
+        self,
+        binding: SourceBinding,
+        summary: SyncSummary,
+        *,
+        transport: str,
+    ) -> bool:
+        active = self.state.active_bulk_manifest(binding.source_id)
+        if active is not None:
+            if transport == "batch":
+                escape = self._escape_active_bulk_to_batch(
+                    binding,
+                    active,
+                    summary,
+                )
+                if escape == "Fallback":
+                    return self._flush_pending(binding, summary)
+                if escape == "Paused":
+                    return False
+                active = self._require_local_bulk(active.bulk_id)
+            outcome = self._resume_bulk_manifest(binding, active, summary)
+            if outcome == "Paused":
+                return False
+            if outcome == "Complete":
+                return True
+            self.progress(
+                "Bulk metadata import could not complete cleanly · "
+                "falling back to timeout-safe batches"
+            )
+            return self._flush_pending(binding, summary)
+
+        batches = self.state.pending_batches(binding.source_id)
+        if not batches:
+            summary.queued_batches = 0
+            return True
+        if transport == "batch":
+            return self._flush_pending(binding, summary)
+
+        entries = [
+            dict(entry)
+            for batch in batches
+            for entry in (batch.payload.get("entries") or [])
+        ]
+        threshold_met = (
+            len(batches) >= BULK_AUTO_BATCH_THRESHOLD
+            or len(entries) >= BULK_AUTO_ROW_THRESHOLD
+        )
+        if transport == "auto" and not threshold_met:
+            return self._flush_pending(binding, summary)
+        if not self._bulk_entries_eligible(batches, entries):
+            self.progress(
+                "Bulk metadata requires hash-enriched additions only · "
+                "using timeout-safe batches for deletions or pending hashes"
+            )
+            return self._flush_pending(binding, summary)
+
+        snapshot_id = str(uuid.uuid4())
+        artifact_path = (
+            self.state.path.parent
+            / "bulk-manifests"
+            / f"{snapshot_id}.ndjson.gz"
+        )
+        try:
+            artifact = write_manifest_gzip(
+                artifact_path,
+                source_id=binding.source_id,
+                snapshot_id=snapshot_id,
+                entries=entries,
+                permission_state=str(
+                    batches[0].payload.get("permissionState")
+                    or "NotApplicable"
+                ),
+                client_cursor=(
+                    str(batches[0].payload["clientCursor"])
+                    if batches[0].payload.get("clientCursor") is not None
+                    else None
+                ),
+            )
+            active = self.state.queue_bulk_manifest(
+                binding.source_id,
+                snapshot_id,
+                artifact_path=artifact.path,
+                artifact_sha256=artifact.compressed_sha256,
+                artifact_bytes=artifact.compressed_bytes,
+                entry_count=artifact.entry_count,
+                superseded_batch_ids=tuple(batch.batch_id for batch in batches),
+            )
+        except (BulkArtifactError, OSError, ValueError) as exc:
+            self.progress(
+                "Bulk metadata preparation was not usable · "
+                f"using timeout-safe batches ({type(exc).__name__})"
+            )
+            return self._flush_pending(binding, summary)
+
+        self.progress(
+            "Bulk metadata · Prepared one manifest · "
+            f"{active.entry_count:,} rows from "
+            f"{len(active.superseded_batch_ids):,} saved batches"
+        )
+        outcome = self._resume_bulk_manifest(binding, active, summary)
+        if outcome == "Paused":
+            return False
+        if outcome == "Complete":
+            return True
+        self.progress(
+            "Bulk metadata import could not complete cleanly · "
+            "falling back to timeout-safe batches"
+        )
+        return self._flush_pending(binding, summary)
+
+    def _escape_active_bulk_to_batch(
+        self,
+        binding: SourceBinding,
+        item: BulkManifestOutboxItem,
+        summary: SyncSummary,
+    ) -> str:
+        if item.server_import_id is None:
+            self.state.fail_bulk_manifest(
+                item.bulk_id,
+                state="Cancelled",
+                code="BULK_REPLACED_BY_BATCH",
+                message="The prepared bulk import was replaced by batch transport.",
+            )
+            self.progress(
+                "Bulk metadata was only prepared locally · switching to batch transport"
+            )
+            return "Fallback"
+        try:
+            fresh = self.api.get_manifest_import(
+                binding.source_id,
+                str(item.server_import_id),
+            )
+            status = str(fresh.get("status") or item.server_status or "")
+            self.state.update_bulk_manifest_status(
+                item.bulk_id,
+                status=status,
+                phase=str(fresh.get("phase") or item.server_phase or status),
+                processed_entries=int(
+                    fresh.get("processedEntryCount") or item.processed_entries
+                ),
+            )
+            item = self._require_local_bulk(item.bulk_id)
+            authoritative_payload: Mapping[str, Any] = fresh
+        except ApiError as exc:
+            if exc.problem.status == 401:
+                raise
+            if self._bulk_error_is_transient(exc):
+                self._set_bulk_summary(summary, item)
+                summary.queued_batches = len(
+                    self.state.pending_batches(binding.source_id)
+                )
+                self.progress(
+                    "Cannot safely switch to batch while the submitted bulk "
+                    "status is unavailable · rerun sync"
+                )
+                return "Paused"
+            self.state.fail_bulk_manifest(
+                item.bulk_id,
+                state="Cancelled",
+                server_status=item.server_status,
+                code=exc.problem.code or "BULK_STATUS_REJECTED",
+                message=exc.problem.detail,
+            )
+            return "Fallback"
+
+        if item.server_status == "AwaitingUpload":
+            self.state.fail_bulk_manifest(
+                item.bulk_id,
+                state="Cancelled",
+                server_status="AwaitingUpload",
+                code="BULK_REPLACED_BY_BATCH",
+                message="The unsubmitted bulk upload was replaced by batch transport.",
+            )
+            self.progress(
+                "Bulk upload had not been submitted · switching to batch transport"
+            )
+            return "Fallback"
+        if item.server_status in {"Queued", "Running", "RetryDue"}:
+            self._set_bulk_summary(summary, item)
+            summary.queued_batches = len(self.state.pending_batches(binding.source_id))
+            self.progress(
+                "Submitted bulk metadata is still running · batch transport "
+                "will not race it; rerun sync after it finishes"
+            )
+            return "Paused"
+        return "Resume"
+
+    @staticmethod
+    def _bulk_entries_eligible(
+        batches: Sequence[OutboxBatch],
+        entries: Sequence[Mapping[str, Any]],
+    ) -> bool:
+        if not entries:
+            return False
+        permission_states = {
+            str(batch.payload.get("permissionState") or "NotApplicable")
+            for batch in batches
+        }
+        client_cursors = {
+            (
+                str(batch.payload.get("clientCursor"))
+                if batch.payload.get("clientCursor") is not None
+                else None
+            )
+            for batch in batches
+        }
+        if (
+            any(str(batch.payload.get("kind") or "") != "Full" for batch in batches)
+            or len(permission_states) != 1
+            or len(client_cursors) != 1
+        ):
+            return False
+        for entry in entries:
+            content_hash = entry.get("contentSha256")
+            if (
+                entry.get("operation") != "Upsert"
+                or not isinstance(content_hash, str)
+                or len(content_hash) != 64
+            ):
+                return False
+            try:
+                int(content_hash, 16)
+            except ValueError:
+                return False
+        return True
+
+    def _resume_bulk_manifest(
+        self,
+        binding: SourceBinding,
+        item: BulkManifestOutboxItem,
+        summary: SyncSummary,
+    ) -> str:
+        self._set_bulk_summary(summary, item)
+        create_response: Mapping[str, Any] | None = None
+        try:
+            if item.server_import_id is None:
+                self.progress(
+                    "Bulk metadata · Creating import · "
+                    f"{item.entry_count:,} rows"
+                )
+                captured_batches = self._captured_bulk_batches(item)
+                first_payload = captured_batches[0].payload
+                create_response = self.api.create_manifest_import(
+                    binding.source_id,
+                    {
+                        "snapshotId": item.snapshot_id,
+                        "kind": "Full",
+                        "permissionState": str(
+                            first_payload.get("permissionState") or "NotApplicable"
+                        ),
+                        "deletionDetectionReliable": False,
+                        "clientCursor": first_payload.get("clientCursor"),
+                        "schemaVersion": MANIFEST_SCHEMA_VERSION,
+                        "checksumSha256": item.artifact_sha256,
+                        "byteSize": item.artifact_bytes,
+                        "entryCount": item.entry_count,
+                    },
+                    key=item.idempotency_key,
+                )
+                server_import_id = str(create_response.get("importId") or "")
+                if not server_import_id:
+                    raise ValueError("Bulk import response did not include importId")
+                status = str(create_response.get("status") or "AwaitingUpload")
+                phase = str(create_response.get("phase") or "WaitingForUpload")
+                self.state.set_bulk_manifest_server_import(
+                    item.bulk_id,
+                    server_import_id=server_import_id,
+                    status=status,
+                    phase=phase,
+                )
+                item = self._require_local_bulk(item.bulk_id)
+
+            # Once the server ID exists, its current state is authoritative.
+            # Refreshing here reconciles lost complete responses and prevents
+            # a cached RetryDue state from becoming a local deadlock.
+            fresh = self.api.get_manifest_import(
+                binding.source_id,
+                str(item.server_import_id),
+            )
+            self.state.update_bulk_manifest_status(
+                item.bulk_id,
+                status=str(fresh.get("status") or item.server_status or "Queued"),
+                phase=str(fresh.get("phase") or item.server_phase or "Preparing"),
+                processed_entries=int(
+                    fresh.get("processedEntryCount") or item.processed_entries
+                ),
+            )
+            item = self._require_local_bulk(item.bulk_id)
+            authoritative_payload: Mapping[str, Any] = fresh
+
+            if item.server_status == "AwaitingUpload":
+                plan_response = create_response
+                if self._signed_transfer(plan_response) is None:
+                    try:
+                        plan_response = self.api.refresh_manifest_import_upload(
+                            binding.source_id,
+                            str(item.server_import_id),
+                            key=f"{item.idempotency_key}:upload",
+                        )
+                    except ApiError as exc:
+                        if "NOT_AWAITING_UPLOAD" not in str(
+                            exc.problem.code or ""
+                        ).upper():
+                            raise
+                        reconciled = self.api.get_manifest_import(
+                            binding.source_id,
+                            str(item.server_import_id),
+                        )
+                        self.state.update_bulk_manifest_status(
+                            item.bulk_id,
+                            status=str(reconciled.get("status") or "Queued"),
+                            phase=str(reconciled.get("phase") or "Preparing"),
+                            processed_entries=int(
+                                reconciled.get("processedEntryCount") or 0
+                            ),
+                        )
+                        item = self._require_local_bulk(item.bulk_id)
+                        authoritative_payload = reconciled
+                        plan_response = None
+                if item.server_status != "AwaitingUpload":
+                    plan_response = None
+                else:
+                    transfer = self._signed_transfer(plan_response)
+                    if transfer is None:
+                        raise ValueError(
+                            "Bulk upload plan did not include a signed request"
+                        )
+                    self.progress(
+                        "Bulk metadata · Uploading one manifest · "
+                        f"{item.artifact_bytes / (1024 * 1024):,.1f} MiB"
+                    )
+                    self.api.put_signed_file(
+                        str(transfer["url"]),
+                        Path(item.artifact_path),
+                        headers=dict(transfer.get("headers") or {}),
+                    )
+                    completed = self.api.complete_manifest_import(
+                        binding.source_id,
+                        str(item.server_import_id),
+                        key=f"{item.idempotency_key}:complete",
+                    )
+                    status = str((completed or {}).get("status") or "Queued")
+                    phase = str((completed or {}).get("phase") or "Queued")
+                    self.state.update_bulk_manifest_status(
+                        item.bulk_id,
+                        status=status,
+                        phase=phase,
+                        processed_entries=int(
+                            (completed or {}).get("processedEntryCount") or 0
+                        ),
+                    )
+                    item = self._require_local_bulk(item.bulk_id)
+                    authoritative_payload = completed or {
+                        "status": status,
+                        "phase": phase,
+                        "processedEntryCount": item.processed_entries,
+                        "entryCount": item.entry_count,
+                        "counts": {},
+                    }
+
+            payload: Mapping[str, Any] = authoritative_payload
+            last_progress: tuple[str, str, int] | None = None
+            for attempt in range(BULK_POLL_MAX_ATTEMPTS):
+                status = str(payload.get("status") or item.server_status or "")
+                if status in {
+                    "Succeeded",
+                    "CompletedWithErrors",
+                    "FailedPermanent",
+                    "Cancelled",
+                    "Expired",
+                }:
+                    break
+                if status == "RetryDue":
+                    self._set_bulk_summary(summary, self._require_local_bulk(item.bulk_id))
+                    self.progress(
+                        "Bulk metadata · Waiting for an automatic retry · "
+                        f"{summary.bulk_processed:,}/{summary.bulk_total:,} rows"
+                    )
+                    return "Paused"
+                payload = self.api.get_manifest_import(
+                    binding.source_id,
+                    str(item.server_import_id),
+                )
+                status = str(payload.get("status") or "")
+                phase = str(payload.get("phase") or status or "Processing")
+                processed = int(payload.get("processedEntryCount") or 0)
+                self.state.update_bulk_manifest_status(
+                    item.bulk_id,
+                    status=status,
+                    phase=phase,
+                    processed_entries=processed,
+                )
+                marker = (status, phase, processed)
+                if marker != last_progress:
+                    percent = (processed / item.entry_count * 100) if item.entry_count else 0
+                    self.progress(
+                        f"Bulk metadata · {phase} · {processed:,}/{item.entry_count:,} "
+                        f"rows · {percent:.1f}%"
+                    )
+                    last_progress = marker
+                if status not in {
+                    "Succeeded",
+                    "CompletedWithErrors",
+                    "FailedPermanent",
+                    "Cancelled",
+                    "Expired",
+                }:
+                    self.sleep(min(1.0 + attempt // 10, 5.0))
+            else:
+                self._set_bulk_summary(summary, self._require_local_bulk(item.bulk_id))
+                self.progress(
+                    "Bulk metadata continues on the server · rerun sync to resume watching"
+                )
+                return "Paused"
+
+            status = str(payload.get("status") or "")
+            if status != "Succeeded" or self._count(payload, "rejected") > 0:
+                return self._close_bulk_for_fallback(item, status, payload)
+            return self._apply_bulk_result(binding, item.bulk_id, payload, summary)
+        except ApiError as exc:
+            if exc.problem.status == 401:
+                raise
+            if self._bulk_error_is_transient(exc):
+                current = self._require_local_bulk(item.bulk_id)
+                self._set_bulk_summary(summary, current)
+                summary.queued_batches = len(
+                    self.state.pending_batches(binding.source_id)
+                )
+                self.progress(
+                    "Bulk metadata paused because the service is temporarily "
+                    "unavailable · saved work will resume"
+                )
+                return "Paused"
+            self.state.fail_bulk_manifest(
+                item.bulk_id,
+                state="FailedPermanent",
+                server_status=item.server_status,
+                code=exc.problem.code or "BULK_IMPORT_REJECTED",
+                message=exc.problem.detail,
+            )
+            return "Fallback"
+        except (BulkArtifactError, OSError, ValueError) as exc:
+            self.state.fail_bulk_manifest(
+                item.bulk_id,
+                state="FailedPermanent",
+                server_status=item.server_status,
+                code=getattr(exc, "code", "BULK_RESULT_INVALID"),
+                message=str(exc),
+            )
+            return "Fallback"
+
+    @staticmethod
+    def _signed_transfer(
+        payload: Mapping[str, Any] | None,
+    ) -> Mapping[str, Any] | None:
+        if not payload:
+            return None
+        nested = payload.get("upload")
+        candidate = nested if isinstance(nested, Mapping) else payload
+        if candidate.get("url") and str(candidate.get("method") or "PUT") == "PUT":
+            return candidate
+        return None
+
+    def _apply_bulk_result(
+        self,
+        binding: SourceBinding,
+        bulk_id: str,
+        status_payload: Mapping[str, Any],
+        summary: SyncSummary,
+    ) -> str:
+        item = self._require_local_bulk(bulk_id)
+        result_path = Path(item.result_path) if item.result_path else None
+        if result_path is None or not result_path.is_file():
+            result_plan = self.api.get_manifest_import_result(
+                binding.source_id,
+                str(item.server_import_id),
+            )
+            result_url = str(result_plan.get("url") or "")
+            checksum = str(result_plan.get("checksumSha256") or "")
+            result_bytes = int(result_plan.get("byteSize") or 0)
+            if not result_url or not checksum or result_bytes <= 0:
+                raise ValueError("Bulk result download plan is incomplete")
+            result_path = (
+                self.state.path.parent
+                / "bulk-results"
+                / f"{item.server_import_id}.ndjson.gz"
+            )
+            self.progress("Bulk metadata · Downloading verified result")
+            self.api.get_signed_file(
+                result_url,
+                result_path,
+                expected_bytes=result_bytes,
+                max_bytes=MAX_COMPRESSED_BYTES,
+                headers=dict(result_plan.get("headers") or {}),
+            )
+            header = read_result_header(
+                result_path,
+                expected_sha256=checksum,
+                expected_compressed_bytes=result_bytes,
+                expected_import_id=str(item.server_import_id),
+            )
+            if header.entry_count != item.entry_count:
+                raise ValueError("Bulk result row count does not match the manifest")
+            if self._count({"counts": header.counts}, "rejected") > 0:
+                raise ValueError("Bulk result contains rejected rows")
+            self.state.record_bulk_manifest_result(
+                bulk_id,
+                result_path=result_path,
+                result_sha256=checksum,
+                result_bytes=result_bytes,
+            )
+            item = self._require_local_bulk(bulk_id)
+        else:
+            if not item.result_sha256 or not item.result_bytes:
+                raise ValueError("Saved bulk result metadata is incomplete")
+            header = read_result_header(
+                result_path,
+                expected_sha256=item.result_sha256,
+                expected_compressed_bytes=item.result_bytes,
+                expected_import_id=str(item.server_import_id),
+            )
+            if header.entry_count != item.entry_count:
+                raise ValueError("Saved bulk result row count is inconsistent")
+
+        entries = self._captured_bulk_entries(item)
+        if len(entries) != item.entry_count:
+            raise ValueError("Captured bulk manifest rows are incomplete")
+        page: list[tuple[int, Mapping[str, Any], Mapping[str, Any]]] = []
+        for result in iter_result_entries(
+            header,
+            after_row_number=item.result_applied_through,
+        ):
+            page.append(
+                (
+                    result.row_number,
+                    entries[result.row_number - 1],
+                    result.as_api_result(),
+                )
+            )
+            if len(page) >= BULK_RESULT_APPLY_PAGE_SIZE:
+                applied = self.state.apply_bulk_result_rows(bulk_id, tuple(page))
+                self.progress(
+                    f"Bulk metadata · Applying result · {applied:,}/{item.entry_count:,} rows"
+                )
+                page.clear()
+        if page:
+            applied = self.state.apply_bulk_result_rows(bulk_id, tuple(page))
+            self.progress(
+                f"Bulk metadata · Applying result · {applied:,}/{item.entry_count:,} rows"
+            )
+        current = self._require_local_bulk(bulk_id)
+        if current.result_applied_through != current.entry_count:
+            raise ValueError("Bulk result application stopped before the final row")
+        self.state.complete_bulk_manifest(bulk_id)
+        summary.bulk_completed = True
+        summary.bulk_state = "Applied"
+        summary.bulk_phase = "Complete"
+        summary.bulk_processed = item.entry_count
+        summary.bulk_total = item.entry_count
+        summary.bulk_captured_batches = len(item.superseded_batch_ids)
+        summary.duplicates_linked += self._count(
+            {"counts": header.counts},
+            "duplicatesLinked",
+        )
+        summary.queued_batches = len(self.state.pending_batches(binding.source_id))
+        self.progress(
+            f"Bulk metadata · Complete · {item.entry_count:,} rows committed"
+        )
+        return "Complete"
+
+    def _captured_bulk_entries(
+        self,
+        item: BulkManifestOutboxItem,
+    ) -> list[dict[str, Any]]:
+        batches = self._captured_bulk_batches(item)
+        return [
+            dict(entry)
+            for batch in batches
+            for entry in (batch.payload.get("entries") or [])
+        ]
+
+    def _captured_bulk_batches(
+        self,
+        item: BulkManifestOutboxItem,
+    ) -> list[OutboxBatch]:
+        pending = {
+            batch.batch_id: batch
+            for batch in self.state.pending_batches(item.source_id)
+        }
+        if any(batch_id not in pending for batch_id in item.superseded_batch_ids):
+            raise ValueError("A captured manifest batch is no longer pending")
+        return [pending[batch_id] for batch_id in item.superseded_batch_ids]
+
+    def _close_bulk_for_fallback(
+        self,
+        item: BulkManifestOutboxItem,
+        status: str,
+        payload: Mapping[str, Any],
+    ) -> str:
+        self.state.fail_bulk_manifest(
+            item.bulk_id,
+            state="FailedPermanent",
+            server_status=status or item.server_status,
+            code=str(payload.get("failureCode") or status or "BULK_IMPORT_FAILED"),
+            message=str(
+                payload.get("failureMessage")
+                or "The bulk import did not complete without rejected rows."
+            ),
+        )
+        return "Fallback"
+
+    @staticmethod
+    def _bulk_error_is_transient(error: ApiError) -> bool:
+        code = str(error.problem.code or "").upper()
+        if code.startswith("BULK_MANIFEST_UPLOAD_") or code.startswith(
+            "BULK_RESULT_DOWNLOAD_"
+        ):
+            return True
+        if error.problem.status in {0, 408, 429} or error.problem.status >= 500:
+            return True
+        return error.problem.status == 409 and code.endswith("REQUEST_IN_PROGRESS")
+
+    @staticmethod
+    def _count(payload: Mapping[str, Any], key: str) -> int:
+        counts = payload.get("counts")
+        if not isinstance(counts, Mapping):
+            return 0
+        snake = {
+            "duplicatesLinked": "duplicates_linked",
+            "ignoredDeletions": "ignored_deletions",
+        }.get(key, key)
+        return int(counts.get(key) or counts.get(snake) or 0)
+
+    def _require_local_bulk(self, bulk_id: str) -> BulkManifestOutboxItem:
+        item = self.state.bulk_manifest(bulk_id)
+        if item is None:
+            raise ValueError("The local bulk outbox item disappeared")
+        return item
+
+    @staticmethod
+    def _set_bulk_summary(
+        summary: SyncSummary,
+        item: BulkManifestOutboxItem,
+    ) -> None:
+        summary.bulk_state = item.server_status or item.state
+        summary.bulk_phase = item.server_phase
+        summary.bulk_processed = item.processed_entries
+        summary.bulk_total = item.entry_count
+        summary.bulk_captured_batches = len(item.superseded_batch_ids)
 
     def _flush_pending(
         self,
@@ -284,11 +1034,16 @@ class SyncEngine:
     def _flush_description_outbox(
         self,
         binding: SourceBinding,
-        summary: SyncSummary,
+        summary: SyncSummary | EnrichmentSummary,
+        *,
+        limit: int,
     ) -> None:
         self._reconcile_sent_descriptions(binding)
         self._recover_supported_description_skips(binding, summary)
-        tasks = self.state.due_description_tasks(binding.source_id)
+        tasks = self.state.due_description_tasks(
+            binding.source_id,
+            limit=limit,
+        )
         if tasks:
             self.progress(f"Preparing {len(tasks)} scene preview(s)")
         for task in tasks:
@@ -376,7 +1131,7 @@ class SyncEngine:
     def _recover_supported_description_skips(
         self,
         binding: SourceBinding,
-        summary: SyncSummary,
+        summary: SyncSummary | EnrichmentSummary,
     ) -> None:
         """Retry previously rejected MPO/JPG files once after decoder upgrades."""
 
@@ -810,13 +1565,25 @@ class SyncEngine:
             )
 
     def _add_description_attention_counts(
-        self, binding: SourceBinding, summary: SyncSummary
+        self,
+        binding: SourceBinding,
+        summary: SyncSummary | EnrichmentSummary,
+        *,
+        count_as_failed: bool,
     ) -> None:
         counts = self.state.description_counts(binding.source_id)
         summary.description_pending = counts["Pending"]
         summary.description_deferred = counts["Deferred"]
         summary.description_quarantined = counts["Failed"]
-        summary.failed += summary.description_quarantined
+        if count_as_failed:
+            summary.failed += summary.description_quarantined
+
+    @staticmethod
+    def _validate_enrichment_limit(limit: int) -> None:
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise ValueError("Scene-preview limit must be an integer")
+        if not 1 <= limit <= 1_000:
+            raise ValueError("Scene-preview limit must be between 1 and 1000")
 
     @staticmethod
     def _is_permanent_request_error(error: ApiError) -> bool:

@@ -10,12 +10,13 @@ from typing import Any, Mapping
 
 import httpx
 from PIL import Image
+import pytest
 from typer.testing import CliRunner
 
 import cli.imagetracker_cli.app as cli_app_module
 from cli.imagetracker_cli.api_client import ApiClient, ApiError, ApiProblem
 from cli.imagetracker_cli.app import app
-from cli.imagetracker_cli.media import stream_sha256
+from cli.imagetracker_cli.media import ScanResult, stream_sha256
 from cli.imagetracker_cli.scene_preview import (
     SCENE_PREVIEW_CAPABILITY_VERSION,
     ScenePreviewError,
@@ -163,6 +164,163 @@ class UploadApi:
     def retry_job(self, job_id: str, *, key: str):
         self.retried_jobs.append((job_id, key))
         return {"jobId": job_id, "jobType": "Description", "status": "Preparing"}
+
+
+class EmptyScanner:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def scan(self, *_args: Any, **_kwargs: Any) -> ScanResult:
+        self.calls += 1
+        return ScanResult(complete_read=False)
+
+
+def test_sync_is_metadata_only_until_enrichment_is_explicit(tmp_path: Path):
+    photo = tmp_path / "one.jpg"
+    _photo(photo)
+    state = LocalState(tmp_path / "state.sqlite3")
+    _queue_photo(state, photo)
+    api = UploadApi()
+    scanner = EmptyScanner()
+    engine = SyncEngine(api, state, scanner)  # type: ignore[arg-type]
+
+    metadata = engine.sync(_binding(tmp_path))
+
+    assert scanner.calls == 1
+    assert api.plan_calls == 0
+    assert metadata.descriptions_staged == 0
+    assert metadata.description_pending == 1
+    assert metadata.failed == 0
+
+    enriched = engine.sync(
+        _binding(tmp_path),
+        with_enrichment=True,
+        enrichment_limit=1,
+    )
+
+    assert scanner.calls == 2
+    assert api.plan_calls == 1
+    assert enriched.descriptions_staged == 1
+    assert enriched.description_pending == 0
+
+
+def test_enrich_honors_limit_without_scanning_or_flushing_manifests(
+    tmp_path: Path,
+):
+    first = tmp_path / "one.jpg"
+    second = tmp_path / "two.jpg"
+    _photo(first)
+    _photo(second)
+    state = LocalState(tmp_path / "state.sqlite3")
+    _queue_photo(state, first)
+    _queue_photo(
+        state,
+        second,
+        job_id="e7b66774-4ef2-4f8e-812f-49cc81079d48",
+        occurrence_id="11d50787-8074-4489-b1fa-606c92ed8df8",
+        asset_id="4bc06d38-a7d8-4421-9c2c-13f68543a02b",
+        source_item_id="photo:second",
+    )
+    api = UploadApi()
+    scanner = EmptyScanner()
+
+    summary = SyncEngine(api, state, scanner).enrich(  # type: ignore[arg-type]
+        _binding(tmp_path),
+        limit=1,
+    )
+
+    assert scanner.calls == 0
+    assert api.plan_calls == 1
+    assert summary.limit == 1
+    assert summary.descriptions_staged == 1
+    assert summary.description_pending == 1
+    assert state.pending_count() == 0
+
+
+def test_description_due_limit_is_explicit_and_bounded(tmp_path: Path):
+    state = LocalState(tmp_path / "state.sqlite3")
+
+    for invalid in (0, 1001):
+        with pytest.raises(ValueError, match="between 1 and 1000"):
+            state.due_description_tasks(SOURCE_ID, limit=invalid)
+
+
+def test_enrich_cli_emits_one_json_result_and_resumes_cleanly_after_interrupt(
+    tmp_path: Path,
+    monkeypatch,
+):
+    root = tmp_path / "library"
+    root.mkdir()
+    photo = root / "one.jpg"
+    _photo(photo)
+    state = LocalState(tmp_path / "state.sqlite3")
+    state.bind_source(
+        {
+            "sourceId": SOURCE_ID,
+            "sourceKey": "source-key",
+            "displayName": "Photos",
+            "storageMode": "Local",
+        },
+        root,
+    )
+    _queue_photo(state, photo)
+    monkeypatch.setattr(
+        cli_app_module,
+        "_runtime",
+        lambda: SimpleNamespace(state=state, api=UploadApi()),
+    )
+
+    completed = CliRunner().invoke(
+        app,
+        ["enrich", SOURCE_ID, "--limit", "1", "--json"],
+    )
+
+    assert completed.exit_code == 0
+    assert len(completed.stdout.splitlines()) == 1
+    payload = json.loads(completed.stdout)
+    assert payload["limit"] == 1
+    assert payload["descriptions_staged"] == 1
+
+    interrupted_root = tmp_path / "interrupted"
+    interrupted_root.mkdir()
+    interrupted_photo = interrupted_root / "two.jpg"
+    _photo(interrupted_photo)
+    interrupted_state = LocalState(tmp_path / "interrupted-state.sqlite3")
+    interrupted_state.bind_source(
+        {
+            "sourceId": SOURCE_ID,
+            "sourceKey": "interrupted-source",
+            "displayName": "Interrupted Photos",
+            "storageMode": "Local",
+        },
+        interrupted_root,
+    )
+    _queue_photo(interrupted_state, interrupted_photo)
+
+    class InterruptingApi(UploadApi):
+        def create_upload_plan(self, payload: Mapping[str, Any], *, key: str):
+            del payload, key
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        cli_app_module,
+        "_runtime",
+        lambda: SimpleNamespace(
+            state=interrupted_state,
+            api=InterruptingApi(),
+        ),
+    )
+
+    interrupted = CliRunner().invoke(
+        app,
+        ["enrich", SOURCE_ID, "--limit", "1"],
+    )
+
+    assert interrupted.exit_code == 0
+    assert "rerun the same enrich command" in " ".join(
+        interrupted.stdout.split()
+    )
+    assert interrupted_state.description_counts(SOURCE_ID)["Pending"] == 1
 
 
 def test_decoder_upgrade_recovers_previously_skipped_mpo_job_once(
@@ -332,7 +490,9 @@ def test_scene_staging_uploads_only_deterministic_preview_with_exact_headers(tmp
     api = UploadApi()
     engine = SyncEngine(api, state)  # type: ignore[arg-type]
 
-    outcome = engine._stage_description(state.due_description_tasks(SOURCE_ID)[0])
+    outcome = engine._stage_description(
+        state.due_description_tasks(SOURCE_ID, limit=100)[0]
+    )
 
     assert outcome == "Sent"
     assert api.plan_payload is not None
@@ -397,7 +557,7 @@ def test_changed_original_is_quarantined_before_preview_upload(tmp_path: Path):
     api = UploadApi()
 
     outcome = SyncEngine(api, state)._stage_description(  # type: ignore[arg-type]
-        state.due_description_tasks(SOURCE_ID)[0]
+        state.due_description_tasks(SOURCE_ID, limit=100)[0]
     )
 
     assert outcome == "Skipped"
@@ -428,7 +588,7 @@ def test_same_size_same_mtime_replacement_is_rehashed_before_ai_staging(
     api = UploadApi()
 
     outcome = SyncEngine(api, state)._stage_description(  # type: ignore[arg-type]
-        state.due_description_tasks(SOURCE_ID)[0]
+        state.due_description_tasks(SOURCE_ID, limit=100)[0]
     )
 
     assert outcome == "Skipped"
@@ -503,7 +663,11 @@ def test_quota_deferral_persists_next_attempt_without_upload(tmp_path: Path):
     )
     api = UploadApi("Deferred")
     summary = SyncSummary(SOURCE_ID, str(tmp_path), False)
-    SyncEngine(api, state)._flush_description_outbox(_binding(tmp_path), summary)  # type: ignore[arg-type]
+    SyncEngine(api, state)._flush_description_outbox(  # type: ignore[arg-type]
+        _binding(tmp_path),
+        summary,
+        limit=100,
+    )
 
     tasks = state.list_description_outbox(state="Deferred")
     assert len(tasks) == 2
@@ -519,11 +683,21 @@ def test_quota_deferral_persists_next_attempt_without_upload(tmp_path: Path):
     )
     assert api.plan_calls == 1
     assert api.put_content is None
-    assert state.due_description_tasks(SOURCE_ID) == []
-    assert state.due_description_tasks("e71737c2-9c87-4bbc-a1d8-d4c301889f8a") == []
+    assert state.due_description_tasks(SOURCE_ID, limit=100) == []
+    assert (
+        state.due_description_tasks(
+            "e71737c2-9c87-4bbc-a1d8-d4c301889f8a",
+            limit=100,
+        )
+        == []
+    )
     counts = state.description_counts()
     summary = SyncSummary(SOURCE_ID, str(tmp_path), False)
-    SyncEngine(api, state)._add_description_attention_counts(_binding(tmp_path), summary)  # type: ignore[arg-type]
+    SyncEngine(api, state)._add_description_attention_counts(  # type: ignore[arg-type]
+        _binding(tmp_path),
+        summary,
+        count_as_failed=True,
+    )
     assert counts["Deferred"] == 2
     assert summary.description_deferred == 1
     assert summary.failed == 0
@@ -600,7 +774,7 @@ def test_lost_put_response_completes_existing_uploaded_object_without_second_put
     api = LeaseRecoveryApi("Uploading", object_present=True)
 
     outcome = SyncEngine(api, state)._stage_description(  # type: ignore[arg-type]
-        state.due_description_tasks(SOURCE_ID)[0]
+        state.due_description_tasks(SOURCE_ID, limit=100)[0]
     )
 
     assert outcome == "Sent"
@@ -617,7 +791,7 @@ def test_stale_lease_without_object_is_cancelled_and_replanned(tmp_path: Path):
     api = LeaseRecoveryApi("Uploading", object_present=False)
 
     outcome = SyncEngine(api, state)._stage_description(  # type: ignore[arg-type]
-        state.due_description_tasks(SOURCE_ID)[0]
+        state.due_description_tasks(SOURCE_ID, limit=100)[0]
     )
 
     assert outcome == "Sent"
@@ -635,7 +809,7 @@ def test_lost_complete_response_recovers_from_completed_session(tmp_path: Path):
     api = LeaseRecoveryApi("Completed")
 
     outcome = SyncEngine(api, state)._stage_description(  # type: ignore[arg-type]
-        state.due_description_tasks(SOURCE_ID)[0]
+        state.due_description_tasks(SOURCE_ID, limit=100)[0]
     )
 
     assert outcome == "Sent"
@@ -654,7 +828,9 @@ def test_transient_staging_failure_stays_pending_and_permanent_is_quarantined(tm
         _queue_photo(state, photo)
         summary = SyncSummary(SOURCE_ID, str(folder), False)
         SyncEngine(FailingPlanApi(status), state)._flush_description_outbox(  # type: ignore[arg-type]
-            _binding(folder), summary
+            _binding(folder),
+            summary,
+            limit=100,
         )
         task = state.list_description_outbox(state=expected_state)[0]
         assert str(photo) not in json.dumps(task.error)

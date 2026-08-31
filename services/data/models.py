@@ -38,6 +38,11 @@ UINT_BIGINT = mysql.BIGINT(unsigned=True).with_variant(BigInteger, "sqlite")
 UINT_INT = mysql.INTEGER(unsigned=True).with_variant(Integer, "sqlite")
 UINT_SMALLINT = mysql.SMALLINT(unsigned=True).with_variant(SmallInteger, "sqlite")
 BOOL_INT = mysql.TINYINT(unsigned=True).with_variant(Integer, "sqlite")
+LONG_TEXT = mysql.LONGTEXT().with_variant(Text(), "sqlite")
+BINARY_SOURCE_ITEM = mysql.VARCHAR(512, collation="utf8mb4_bin").with_variant(
+    String(512), "sqlite"
+)
+BINARY_TEXT = mysql.TEXT(collation="utf8mb4_bin").with_variant(Text(), "sqlite")
 
 
 class Base(DeclarativeBase):
@@ -172,6 +177,336 @@ class MediaSource(Base):
     removed_at_utc: Mapped[datetime | None] = mapped_column("RemovedAtUtc", DateTime)
 
 
+class ManifestImport(Base):
+    __tablename__ = "ManifestImport"
+    __table_args__ = (
+        UniqueConstraint("PublicId", name="Ux_ManifestImport_PublicId"),
+        UniqueConstraint(
+            "UserId", "IdempotencyKey", name="Ux_ManifestImport_User_Idempotency"
+        ),
+        UniqueConstraint(
+            "UserId",
+            "MediaSourceId",
+            "SnapshotId",
+            name="Ux_ManifestImport_User_Source_Snapshot",
+        ),
+        UniqueConstraint(
+            "UserId",
+            "MediaSourceId",
+            "ActiveMarker",
+            name="Ux_ManifestImport_User_Source_Active",
+        ),
+        UniqueConstraint("UserId", "Id", name="Ux_ManifestImport_User_Id"),
+        ForeignKeyConstraint(
+            ["UserId", "MediaSourceId"],
+            ["MediaSource.UserId", "MediaSource.Id"],
+            name="Fk_ManifestImport_MediaSource",
+            ondelete="CASCADE",
+        ),
+        Index(
+            "Ix_ManifestImport_Status_NextAttempt",
+            "Status",
+            "NextAttemptAtUtc",
+            "Id",
+        ),
+        Index(
+            "Ix_ManifestImport_User_Source_Created",
+            "UserId",
+            "MediaSourceId",
+            "CreatedAtUtc",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column("Id", ID_TYPE, primary_key=True, autoincrement=True)
+    public_id: Mapped[str] = mapped_column("PublicId", String(36), default=new_public_id)
+    user_id: Mapped[int] = mapped_column("UserId", UINT_BIGINT)
+    media_source_id: Mapped[int] = mapped_column("MediaSourceId", UINT_BIGINT)
+    snapshot_id: Mapped[str] = mapped_column("SnapshotId", String(36))
+    idempotency_key: Mapped[str] = mapped_column("IdempotencyKey", String(128))
+    request_sha256: Mapped[str] = mapped_column("RequestSha256", String(64))
+    active_marker: Mapped[int | None] = mapped_column("ActiveMarker", BOOL_INT, default=1)
+    manifest_kind: Mapped[str] = mapped_column("ManifestKind", String(16))
+    permission_state: Mapped[str] = mapped_column("PermissionState", String(32))
+    deletion_detection_reliable: Mapped[int] = mapped_column(
+        "DeletionDetectionReliable", BOOL_INT
+    )
+    client_cursor: Mapped[str | None] = mapped_column("ClientCursor", String(1024))
+    schema_version: Mapped[str] = mapped_column("SchemaVersion", String(32))
+    status: Mapped[str] = mapped_column(
+        "Status", String(32), default="AwaitingUpload"
+    )
+    phase: Mapped[str] = mapped_column("Phase", String(32), default="Preparing")
+    input_s3_bucket: Mapped[str] = mapped_column("InputS3Bucket", String(63))
+    input_s3_object_key: Mapped[str] = mapped_column("InputS3ObjectKey", String(1024))
+    input_s3_version_id: Mapped[str | None] = mapped_column(
+        "InputS3VersionId", String(1024)
+    )
+    input_checksum_sha256: Mapped[str] = mapped_column(
+        "InputChecksumSha256", String(64)
+    )
+    input_byte_size: Mapped[int] = mapped_column("InputByteSize", UINT_BIGINT)
+    declared_entry_count: Mapped[int] = mapped_column("DeclaredEntryCount", UINT_INT)
+    validated_entry_count: Mapped[int] = mapped_column(
+        "ValidatedEntryCount", UINT_INT, default=0
+    )
+    processed_entry_count: Mapped[int] = mapped_column(
+        "ProcessedEntryCount", UINT_INT, default=0
+    )
+    created_count: Mapped[int] = mapped_column("CreatedCount", UINT_INT, default=0)
+    updated_count: Mapped[int] = mapped_column("UpdatedCount", UINT_INT, default=0)
+    duplicate_linked_count: Mapped[int] = mapped_column(
+        "DuplicateLinkedCount", UINT_INT, default=0
+    )
+    deleted_count: Mapped[int] = mapped_column("DeletedCount", UINT_INT, default=0)
+    ignored_deletion_count: Mapped[int] = mapped_column(
+        "IgnoredDeletionCount", UINT_INT, default=0
+    )
+    unchanged_count: Mapped[int] = mapped_column("UnchangedCount", UINT_INT, default=0)
+    rejected_count: Mapped[int] = mapped_column("RejectedCount", UINT_INT, default=0)
+    result_s3_bucket: Mapped[str | None] = mapped_column("ResultS3Bucket", String(63))
+    result_s3_object_key: Mapped[str | None] = mapped_column(
+        "ResultS3ObjectKey", String(1024)
+    )
+    result_checksum_sha256: Mapped[str | None] = mapped_column(
+        "ResultChecksumSha256", String(64)
+    )
+    result_byte_size: Mapped[int | None] = mapped_column("ResultByteSize", UINT_BIGINT)
+    attempt_count: Mapped[int] = mapped_column("AttemptCount", UINT_INT, default=0)
+    max_attempts: Mapped[int] = mapped_column("MaxAttempts", UINT_INT, default=5)
+    next_attempt_at_utc: Mapped[datetime | None] = mapped_column(
+        "NextAttemptAtUtc", DateTime
+    )
+    lease_token_hash: Mapped[str | None] = mapped_column("LeaseTokenHash", String(64))
+    lease_expires_at_utc: Mapped[datetime | None] = mapped_column(
+        "LeaseExpiresAtUtc", DateTime
+    )
+    failure_class: Mapped[str | None] = mapped_column("FailureClass", String(32))
+    failure_code: Mapped[str | None] = mapped_column("FailureCode", String(64))
+    failure_message: Mapped[str | None] = mapped_column("FailureMessage", Text)
+    upload_expires_at_utc: Mapped[datetime | None] = mapped_column(
+        "UploadExpiresAtUtc", DateTime
+    )
+    queued_at_utc: Mapped[datetime | None] = mapped_column("QueuedAtUtc", DateTime)
+    started_at_utc: Mapped[datetime | None] = mapped_column("StartedAtUtc", DateTime)
+    completed_at_utc: Mapped[datetime | None] = mapped_column("CompletedAtUtc", DateTime)
+    created_at_utc: Mapped[datetime] = mapped_column("CreatedAtUtc", DateTime, default=utc_now)
+    updated_at_utc: Mapped[datetime] = mapped_column(
+        "UpdatedAtUtc", DateTime, default=utc_now, onupdate=utc_now
+    )
+
+
+class ManifestImportEntry(Base):
+    __tablename__ = "ManifestImportEntry"
+    __table_args__ = (
+        UniqueConstraint(
+            "ManifestImportId", "RowNumber", name="Ux_ManifestImportEntry_Import_Row"
+        ),
+        UniqueConstraint(
+            "ManifestImportId", "StageId", name="Ux_ManifestImportEntry_Import_Stage"
+        ),
+        ForeignKeyConstraint(
+            ["ManifestImportId"],
+            ["ManifestImport.Id"],
+            name="Fk_ManifestImportEntry_ManifestImport",
+            ondelete="CASCADE",
+        ),
+        Index(
+            "Ix_ManifestImportEntry_Import_SourceItem",
+            "ManifestImportId",
+            "SourceItemId",
+        ),
+        Index(
+            "Ix_ManifestImportEntry_Import_Hash",
+            "ManifestImportId",
+            "ContentSha256",
+        ),
+        Index(
+            "Ix_ManifestImportEntry_Import_ResolvedAsset",
+            "ManifestImportId",
+            "ResolvedAssetId",
+        ),
+    )
+
+    stage_id: Mapped[int] = mapped_column(
+        "StageId", ID_TYPE, primary_key=True, autoincrement=True
+    )
+    manifest_import_id: Mapped[int] = mapped_column("ManifestImportId", UINT_BIGINT)
+    row_number: Mapped[int] = mapped_column("RowNumber", UINT_INT)
+    operation_raw: Mapped[str] = mapped_column("OperationRaw", Text)
+    source_item_id_raw: Mapped[str] = mapped_column("SourceItemIdRaw", BINARY_TEXT)
+    source_revision_raw: Mapped[str | None] = mapped_column("SourceRevisionRaw", Text)
+    original_file_name_raw: Mapped[str | None] = mapped_column("OriginalFileNameRaw", Text)
+    local_locator_raw: Mapped[str | None] = mapped_column("LocalLocatorRaw", LONG_TEXT)
+    content_sha256_raw: Mapped[str | None] = mapped_column("ContentSha256Raw", Text)
+    media_type_raw: Mapped[str | None] = mapped_column("MediaTypeRaw", Text)
+    mime_type_raw: Mapped[str | None] = mapped_column("MimeTypeRaw", Text)
+    byte_size_raw: Mapped[str | None] = mapped_column("ByteSizeRaw", Text)
+    width_pixels_raw: Mapped[str | None] = mapped_column("WidthPixelsRaw", Text)
+    height_pixels_raw: Mapped[str | None] = mapped_column("HeightPixelsRaw", Text)
+    duration_milliseconds_raw: Mapped[str | None] = mapped_column(
+        "DurationMillisecondsRaw", Text
+    )
+    capture_datetime_local_raw: Mapped[str | None] = mapped_column(
+        "CaptureDateTimeLocalRaw", Text
+    )
+    capture_datetime_utc_raw: Mapped[str | None] = mapped_column(
+        "CaptureDateTimeUtcRaw", Text
+    )
+    time_zone_raw: Mapped[str | None] = mapped_column("TimeZoneRaw", Text)
+    utc_offset_minutes_raw: Mapped[str | None] = mapped_column(
+        "UtcOffsetMinutesRaw", Text
+    )
+    latitude_raw: Mapped[str | None] = mapped_column("LatitudeRaw", Text)
+    longitude_raw: Mapped[str | None] = mapped_column("LongitudeRaw", Text)
+    altitude_meters_raw: Mapped[str | None] = mapped_column("AltitudeMetersRaw", Text)
+    accuracy_meters_raw: Mapped[str | None] = mapped_column("AccuracyMetersRaw", Text)
+    provenance_json_raw: Mapped[str | None] = mapped_column("ProvenanceJsonRaw", LONG_TEXT)
+    operation: Mapped[str | None] = mapped_column("Operation", String(16))
+    source_item_id: Mapped[str | None] = mapped_column(
+        "SourceItemId", BINARY_SOURCE_ITEM
+    )
+    source_revision: Mapped[str | None] = mapped_column("SourceRevision", String(255))
+    original_file_name: Mapped[str | None] = mapped_column(
+        "OriginalFileName", String(512)
+    )
+    local_locator: Mapped[str | None] = mapped_column("LocalLocator", Text)
+    content_sha256: Mapped[str | None] = mapped_column("ContentSha256", String(64))
+    media_type: Mapped[str | None] = mapped_column("MediaType", String(16))
+    mime_type: Mapped[str | None] = mapped_column("MimeType", String(255))
+    byte_size: Mapped[int | None] = mapped_column("ByteSize", UINT_BIGINT)
+    width_pixels: Mapped[int | None] = mapped_column("WidthPixels", UINT_INT)
+    height_pixels: Mapped[int | None] = mapped_column("HeightPixels", UINT_INT)
+    duration_milliseconds: Mapped[int | None] = mapped_column(
+        "DurationMilliseconds", UINT_BIGINT
+    )
+    capture_datetime_local: Mapped[datetime | None] = mapped_column(
+        "CaptureDateTimeLocal", DateTime
+    )
+    capture_datetime_utc: Mapped[datetime | None] = mapped_column(
+        "CaptureDateTimeUtc", DateTime
+    )
+    time_zone: Mapped[str | None] = mapped_column("TimeZone", String(64))
+    utc_offset_minutes: Mapped[int | None] = mapped_column("UtcOffsetMinutes", SmallInteger)
+    latitude: Mapped[Decimal | None] = mapped_column("Latitude", Numeric(9, 6))
+    longitude: Mapped[Decimal | None] = mapped_column("Longitude", Numeric(10, 6))
+    altitude_meters: Mapped[Decimal | None] = mapped_column(
+        "AltitudeMeters", Numeric(10, 3)
+    )
+    accuracy_meters: Mapped[Decimal | None] = mapped_column(
+        "AccuracyMeters", Numeric(10, 3)
+    )
+    coordinate_revision: Mapped[str | None] = mapped_column(
+        "CoordinateRevision", String(64)
+    )
+    provenance_json: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        "ProvenanceJson", JSON
+    )
+    location_source: Mapped[str | None] = mapped_column("LocationSource", String(32))
+    validation_state: Mapped[str] = mapped_column(
+        "ValidationState", String(32), default="Pending"
+    )
+    existing_occurrence_id: Mapped[int | None] = mapped_column(
+        "ExistingOccurrenceId", UINT_BIGINT
+    )
+    existing_asset_id: Mapped[int | None] = mapped_column("ExistingAssetId", UINT_BIGINT)
+    resolved_asset_id: Mapped[int | None] = mapped_column("ResolvedAssetId", UINT_BIGINT)
+    outcome: Mapped[str | None] = mapped_column("Outcome", String(32))
+    error_code: Mapped[str | None] = mapped_column("ErrorCode", String(64))
+    error_message: Mapped[str | None] = mapped_column("ErrorMessage", String(1000))
+    occurrence_public_id: Mapped[str | None] = mapped_column(
+        "OccurrencePublicId", String(36)
+    )
+    media_asset_public_id: Mapped[str | None] = mapped_column(
+        "MediaAssetPublicId", String(36)
+    )
+    description_job_public_id: Mapped[str | None] = mapped_column(
+        "DescriptionJobPublicId", String(36)
+    )
+    created_at_utc: Mapped[datetime] = mapped_column("CreatedAtUtc", DateTime, default=utc_now)
+    updated_at_utc: Mapped[datetime] = mapped_column(
+        "UpdatedAtUtc", DateTime, default=utc_now, onupdate=utc_now
+    )
+
+
+class ManifestImportAssetWork(Base):
+    __tablename__ = "ManifestImportAssetWork"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["ManifestImportId", "CanonicalStageId"],
+            ["ManifestImportEntry.ManifestImportId", "ManifestImportEntry.StageId"],
+            name="Fk_ManifestImportAssetWork_CanonicalEntry",
+            ondelete="CASCADE",
+        ),
+        Index(
+            "Ix_ManifestImportAssetWork_Import_ResolvedAsset",
+            "ManifestImportId",
+            "ResolvedMediaAssetId",
+        ),
+        Index(
+            "Ix_ManifestImportAssetWork_CanonicalStage",
+            "ManifestImportId",
+            "CanonicalStageId",
+        ),
+    )
+
+    manifest_import_id: Mapped[int] = mapped_column(
+        "ManifestImportId", UINT_BIGINT, primary_key=True
+    )
+    content_sha256: Mapped[str] = mapped_column(
+        "ContentSha256", String(64), primary_key=True
+    )
+    canonical_stage_id: Mapped[int] = mapped_column("CanonicalStageId", UINT_BIGINT)
+    canonical_row_number: Mapped[int] = mapped_column("CanonicalRowNumber", UINT_INT)
+    resolved_media_asset_id: Mapped[int | None] = mapped_column(
+        "ResolvedMediaAssetId", UINT_BIGINT
+    )
+    resolved_media_asset_public_id: Mapped[str | None] = mapped_column(
+        "ResolvedMediaAssetPublicId", String(36)
+    )
+    asset_was_preexisting: Mapped[int] = mapped_column(
+        "AssetWasPreexisting", BOOL_INT, default=0
+    )
+    asset_created: Mapped[int] = mapped_column("AssetCreated", BOOL_INT, default=0)
+    asset_changed: Mapped[int] = mapped_column("AssetChanged", BOOL_INT, default=0)
+    error_code: Mapped[str | None] = mapped_column("ErrorCode", String(64))
+    error_message: Mapped[str | None] = mapped_column("ErrorMessage", String(1000))
+    created_at_utc: Mapped[datetime] = mapped_column("CreatedAtUtc", DateTime, default=utc_now)
+    updated_at_utc: Mapped[datetime] = mapped_column(
+        "UpdatedAtUtc", DateTime, default=utc_now, onupdate=utc_now
+    )
+
+
+class ManifestImportFailure(Base):
+    __tablename__ = "ManifestImportFailure"
+    __table_args__ = (
+        UniqueConstraint("PublicId", name="Ux_ManifestImportFailure_PublicId"),
+        UniqueConstraint(
+            "ManifestImportId", "RowNumber", name="Ux_ManifestImportFailure_Import_Row"
+        ),
+        ForeignKeyConstraint(
+            ["UserId", "ManifestImportId"],
+            ["ManifestImport.UserId", "ManifestImport.Id"],
+            name="Fk_ManifestImportFailure_ManifestImport",
+            ondelete="CASCADE",
+        ),
+        Index(
+            "Ix_ManifestImportFailure_User_Import", "UserId", "ManifestImportId"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column("Id", ID_TYPE, primary_key=True, autoincrement=True)
+    public_id: Mapped[str] = mapped_column("PublicId", String(36), default=new_public_id)
+    user_id: Mapped[int] = mapped_column("UserId", UINT_BIGINT)
+    manifest_import_id: Mapped[int] = mapped_column("ManifestImportId", UINT_BIGINT)
+    row_number: Mapped[int] = mapped_column("RowNumber", UINT_INT)
+    source_item_id: Mapped[str] = mapped_column("SourceItemId", BINARY_SOURCE_ITEM)
+    source_revision: Mapped[str | None] = mapped_column("SourceRevision", String(255))
+    operation: Mapped[str] = mapped_column("Operation", String(16))
+    error_code: Mapped[str] = mapped_column("ErrorCode", String(64))
+    error_message: Mapped[str | None] = mapped_column("ErrorMessage", String(1000))
+    created_at_utc: Mapped[datetime] = mapped_column("CreatedAtUtc", DateTime, default=utc_now)
+
+
 class MediaAsset(Base):
     __tablename__ = "MediaAsset"
     __table_args__ = (
@@ -287,6 +622,12 @@ class MediaOccurrence(Base):
             ["MediaAsset.UserId", "MediaAsset.Id"],
             name="Fk_MediaOccurrence_MediaAsset",
             ondelete="CASCADE",
+        ),
+        Index(
+            "Ix_MediaOccurrence_User_Asset_DeletionState",
+            "UserId",
+            "MediaAssetId",
+            "DeletionState",
         ),
     )
 
@@ -733,6 +1074,10 @@ __all__ = [
     "Device",
     "IdempotencyRecord",
     "LegacyImageAssetMap",
+    "ManifestImport",
+    "ManifestImportAssetWork",
+    "ManifestImportEntry",
+    "ManifestImportFailure",
     "MediaAsset",
     "MediaChange",
     "MediaDescription",

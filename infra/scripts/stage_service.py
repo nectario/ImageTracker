@@ -21,6 +21,7 @@ REPOSITORY_ROOT = INFRA_ROOT.parent
 SERVICES_ROOT = REPOSITORY_ROOT / "services"
 API_SOURCE_ROOT = SERVICES_ROOT / "api"
 WORKER_SOURCE_ROOT = SERVICES_ROOT / "worker"
+BULK_SOURCE_ROOT = SERVICES_ROOT / "bulk"
 NORMALIZATION_RULES_PATH = REPOSITORY_ROOT / "location_normalization_rules.json"
 BUILD_ROOT = INFRA_ROOT / ".build"
 
@@ -32,6 +33,7 @@ def _validate_paths() -> None:
     handler_paths = (
         API_SOURCE_ROOT / "handler.py",
         WORKER_SOURCE_ROOT / "handler.py",
+        BULK_SOURCE_ROOT / "handler.py",
     )
     for handler_path in handler_paths:
         if not handler_path.is_file():

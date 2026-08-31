@@ -1,6 +1,6 @@
 # Phase 1 Local Mode and Enrichment Status
 
-Implementation snapshot: 2026-08-30. The Local-mode core is deployed to
+Implementation snapshot: 2026-08-31. The Local-mode core is deployed to
 `image-tracker-prod` in `us-east-2`; the original acceptance evidence below was
 measured against that stack on 2026-08-27. Reverse geocoding and scene
 description are now deployed in the bounded production worker. Only a synthetic
@@ -58,6 +58,25 @@ interrupted committed request replayed safely. This is a useful reduction, but
 not yet the desired WOW result; MySQL auto-increment/ORM insert work now
 dominates, so the next large gain requires a truly set-based staging-table or
 asynchronous bulk-ingest path.
+
+That set-based path is now implemented and package-validated in the repository,
+but has not yet been migrated or deployed. Migration 014 adds durable import,
+raw/normalized staging, asset-work, and failure-audit tables plus an online
+occurrence index. The authenticated API issues a checksum-bound private S3
+upload, a dedicated one-concurrent 15-minute Lambda performs one validated
+`LOAD DATA LOCAL INFILE` and set merge, and a durable result artifact lets the
+CLI resume SQLite reconciliation after interruption. `sync --transport auto`
+uses bulk above 10 batches or 1,000 eligible rows and preserves the existing
+batch outbox for all fallbacks. Ordinary sync is metadata-only; paid preview
+staging now requires `enrich --limit N` or `--with-enrichment` explicitly.
+
+The complete candidate passes 341 tests, validates 33 OpenAPI operations/93
+schemas/29 paths, and produces a valid production CloudFormation/Lambda
+package. The remaining release gate is intentionally operational: apply
+migration 014 with the existing administrative MySQL credential, run a tiny
+disposable real-MySQL canary, inspect its rows/result/CloudWatch duration, then
+scale through 1,000 and 10,000 rows before allowing the saved production
+backlog to use bulk transport.
 
 ## Scope delivered in the repository
 

@@ -596,6 +596,264 @@
         }
       }
     },
+    "/v1/sources/{sourceId}/manifest-imports": {
+      "post": {
+        "tags": [
+          "Sources"
+        ],
+        "operationId": "createManifestImport",
+        "summary": "Create an asynchronous full-manifest import",
+        "description": "Creates one checksum-bound Local-source import and returns a signed S3 upload. The same Idempotency-Key and request replay the existing import; another active import for the source is rejected.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SourceIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKeyHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ManifestImportCreateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Identical import creation replayed.",
+            "headers": {
+              "Idempotency-Replayed": {
+                "$ref": "#/components/headers/IdempotencyReplayedHeader"
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManifestImport"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Manifest import created.",
+            "headers": {
+              "Idempotency-Replayed": {
+                "$ref": "#/components/headers/IdempotencyReplayedHeader"
+              },
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestIdHeader"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManifestImport"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/v1/sources/{sourceId}/manifest-imports/{manifestImportId}/upload-url": {
+      "post": {
+        "tags": [
+          "Sources"
+        ],
+        "operationId": "refreshManifestImportUpload",
+        "summary": "Refresh an awaiting manifest upload URL",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SourceIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/ManifestImportIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKeyHeader"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Upload URL refreshed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManifestImport"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/v1/sources/{sourceId}/manifest-imports/{manifestImportId}/complete": {
+      "post": {
+        "tags": [
+          "Sources"
+        ],
+        "operationId": "completeManifestImportUpload",
+        "summary": "Verify and queue an uploaded manifest",
+        "description": "Verifies the S3 byte count, SHA-256 checksum, media type, and gzip encoding before durably queuing the import. Queue publication failure does not lose the queued database state.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SourceIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/ManifestImportIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKeyHeader"
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Manifest verified and queued.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManifestImport"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/v1/sources/{sourceId}/manifest-imports/{manifestImportId}": {
+      "get": {
+        "tags": [
+          "Sources"
+        ],
+        "operationId": "getManifestImport",
+        "summary": "Get manifest import progress",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SourceIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/ManifestImportIdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Manifest import state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManifestImport"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/v1/sources/{sourceId}/manifest-imports/{manifestImportId}/result": {
+      "get": {
+        "tags": [
+          "Sources"
+        ],
+        "operationId": "getManifestImportResult",
+        "summary": "Get a signed manifest result download",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SourceIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/ManifestImportIdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Signed result download.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManifestImportResultDownload"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
     "/v1/uploads/plan": {
       "post": {
         "tags": [
@@ -1766,6 +2024,15 @@
       },
       "SourceIdPath": {
         "name": "sourceId",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "ManifestImportIdPath": {
+        "name": "manifestImportId",
         "in": "path",
         "required": true,
         "schema": {
@@ -2975,6 +3242,229 @@
             "items": {
               "$ref": "#/components/schemas/ManifestEntryResult"
             }
+          }
+        }
+      },
+      "ManifestImportStatus": {
+        "type": "string",
+        "enum": [
+          "AwaitingUpload",
+          "Queued",
+          "Running",
+          "RetryDue",
+          "Succeeded",
+          "CompletedWithErrors",
+          "FailedPermanent",
+          "Cancelled",
+          "Expired"
+        ]
+      },
+      "ManifestImportPhase": {
+        "type": "string",
+        "enum": [
+          "Preparing",
+          "WaitingForUpload",
+          "Queued",
+          "Downloading",
+          "Validating",
+          "Loading",
+          "Staged",
+          "Merging",
+          "Merged",
+          "WritingResult",
+          "Complete"
+        ]
+      },
+      "ManifestImportCreateRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "snapshotId",
+          "permissionState",
+          "checksumSha256",
+          "byteSize",
+          "entryCount"
+        ],
+        "properties": {
+          "snapshotId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "Full"
+            ],
+            "default": "Full"
+          },
+          "permissionState": {
+            "$ref": "#/components/schemas/PermissionState"
+          },
+          "deletionDetectionReliable": {
+            "type": "boolean",
+            "enum": [
+              false
+            ],
+            "default": false
+          },
+          "clientCursor": {
+            "type": "string",
+            "maxLength": 1024,
+            "nullable": true
+          },
+          "schemaVersion": {
+            "type": "string",
+            "enum": [
+              "ManifestNdjsonV1"
+            ],
+            "default": "ManifestNdjsonV1"
+          },
+          "checksumSha256": {
+            "type": "string",
+            "pattern": "^[A-Fa-f0-9]{64}$"
+          },
+          "byteSize": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 268435456
+          },
+          "entryCount": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 250000
+          }
+        }
+      },
+      "ManifestImport": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "importId",
+          "sourceId",
+          "snapshotId",
+          "schemaVersion",
+          "status",
+          "phase",
+          "entryCount",
+          "validatedEntryCount",
+          "processedEntryCount",
+          "counts",
+          "resultAvailable",
+          "createdAtUtc",
+          "updatedAtUtc"
+        ],
+        "properties": {
+          "importId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "sourceId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "snapshotId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "schemaVersion": {
+            "type": "string",
+            "enum": [
+              "ManifestNdjsonV1"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/ManifestImportStatus"
+          },
+          "phase": {
+            "$ref": "#/components/schemas/ManifestImportPhase"
+          },
+          "entryCount": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "validatedEntryCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "processedEntryCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "counts": {
+            "$ref": "#/components/schemas/ManifestCounts"
+          },
+          "upload": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SignedUploadRequest"
+              }
+            ],
+            "nullable": true
+          },
+          "uploadExpiresAtUtc": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "nextAttemptAtUtc": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "failureCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "failureMessage": {
+            "type": "string",
+            "nullable": true
+          },
+          "resultAvailable": {
+            "type": "boolean",
+            "default": false
+          },
+          "createdAtUtc": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAtUtc": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "completedAtUtc": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          }
+        }
+      },
+      "ManifestImportResultDownload": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "url",
+          "expiresAtUtc",
+          "checksumSha256",
+          "byteSize"
+        ],
+        "properties": {
+          "url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "expiresAtUtc": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "checksumSha256": {
+            "type": "string",
+            "pattern": "^[A-Fa-f0-9]{64}$"
+          },
+          "byteSize": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
           }
         }
       },

@@ -9,7 +9,10 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.exceptions import HTTPException
 
-from services.api.composition import build_default_phase1_service
+from services.api.composition import (
+    build_default_manifest_import_service,
+    build_default_phase1_service,
+)
 from services.api.errors import (
     http_error_handler,
     service_error_handler,
@@ -17,6 +20,8 @@ from services.api.errors import (
     validation_error_handler,
 )
 from services.api.routes import create_phase1_router
+from services.api.manifest_import_routes import create_manifest_import_router
+from services.api.manifest_import_service import ManifestImportService
 from services.api.service import AuthIdentity, Phase1Service, ServiceError
 from services.common.settings import AppSettings, get_settings
 
@@ -34,6 +39,7 @@ def create_app(
     settings: AppSettings | None = None,
     *,
     phase1_service: Phase1Service | None = None,
+    manifest_import_service: ManifestImportService | None = None,
     test_identity: AuthIdentity | None = None,
 ) -> FastAPI:
     resolved_settings = settings or get_settings()
@@ -54,6 +60,11 @@ def create_app(
         phase1_service
         if phase1_service is not None
         else build_default_phase1_service(resolved_settings)
+    )
+    app.state.manifest_import_service = (
+        manifest_import_service
+        if manifest_import_service is not None
+        else build_default_manifest_import_service(resolved_settings)
     )
     app.state.test_identity = test_identity
 
@@ -85,6 +96,7 @@ def create_app(
     app.add_api_route("/health", health, methods=["GET"], response_model=HealthResponse)
     app.add_api_route("/v1/health", health, methods=["GET"], response_model=HealthResponse)
     app.include_router(create_phase1_router())
+    app.include_router(create_manifest_import_router())
     return app
 
 

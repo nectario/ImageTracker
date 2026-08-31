@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
 import uuid
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Protocol
+from typing import Any, Iterable, Iterator, Mapping, Protocol
 
 import httpx
 
@@ -34,6 +36,17 @@ class ApiError(RuntimeError):
 
 class AuthenticationRequired(ApiError):
     pass
+
+
+class _FileByteStream(httpx.SyncByteStream):
+    def __init__(self, path: Path, *, chunk_size: int = 1024 * 1024) -> None:
+        self.path = path
+        self.chunk_size = chunk_size
+
+    def __iter__(self) -> Iterator[bytes]:
+        with self.path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(self.chunk_size), b""):
+                yield chunk
 
 
 class ApiClient:
@@ -198,6 +211,223 @@ class ApiClient:
             json=payload,
             headers={"Idempotency-Key": key},
         )
+
+    def create_manifest_import(
+        self,
+        source_id: str,
+        payload: Mapping[str, Any],
+        *,
+        key: str,
+    ) -> Mapping[str, Any]:
+        return self.request(
+            "POST",
+            f"/v1/sources/{source_id}/manifest-imports",
+            json=payload,
+            headers={"Idempotency-Key": key},
+        )
+
+    def refresh_manifest_import_upload(
+        self,
+        source_id: str,
+        import_id: str,
+        *,
+        key: str,
+    ) -> Mapping[str, Any]:
+        return self.request(
+            "POST",
+            f"/v1/sources/{source_id}/manifest-imports/{import_id}/upload-url",
+            headers={"Idempotency-Key": key},
+        )
+
+    def complete_manifest_import(
+        self,
+        source_id: str,
+        import_id: str,
+        *,
+        key: str,
+    ) -> Mapping[str, Any]:
+        return self.request(
+            "POST",
+            f"/v1/sources/{source_id}/manifest-imports/{import_id}/complete",
+            headers={"Idempotency-Key": key},
+        )
+
+    def get_manifest_import(
+        self,
+        source_id: str,
+        import_id: str,
+    ) -> Mapping[str, Any]:
+        return self.request(
+            "GET",
+            f"/v1/sources/{source_id}/manifest-imports/{import_id}",
+        )
+
+    def get_manifest_import_result(
+        self,
+        source_id: str,
+        import_id: str,
+    ) -> Mapping[str, Any]:
+        return self.request(
+            "GET",
+            f"/v1/sources/{source_id}/manifest-imports/{import_id}/result",
+        )
+
+    def put_signed_file(
+        self,
+        url: str,
+        path: Path,
+        *,
+        headers: Mapping[str, str],
+    ) -> str | None:
+        """Stream an artifact to a signed URL without Cognito authorization."""
+
+        selected = path.expanduser().resolve(strict=True)
+        if not selected.is_file():
+            raise ValueError("Signed upload path is not a file")
+        request_headers = dict(headers)
+        declared_length = request_headers.get("Content-Length")
+        if declared_length is not None:
+            try:
+                if int(declared_length) != selected.stat().st_size:
+                    raise ValueError
+            except ValueError as exc:
+                raise ValueError(
+                    "Signed upload Content-Length does not match the artifact"
+                ) from exc
+        else:
+            request_headers["Content-Length"] = str(selected.stat().st_size)
+        try:
+            response = self.http.request(
+                "PUT",
+                url,
+                content=_FileByteStream(selected),
+                headers=request_headers,
+            )
+        except httpx.HTTPError as exc:
+            raise ApiError(
+                ApiProblem(
+                    0,
+                    "Manifest upload unavailable",
+                    "The bulk manifest could not be uploaded. It will be retried.",
+                    code="BULK_MANIFEST_UPLOAD_NETWORK_ERROR",
+                )
+            ) from exc
+        if response.status_code >= 400:
+            raise ApiError(
+                ApiProblem(
+                    response.status_code,
+                    "Manifest upload rejected",
+                    "Object storage rejected the bulk manifest upload.",
+                    code="BULK_MANIFEST_UPLOAD_REJECTED",
+                )
+            )
+        return response.headers.get("etag")
+
+    def get_signed_file(
+        self,
+        url: str,
+        destination: Path,
+        *,
+        expected_bytes: int,
+        max_bytes: int,
+        headers: Mapping[str, str] | None = None,
+    ) -> Mapping[str, str]:
+        """Atomically stream a signed result download without Cognito headers."""
+
+        if (
+            isinstance(expected_bytes, bool)
+            or not isinstance(expected_bytes, int)
+            or isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, int)
+            or not 0 < expected_bytes <= max_bytes
+        ):
+            raise ValueError("Signed download byte limits are invalid")
+        selected = destination.expanduser().resolve(strict=False)
+        selected.parent.mkdir(parents=True, exist_ok=True)
+        partial = selected.with_name(f".{selected.name}.{os.getpid()}.part")
+        try:
+            with self.http.stream(
+                "GET",
+                url,
+                headers=dict(headers or {}),
+            ) as response:
+                if response.status_code >= 400:
+                    raise ApiError(
+                        ApiProblem(
+                            response.status_code,
+                            "Manifest result download rejected",
+                            "Object storage rejected the bulk result download.",
+                            code="BULK_RESULT_DOWNLOAD_REJECTED",
+                        )
+                    )
+                declared_length = response.headers.get("Content-Length")
+                if declared_length is not None:
+                    try:
+                        parsed_length = int(declared_length)
+                    except ValueError as exc:
+                        raise ApiError(
+                            ApiProblem(
+                                0,
+                                "Manifest result size invalid",
+                                "Object storage returned an invalid result size.",
+                                code="BULK_RESULT_DOWNLOAD_SIZE_MISMATCH",
+                            )
+                        ) from exc
+                    if parsed_length != expected_bytes or parsed_length > max_bytes:
+                        raise ApiError(
+                            ApiProblem(
+                                0,
+                                "Manifest result size mismatch",
+                                "The bulk result size did not match its declaration.",
+                                code="BULK_RESULT_DOWNLOAD_SIZE_MISMATCH",
+                            )
+                        )
+                downloaded = 0
+                with partial.open("wb") as handle:
+                    # S3 may label the stored gzip object with Content-Encoding.
+                    # Raw iteration preserves the exact signed bytes and checksum.
+                    for chunk in response.iter_raw(1024 * 1024):
+                        downloaded += len(chunk)
+                        if downloaded > expected_bytes or downloaded > max_bytes:
+                            raise ApiError(
+                                ApiProblem(
+                                    0,
+                                    "Manifest result size mismatch",
+                                    "The bulk result exceeded its declared size.",
+                                    code="BULK_RESULT_DOWNLOAD_SIZE_MISMATCH",
+                                )
+                            )
+                        handle.write(chunk)
+                if downloaded != expected_bytes:
+                    raise ApiError(
+                        ApiProblem(
+                            0,
+                            "Manifest result size mismatch",
+                            "The bulk result was incomplete.",
+                            code="BULK_RESULT_DOWNLOAD_SIZE_MISMATCH",
+                        )
+                    )
+                response_headers = dict(response.headers)
+            os.replace(partial, selected)
+            if os.name != "nt":
+                selected.chmod(0o600)
+            return response_headers
+        except ApiError:
+            partial.unlink(missing_ok=True)
+            raise
+        except httpx.HTTPError as exc:
+            partial.unlink(missing_ok=True)
+            raise ApiError(
+                ApiProblem(
+                    0,
+                    "Manifest result unavailable",
+                    "The bulk result could not be downloaded. It will be retried.",
+                    code="BULK_RESULT_DOWNLOAD_NETWORK_ERROR",
+                )
+            ) from exc
+        except OSError:
+            partial.unlink(missing_ok=True)
+            raise
 
     def create_upload_plan(
         self,

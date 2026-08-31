@@ -9,6 +9,26 @@ class JobDispatchError(RuntimeError):
     """A durable job could not be published to the processing queue."""
 
 
+class SqsManifestImportDispatcher:
+    """Publish one durable manifest-import identity after its DB commit."""
+
+    def __init__(self, *, client: Any, queue_url: str) -> None:
+        if not queue_url:
+            raise ValueError("The manifest import queue URL is required")
+        self._client = client
+        self._queue_url = queue_url
+
+    def dispatch(self, import_id: UUID) -> None:
+        self._client.send_message(
+            QueueUrl=self._queue_url,
+            MessageBody=json.dumps(
+                {"jobType": "BulkManifest", "importId": str(import_id)},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+
+
 class SqsJobDispatcher:
     """Publish post-commit job identities in bounded SQS batches."""
 

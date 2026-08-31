@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from enum import IntEnum
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Annotated, Any, Iterator, Mapping
+from typing import Annotated, Any, Iterator, Literal, Mapping
 
 import typer
 from botocore.exceptions import BotoCoreError, ClientError
@@ -23,7 +23,12 @@ from .api_client import ApiError, AuthenticationRequired
 from .config import DEFAULT_STACK_NAME, ConfigStore, config_from_stack
 from .media import MediaScanner
 from .runtime import Runtime, boto3_session, build_runtime, cloudformation_client
-from .sync import SyncEngine, SyncSummary
+from .sync import (
+    DEFAULT_ENRICHMENT_LIMIT,
+    EnrichmentSummary,
+    SyncEngine,
+    SyncSummary,
+)
 
 
 class ExitCode(IntEnum):
@@ -550,11 +555,39 @@ def _print_sync(summary: SyncSummary) -> None:
         "Scene previews quota-deferred": summary.description_deferred,
         "Scene previews needing attention": summary.description_quarantined,
     }
+    if summary.bulk_total:
+        rows.update(
+            {
+                "Bulk metadata state": summary.bulk_state or "",
+                "Bulk metadata phase": summary.bulk_phase or "",
+                "Bulk metadata rows": (
+                    f"{summary.bulk_processed:,}/{summary.bulk_total:,}"
+                ),
+                "Bulk captured batches": summary.bulk_captured_batches,
+            }
+        )
     for label, value in rows.items():
         table.add_row(label, str(value))
     console.print(table)
     if summary.dry_run:
         console.print("[warning]Dry run:[/warning] no manifest was sent.")
+
+
+def _print_enrichment(summary: EnrichmentSummary) -> None:
+    table = _table(title="ImageTracker scene enrichment")
+    table.add_column("Result", style="accent")
+    table.add_column("Count", justify="right", style="key")
+    rows = {
+        "Run limit": summary.limit,
+        "Scene previews staged": summary.descriptions_staged,
+        "Scene previews recovered": summary.descriptions_recovered,
+        "Scene previews pending": summary.description_pending,
+        "Scene previews quota-deferred": summary.description_deferred,
+        "Scene previews needing attention": summary.description_quarantined,
+    }
+    for label, value in rows.items():
+        table.add_row(label, str(value))
+    console.print(table)
 
 
 @app.command()
@@ -591,8 +624,29 @@ def sync(
             ),
         ),
     ] = False,
+    with_enrichment: Annotated[
+        bool,
+        typer.Option(
+            "--with-enrichment",
+            help=(
+                "After metadata sync, stage up to "
+                f"{DEFAULT_ENRICHMENT_LIMIT} due scene previews. By default "
+                "sync performs metadata work only."
+            ),
+        ),
+    ] = False,
+    transport: Annotated[
+        Literal["auto", "bulk", "batch"],
+        typer.Option(
+            "--transport",
+            help=(
+                "Metadata delivery: auto uses one bulk import for at least "
+                "10 batches or 1,000 rows; batch always uses resumable requests."
+            ),
+        ),
+    ] = "auto",
 ) -> None:
-    """Hash and synchronize a Local folder with safe deletion detection."""
+    """Synchronize Local metadata with safe deletion detection."""
 
     del no_input  # Sync is deliberately non-interactive.
     with command_errors(
@@ -603,6 +657,8 @@ def sync(
     ):
         if fast_add and force_rehash:
             raise ValueError("--fast-add cannot be combined with --force-rehash")
+        if dry_run and with_enrichment:
+            raise ValueError("--with-enrichment cannot be combined with --dry-run")
         runtime = _runtime()
         binding = runtime.state.resolve_binding(source)
         with runtime.state.source_sync_lock(binding.source_id):
@@ -617,6 +673,9 @@ def sync(
                     force_rehash=force_rehash,
                     scan_workers=scan_workers,
                     fast_add=fast_add,
+                    with_enrichment=with_enrichment,
+                    enrichment_limit=DEFAULT_ENRICHMENT_LIMIT,
+                    transport=transport,
                 )
                 if json_output:
                     _emit(summary.as_dict())
@@ -636,6 +695,58 @@ def sync(
 
 
 @app.command()
+def enrich(
+    source: Annotated[
+        str | None,
+        typer.Argument(help="Source ID, name, or local path."),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option(
+            "--limit",
+            min=1,
+            max=1000,
+            help="Maximum due scene previews to prepare and stage.",
+        ),
+    ] = DEFAULT_ENRICHMENT_LIMIT,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit one machine-readable result."),
+    ] = False,
+) -> None:
+    """Stage due scene previews without rescanning or synchronizing metadata."""
+
+    with command_errors(
+        interrupt_message=(
+            "Stopped. Completed scene previews remain staged; rerun the same "
+            "enrich command to resume due work."
+        )
+    ):
+        runtime = _runtime()
+        binding = runtime.state.resolve_binding(source)
+        with runtime.state.source_sync_lock(binding.source_id):
+            progress = (lambda message: None) if json_output else (
+                lambda message: console.print(f"[progress]{message}[/progress]")
+            )
+            summary = SyncEngine(
+                runtime.api,
+                runtime.state,
+                progress=progress,
+            ).enrich(binding, limit=limit)
+            if json_output:
+                _emit(summary.as_dict())
+            else:
+                _print_enrichment(summary)
+            if summary.failed > 0:
+                _error(
+                    "Enrichment completed with scene previews needing attention. "
+                    "Inspect them with 'imagetracker outbox descriptions "
+                    "--state Failed'.",
+                    ExitCode.PARTIAL_SYNC,
+                )
+
+
+@app.command()
 def status(
     follow: Annotated[bool, typer.Option("--follow", help="Refresh until interrupted.")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable output.")] = False,
@@ -646,6 +757,32 @@ def status(
         runtime = _runtime()
         while True:
             description_counts = runtime.state.description_counts()
+            bulk_imports = runtime.state.active_bulk_manifests()
+            cached_bulk_ids: set[str] = set()
+            refreshed_bulk = []
+            for item in bulk_imports:
+                if item.server_import_id:
+                    try:
+                        remote = runtime.api.get_manifest_import(
+                            item.source_id,
+                            item.server_import_id,
+                        )
+                        runtime.state.update_bulk_manifest_status(
+                            item.bulk_id,
+                            status=str(remote.get("status") or item.server_status),
+                            phase=str(remote.get("phase") or item.server_phase or "Preparing"),
+                            processed_entries=int(
+                                remote.get("processedEntryCount")
+                                or item.processed_entries
+                            ),
+                        )
+                        item = runtime.state.bulk_manifest(item.bulk_id) or item
+                    except ApiError as exc:
+                        if exc.problem.status == 401:
+                            raise
+                        cached_bulk_ids.add(item.bulk_id)
+                refreshed_bulk.append(item)
+            bulk_imports = refreshed_bulk
             payload = {
                 "pendingManifestBatches": runtime.state.pending_count(),
                 "failedManifestBatches": runtime.state.failed_count(),
@@ -656,6 +793,23 @@ def status(
                 "sources": len(runtime.state.list_bindings()),
                 "jobs": runtime.api.list_jobs(limit=50),
                 "recentScans": runtime.state.recent_scans(),
+                "bulkImports": [
+                    {
+                        "sourceId": item.source_id,
+                        "state": item.state,
+                        "status": item.server_status,
+                        "phase": item.server_phase,
+                        "processedEntries": item.processed_entries,
+                        "totalEntries": item.entry_count,
+                        "percent": round(
+                            item.processed_entries / item.entry_count * 100,
+                            1,
+                        ),
+                        "capturedBatches": len(item.superseded_batch_ids),
+                        "cached": item.bulk_id in cached_bulk_ids,
+                    }
+                    for item in bulk_imports
+                ],
             }
             if json_output:
                 _emit(payload)
@@ -666,8 +820,31 @@ def status(
                     f"[count]{payload['pendingDescriptionPreviews']}[/count] scene previews queued · "
                     f"[count]{payload['deferredDescriptionPreviews']}[/count] quota-deferred · "
                     f"[count]{payload['failedDescriptionPreviews']}[/count] scene previews need attention · "
+                    f"[count]{len(payload['bulkImports'])}[/count] bulk imports active · "
                     f"[count]{payload['sources']}[/count] local sources"
                 )
+                if payload["bulkImports"]:
+                    bulk_table = _table(title="Bulk metadata activity")
+                    bulk_table.add_column("State", style="accent")
+                    bulk_table.add_column("Phase", style="key")
+                    bulk_table.add_column("Rows", justify="right")
+                    bulk_table.add_column("Progress", justify="right")
+                    bulk_table.add_column("Captured", justify="right")
+                    for item in payload["bulkImports"]:
+                        bulk_table.add_row(
+                            _state_text(item["status"] or item["state"]),
+                            (
+                                f"{item['phase'] or ''}"
+                                f"{' (cached)' if item['cached'] else ''}"
+                            ),
+                            (
+                                f"{item['processedEntries']:,}/"
+                                f"{item['totalEntries']:,}"
+                            ),
+                            f"{item['percent']:.1f}%",
+                            f"{item['capturedBatches']:,} batches",
+                        )
+                    console.print(bulk_table)
                 table = _table(title="Processing activity")
                 table.add_column("Type", style="accent")
                 table.add_column("State", style="key")

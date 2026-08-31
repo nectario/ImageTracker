@@ -149,6 +149,7 @@ imagetracker source add "/mnt/d/Pictures/Camera Uploads" \
 imagetracker source list
 imagetracker sync "Camera Uploads" --fast-add
 imagetracker sync "Camera Uploads" --scan-workers 64
+imagetracker enrich "Camera Uploads" --limit 100
 imagetracker status
 ```
 
@@ -157,6 +158,26 @@ their contents, so a very large library appears quickly. A later normal sync
 performs exact SHA-256 deduplication, EXIF extraction, and video probing in the
 background-friendly deep-index phase. Worker selection is auto-tuned up to 64;
 use `--scan-workers`/`-j` to benchmark another bounded value.
+
+Metadata delivery defaults to `--transport auto`. Small or mixed changes keep
+the proven 100-row request path. At 10 saved batches or 1,000 hash-enriched
+Local upserts, the CLI creates one deterministic, compressed manifest, uploads
+it directly to private S3, follows a dedicated asynchronous MySQL import, and
+applies the checksum-bound result to local state in resumable pages. Deletions,
+pending hashes, rejected bulk rows, and unsupported relinks automatically keep
+or return to the batch path without discarding saved work:
+
+```bash
+imagetracker sync "Camera Uploads" --transport auto
+imagetracker sync "Camera Uploads" --transport bulk
+imagetracker sync "Camera Uploads" --transport batch
+```
+
+`Ctrl+C` stops watching, not the durable server import. The next sync refreshes
+the authoritative server phase before deciding whether to upload, continue,
+apply the result, or fall back. `imagetracker status --follow` shows the bulk
+phase, processed rows, percentage, and whether a value is freshly fetched or
+cached.
 
 For trusted WSL administration on the shared DeepTrading infrastructure, the
 one-file path bypasses API transport batching while preserving account/source
@@ -171,6 +192,16 @@ It creates one ignored CSV, executes one MySQL `LOAD DATA LOCAL INFILE`, merges
 only missing pending-hash occurrences and their change rows set-wise, and
 commits once. It refuses to race a live manifest sender unless the stopped
 outbox is explicitly replaced with `--replace-pending-outbox`.
+
+`sync` is metadata-only by default: it scans, hashes, extracts metadata, and
+sends resumable manifests without staging paid scene-description work. Use the
+separate bounded command when you are ready to process due previews, or add
+`--with-enrichment` to stage up to 100 after a metadata sync:
+
+```bash
+imagetracker enrich "Camera Uploads" --limit 100
+imagetracker sync "Camera Uploads" --with-enrichment
+```
 
 `--dry-run` scans and hashes without sending a manifest. A normal sync saves
 manifest batches locally before sending them, so rerunning the command resumes
@@ -218,10 +249,10 @@ imagetracker jobs list
 imagetracker jobs retry JOB_ID
 ```
 
-The same normal `sync` command drives
-both additions. GPS in a manifest queues reverse geocoding. Each eligible photo
-also receives a server-owned description job; the CLI creates a deterministic
-JPEG preview, stages it, and queues the job without an extra prompt. Useful
+GPS in a manifest queues reverse geocoding. Each eligible photo also receives a
+server-owned description job, but metadata sync leaves its local preview safely
+queued. `enrich` creates deterministic JPEG previews and stages only the number
+requested with `--limit`, without rescanning files or draining manifests. Useful
 WSL commands for watching or repairing that work are:
 
 ```bash
@@ -237,7 +268,7 @@ WSL commands for watching or repairing that work are:
 
 # Retry a server job that is Failed or waiting on quota.
 ./scripts/cli.sh jobs retry JOB_ID
-./scripts/cli.sh sync "Camera Uploads"
+./scripts/cli.sh enrich "Camera Uploads" --limit 100
 ```
 
 `DeferredQuota` is an intentional waiting state, not a failed upload. Once one

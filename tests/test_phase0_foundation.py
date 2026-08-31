@@ -135,6 +135,11 @@ def test_lambda_packaging_keeps_runtime_files_at_archive_root():
     assert '"services/worker/handler.py"' in validator
     assert '"services/worker/composition.py"' in validator
     assert '"services/worker/staging.py"' in validator
+    assert '"services/bulk/handler.py"' in validator
+    assert '"services/bulk/composition.py"' in validator
+    assert '"services/bulk/manifest.py"' in validator
+    assert '"services/bulk/processor.py"' in validator
+    assert '"services/bulk/repository.py"' in validator
     assert '"services/enrichment/aws_location.py"' in validator
     assert '"services/enrichment/models.py"' in validator
     assert '"services/enrichment/normalization.py"' in validator
@@ -149,6 +154,7 @@ def test_lambda_packaging_keeps_runtime_files_at_archive_root():
     )
     assert 'REPOSITORY_ROOT / "location_normalization_rules.json"' in stage_script
     assert "WORKER_SOURCE_ROOT / \"handler.py\"" in stage_script
+    assert "BULK_SOURCE_ROOT / \"handler.py\"" in stage_script
 
 
 def test_worker_infrastructure_is_bounded_and_schedules_stay_disabled():
@@ -178,6 +184,17 @@ def test_worker_infrastructure_is_bounded_and_schedules_stay_disabled():
     assert "State: ${self:custom.retryScheduleState}" in serverless
     assert "maintenanceSchedulesState: ${param:maintenanceSchedulesState, 'DISABLED'}" in serverless
     assert "maxReceiveCount: 8" in serverless
+    assert "handler: services/bulk/handler.handler" in serverless
+    assert "name: ${self:service}-${sls:stage}-manifest-import-worker" in serverless
+    assert "memorySize: 1024" in serverless
+    assert "timeout: 900" in serverless
+    assert "ephemeralStorageSize: 2048" in serverless
+    assert "VisibilityTimeout: 1800" in serverless
+    assert "maxReceiveCount: 5" in serverless
+    assert "IMAGETRACKER_MANIFEST_IMPORT_QUEUE_URL:" in serverless
+    assert "Prefix: manifests/input/" in serverless
+    assert "ManifestImportRetrySchedule:" in serverless
+    assert "RetryManifestImports" in serverless
 
 
 def test_python_wheel_includes_the_rds_trust_bundle(tmp_path: Path):

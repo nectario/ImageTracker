@@ -81,6 +81,8 @@ provider:
       Fn::GetAtt:
         - ProcessingQueue
         - Arn
+    IMAGETRACKER_MANIFEST_IMPORT_QUEUE_URL:
+      Ref: ManifestImportQueue
     IMAGETRACKER_LOCATION_NORMALIZATION_RULES_PATH: /var/task/location_normalization_rules.json
     IMAGETRACKER_GEOCODE_REUSE_RADIUS_METERS: '5'
     IMAGETRACKER_GEOCODE_MONTHLY_CALL_LIMIT: '1000'
@@ -136,9 +138,12 @@ provider:
           Action:
             - sqs:SendMessage
           Resource:
-            Fn::GetAtt:
-              - ProcessingQueue
-              - Arn
+            - Fn::GetAtt:
+                - ProcessingQueue
+                - Arn
+            - Fn::GetAtt:
+                - ManifestImportQueue
+                - Arn
         - Sid: ConsumeImageTrackerProcessing
           Effect: Allow
           Action:
@@ -147,9 +152,12 @@ provider:
             - sqs:ChangeMessageVisibility
             - sqs:GetQueueAttributes
           Resource:
-            Fn::GetAtt:
-              - ProcessingQueue
-              - Arn
+            - Fn::GetAtt:
+                - ProcessingQueue
+                - Arn
+            - Fn::GetAtt:
+                - ManifestImportQueue
+                - Arn
         - Sid: ResolveStoredImageTrackerLocations
           Effect: Allow
           Action:
@@ -199,6 +207,22 @@ functions:
           arn:
             Fn::GetAtt:
               - ProcessingQueue
+              - Arn
+          batchSize: 1
+          functionResponseType: ReportBatchItemFailures
+  manifestImportWorker:
+    name: ${self:service}-${sls:stage}-manifest-import-worker
+    description: ImageTracker bounded set-based manifest import worker
+    handler: services/bulk/handler.handler
+    memorySize: 1024
+    timeout: 900
+    reservedConcurrency: 1
+    ephemeralStorageSize: 2048
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt:
+              - ManifestImportQueue
               - Arn
           batchSize: 1
           functionResponseType: ReportBatchItemFailures
@@ -329,6 +353,10 @@ resources:
               Status: Enabled
               Prefix: staging/
               ExpirationInDays: 1
+            - Id: ExpireManifestInputs
+              Status: Enabled
+              Prefix: manifests/input/
+              ExpirationInDays: 7
             - Id: ExpireTrash
               Status: Enabled
               Prefix: trash/
@@ -415,6 +443,46 @@ resources:
           - Key: ManagedBy
             Value: ServerlessFramework
 
+    ManifestImportDeadLetterQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${sls:stage}-manifest-import-dlq
+        MessageRetentionPeriod: 1209600
+        SqsManagedSseEnabled: true
+        Tags:
+          - Key: Application
+            Value: ImageTracker
+          - Key: Product
+            Value: NektronAI
+          - Key: Environment
+            Value: ${sls:stage}
+          - Key: ManagedBy
+            Value: ServerlessFramework
+
+    ManifestImportQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${sls:stage}-manifest-import
+        MessageRetentionPeriod: 345600
+        ReceiveMessageWaitTimeSeconds: 20
+        VisibilityTimeout: 1800
+        SqsManagedSseEnabled: true
+        RedrivePolicy:
+          deadLetterTargetArn:
+            Fn::GetAtt:
+              - ManifestImportDeadLetterQueue
+              - Arn
+          maxReceiveCount: 5
+        Tags:
+          - Key: Application
+            Value: ImageTracker
+          - Key: Product
+            Value: NektronAI
+          - Key: Environment
+            Value: ${sls:stage}
+          - Key: ManagedBy
+            Value: ServerlessFramework
+
     RetrySchedule:
       Type: AWS::Events::Rule
       Properties:
@@ -429,6 +497,26 @@ resources:
                 - Arn
             Id: ProcessingQueue
             Input: '{"jobType":"RetryDueJobs","source":"schedule"}'
+        Tags:
+          - Key: Application
+            Value: ImageTracker
+          - Key: Environment
+            Value: ${sls:stage}
+
+    ManifestImportRetrySchedule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: ${self:service}-${sls:stage}-retry-manifest-imports
+        Description: Recovers queued, retryable, or expired manifest imports.
+        ScheduleExpression: rate(5 minutes)
+        State: ${self:custom.retryScheduleState}
+        Targets:
+          - Arn:
+              Fn::GetAtt:
+                - ManifestImportQueue
+                - Arn
+            Id: ManifestImportQueue
+            Input: '{"jobType":"RetryManifestImports","source":"schedule"}'
         Tags:
           - Key: Application
             Value: ImageTracker
@@ -500,6 +588,7 @@ resources:
       Properties:
         Queues:
           - Ref: ProcessingQueue
+          - Ref: ManifestImportQueue
         PolicyDocument:
           Version: '2012-10-17'
           Statement:
@@ -509,9 +598,12 @@ resources:
                 Service: events.amazonaws.com
               Action: sqs:SendMessage
               Resource:
-                Fn::GetAtt:
-                  - ProcessingQueue
-                  - Arn
+                - Fn::GetAtt:
+                    - ProcessingQueue
+                    - Arn
+                - Fn::GetAtt:
+                    - ManifestImportQueue
+                    - Arn
               Condition:
                 ArnLike:
                   aws:SourceArn:
@@ -596,6 +688,14 @@ resources:
       Description: Processing dead-letter queue URL.
       Value:
         Ref: ProcessingDeadLetterQueue
+    ManifestImportQueueUrl:
+      Description: Asynchronous manifest import queue URL.
+      Value:
+        Ref: ManifestImportQueue
+    ManifestImportDeadLetterQueueUrl:
+      Description: Manifest import dead-letter queue URL.
+      Value:
+        Ref: ManifestImportDeadLetterQueue
     ConfigurationParameterPrefix:
       Description: SSM path prefix expected by the runtime.
       Value: ${self:custom.parameterPrefix}

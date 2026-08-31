@@ -19,6 +19,7 @@ REQUIRED_MARKERS = {
     "shared API handler": "handler: services/api/handler.handler",
     "bounded API concurrency": "reservedConcurrency: 4",
     "shared worker handler": "handler: services/worker/handler.handler",
+    "manifest import worker handler": "handler: services/bulk/handler.handler",
     "bounded worker concurrency": "reservedConcurrency: 1",
     "single-message worker batches": "batchSize: 1",
     "partial SQS batch responses": "functionResponseType: ReportBatchItemFailures",
@@ -42,6 +43,7 @@ REQUIRED_MARKERS = {
     "SSE-S3": "SSEAlgorithm: AES256",
     "multipart cleanup": "AbortIncompleteMultipartUpload:",
     "one-day staging cleanup": "ExpirationInDays: 1",
+    "manifest input cleanup": "Prefix: manifests/input/",
     "30-day trash cleanup": "ExpirationInDays: 30",
     "processing queue": "Type: AWS::SQS::Queue",
     "dead-letter policy": "RedrivePolicy:",
@@ -118,9 +120,28 @@ def _validate_packaged_template(path: Path) -> list[str]:
         failures.append("packaged worker Lambda memory is not 384 MB")
     if worker_lambda.get("Timeout") != 120:
         failures.append("packaged worker Lambda timeout is not 120 seconds")
+
+    bulk_lambda = resources.get("ManifestImportWorkerLambdaFunction", {}).get(
+        "Properties", {}
+    )
+    if bulk_lambda.get("Runtime") != "python3.12":
+        failures.append("packaged manifest import Lambda runtime is not python3.12")
+    if bulk_lambda.get("Handler") != "services/bulk/handler.handler":
+        failures.append("packaged manifest import handler does not point to services/bulk")
+    if bulk_lambda.get("ReservedConcurrentExecutions") != 1:
+        failures.append("packaged manifest import concurrency is not bounded at 1")
+    if bulk_lambda.get("MemorySize") != 1024:
+        failures.append("packaged manifest import memory is not 1024 MB")
+    if bulk_lambda.get("Timeout") != 900:
+        failures.append("packaged manifest import timeout is not 900 seconds")
+    if (bulk_lambda.get("EphemeralStorage") or {}).get("Size") != 2048:
+        failures.append("packaged manifest import ephemeral storage is not 2048 MB")
     queue = resources.get("ProcessingQueue", {}).get("Properties", {})
     if int(queue.get("VisibilityTimeout", 0)) < 720:
         failures.append("processing queue visibility must cover worker retries")
+    bulk_queue = resources.get("ManifestImportQueue", {}).get("Properties", {})
+    if int(bulk_queue.get("VisibilityTimeout", 0)) < 1800:
+        failures.append("manifest import queue visibility must cover the bulk worker")
 
     mappings = [
         resource.get("Properties", {})
@@ -131,6 +152,8 @@ def _validate_packaged_template(path: Path) -> list[str]:
         mapping
         for mapping in mappings
         if "WorkerLambdaFunction" in json.dumps(mapping.get("FunctionName"))
+        and "ManifestImportWorkerLambdaFunction"
+        not in json.dumps(mapping.get("FunctionName"))
     ]
     if len(worker_mappings) != 1:
         failures.append("packaged worker must have exactly one SQS event source mapping")
@@ -142,6 +165,33 @@ def _validate_packaged_template(path: Path) -> list[str]:
             failures.append("packaged worker does not report partial SQS batch failures")
         if "ProcessingQueue" not in json.dumps(worker_mapping.get("EventSourceArn")):
             failures.append("packaged worker event source is not ProcessingQueue")
+
+    bulk_mappings = [
+        mapping
+        for mapping in mappings
+        if "ManifestImportWorkerLambdaFunction"
+        in json.dumps(mapping.get("FunctionName"))
+    ]
+    if len(bulk_mappings) != 1:
+        failures.append(
+            "packaged manifest import worker must have exactly one SQS event source"
+        )
+    else:
+        bulk_mapping = bulk_mappings[0]
+        if bulk_mapping.get("BatchSize") != 1:
+            failures.append("packaged manifest import SQS batch size is not 1")
+        if bulk_mapping.get("FunctionResponseTypes") != [
+            "ReportBatchItemFailures"
+        ]:
+            failures.append(
+                "packaged manifest import worker does not report partial failures"
+            )
+        if "ManifestImportQueue" not in json.dumps(
+            bulk_mapping.get("EventSourceArn")
+        ):
+            failures.append(
+                "packaged manifest import event source is not ManifestImportQueue"
+            )
 
     execution_role = resources.get("IamRoleLambdaExecution", {}).get("Properties", {})
     role_document = json.dumps(execution_role.get("Policies", []))
@@ -172,6 +222,15 @@ def _validate_packaged_template(path: Path) -> list[str]:
     retry_state = resources.get("RetrySchedule", {}).get("Properties", {}).get("State")
     if retry_state != "ENABLED":
         failures.append("RetrySchedule must package as ENABLED for durable job recovery")
+    bulk_retry_state = (
+        resources.get("ManifestImportRetrySchedule", {})
+        .get("Properties", {})
+        .get("State")
+    )
+    if bulk_retry_state != "ENABLED":
+        failures.append(
+            "ManifestImportRetrySchedule must package as ENABLED for durable recovery"
+        )
 
     for logical_id in (
         "ReconciliationSchedule",
@@ -220,6 +279,11 @@ def _validate_lambda_archive(template_path: Path) -> list[str]:
         "services/worker/handler.py",
         "services/worker/processor.py",
         "services/worker/staging.py",
+        "services/bulk/handler.py",
+        "services/bulk/composition.py",
+        "services/bulk/manifest.py",
+        "services/bulk/processor.py",
+        "services/bulk/repository.py",
         "services/data/certs/us-east-2-bundle.pem",
         "location_normalization_rules.json",
     }

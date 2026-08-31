@@ -1,8 +1,8 @@
-"""Apply only the additive ImageTracker enrichment migrations 012 and 013.
+"""Apply the narrowly scoped additive ImageTracker migrations 012 through 014.
 
-The runner is deliberately narrow and crash-reconcilable. If MySQL commits an
-ALTER before the SchemaMigration marker is written, a rerun verifies the target
-shape and records the missing ledger row instead of repeating the ALTER.
+The runner is deliberately narrow and crash-reconcilable. If MySQL commits DDL
+before the SchemaMigration marker is written, a rerun verifies the complete
+target shape and records the missing ledger row instead of repeating unsafe DDL.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ from ImageTracker import _split_sql_statements  # noqa: E402
 MIGRATIONS = {
     "012": ROOT / "migrations" / "012_AddProviderCircuit.sql",
     "013": ROOT / "migrations" / "013_WidenLocationProviderFields.sql",
+    "014": ROOT / "migrations" / "014_CreateManifestImportTables.sql",
 }
 REQUIRED_BASE = {"007", "008", "009", "010", "011"}
 CA_PATH = ROOT / "services" / "data" / "certs" / "us-east-2-bundle.pem"
@@ -123,6 +124,32 @@ def _columns(connection: pymysql.Connection, table: str) -> dict[str, int | None
         }
 
 
+def _indexes(connection: pymysql.Connection, table: str) -> set[str]:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT DISTINCT INDEX_NAME
+            FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = 'ImageTracker' AND TABLE_NAME = %s
+            """,
+            (table,),
+        )
+        return {str(row["INDEX_NAME"]) for row in cursor.fetchall()}
+
+
+def _constraints(connection: pymysql.Connection, table: str) -> set[str]:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT CONSTRAINT_NAME
+            FROM information_schema.TABLE_CONSTRAINTS
+            WHERE TABLE_SCHEMA = 'ImageTracker' AND TABLE_NAME = %s
+            """,
+            (table,),
+        )
+        return {str(row["CONSTRAINT_NAME"]) for row in cursor.fetchall()}
+
+
 def _satisfied(connection: pymysql.Connection, version: str) -> bool:
     if version == "012":
         columns = _columns(connection, "ProviderUsageMonth")
@@ -137,7 +164,243 @@ def _satisfied(connection: pymysql.Connection, version: str) -> bool:
             (columns.get("ProviderPlaceId") or 0) >= 500
             and (columns.get("PostalCode") or 0) >= 50
         )
+    if version == "014":
+        required_columns = {
+            "ManifestImport": {
+                "Id",
+                "PublicId",
+                "UserId",
+                "MediaSourceId",
+                "SnapshotId",
+                "IdempotencyKey",
+                "RequestSha256",
+                "ActiveMarker",
+                "ManifestKind",
+                "PermissionState",
+                "DeletionDetectionReliable",
+                "ClientCursor",
+                "SchemaVersion",
+                "Status",
+                "Phase",
+                "InputS3Bucket",
+                "InputS3ObjectKey",
+                "InputS3VersionId",
+                "InputChecksumSha256",
+                "InputByteSize",
+                "DeclaredEntryCount",
+                "ValidatedEntryCount",
+                "ProcessedEntryCount",
+                "CreatedCount",
+                "UpdatedCount",
+                "DuplicateLinkedCount",
+                "DeletedCount",
+                "IgnoredDeletionCount",
+                "UnchangedCount",
+                "RejectedCount",
+                "ResultS3Bucket",
+                "ResultS3ObjectKey",
+                "ResultChecksumSha256",
+                "ResultByteSize",
+                "AttemptCount",
+                "MaxAttempts",
+                "NextAttemptAtUtc",
+                "LeaseTokenHash",
+                "LeaseExpiresAtUtc",
+                "FailureClass",
+                "FailureCode",
+                "FailureMessage",
+                "UploadExpiresAtUtc",
+                "QueuedAtUtc",
+                "StartedAtUtc",
+                "CompletedAtUtc",
+                "CreatedAtUtc",
+                "UpdatedAtUtc",
+            },
+            "ManifestImportEntry": {
+                "StageId",
+                "ManifestImportId",
+                "RowNumber",
+                "OperationRaw",
+                "SourceItemIdRaw",
+                "SourceRevisionRaw",
+                "OriginalFileNameRaw",
+                "LocalLocatorRaw",
+                "ContentSha256Raw",
+                "MediaTypeRaw",
+                "MimeTypeRaw",
+                "ByteSizeRaw",
+                "WidthPixelsRaw",
+                "HeightPixelsRaw",
+                "DurationMillisecondsRaw",
+                "CaptureDateTimeLocalRaw",
+                "CaptureDateTimeUtcRaw",
+                "TimeZoneRaw",
+                "UtcOffsetMinutesRaw",
+                "LatitudeRaw",
+                "LongitudeRaw",
+                "AltitudeMetersRaw",
+                "AccuracyMetersRaw",
+                "ProvenanceJsonRaw",
+                "Operation",
+                "SourceItemId",
+                "SourceRevision",
+                "OriginalFileName",
+                "LocalLocator",
+                "ContentSha256",
+                "MediaType",
+                "MimeType",
+                "ByteSize",
+                "WidthPixels",
+                "HeightPixels",
+                "DurationMilliseconds",
+                "CaptureDateTimeLocal",
+                "CaptureDateTimeUtc",
+                "TimeZone",
+                "UtcOffsetMinutes",
+                "Latitude",
+                "Longitude",
+                "AltitudeMeters",
+                "AccuracyMeters",
+                "CoordinateRevision",
+                "ProvenanceJson",
+                "LocationSource",
+                "ValidationState",
+                "ExistingOccurrenceId",
+                "ExistingAssetId",
+                "ResolvedAssetId",
+                "Outcome",
+                "ErrorCode",
+                "ErrorMessage",
+                "OccurrencePublicId",
+                "MediaAssetPublicId",
+                "DescriptionJobPublicId",
+                "CreatedAtUtc",
+                "UpdatedAtUtc",
+            },
+            "ManifestImportAssetWork": {
+                "ManifestImportId",
+                "ContentSha256",
+                "CanonicalStageId",
+                "CanonicalRowNumber",
+                "ResolvedMediaAssetId",
+                "ResolvedMediaAssetPublicId",
+                "AssetWasPreexisting",
+                "AssetCreated",
+                "AssetChanged",
+                "ErrorCode",
+                "ErrorMessage",
+                "CreatedAtUtc",
+                "UpdatedAtUtc",
+            },
+            "ManifestImportFailure": {
+                "Id",
+                "PublicId",
+                "UserId",
+                "ManifestImportId",
+                "RowNumber",
+                "SourceItemId",
+                "SourceRevision",
+                "Operation",
+                "ErrorCode",
+                "ErrorMessage",
+                "CreatedAtUtc",
+            },
+        }
+        if any(
+            not columns.issubset(_columns(connection, table))
+            for table, columns in required_columns.items()
+        ):
+            return False
+        required_indexes = {
+            "ManifestImport": {
+                "Ux_ManifestImport_PublicId",
+                "Ux_ManifestImport_User_Idempotency",
+                "Ux_ManifestImport_User_Source_Snapshot",
+                "Ux_ManifestImport_User_Source_Active",
+                "Ix_ManifestImport_Status_NextAttempt",
+            },
+            "ManifestImportEntry": {
+                "Ux_ManifestImportEntry_Import_Row",
+                "Ix_ManifestImportEntry_Import_SourceItem",
+                "Ix_ManifestImportEntry_Import_Hash",
+            },
+            "ManifestImportAssetWork": {
+                "PRIMARY",
+                "Ix_ManifestImportAssetWork_Import_ResolvedAsset",
+            },
+            "ManifestImportFailure": {
+                "Ux_ManifestImportFailure_Import_Row",
+                "Ix_ManifestImportFailure_User_Import",
+            },
+            "MediaOccurrence": {
+                "Ix_MediaOccurrence_User_Asset_DeletionState",
+            },
+        }
+        if not all(
+            names.issubset(_indexes(connection, table))
+            for table, names in required_indexes.items()
+        ):
+            return False
+        required_constraints = {
+            "ManifestImport": {"Fk_ManifestImport_MediaSource"},
+            "ManifestImportEntry": {"Fk_ManifestImportEntry_ManifestImport"},
+            "ManifestImportAssetWork": {
+                "Fk_ManifestImportAssetWork_CanonicalEntry"
+            },
+            "ManifestImportFailure": {"Fk_ManifestImportFailure_ManifestImport"},
+        }
+        return all(
+            names.issubset(_constraints(connection, table))
+            for table, names in required_constraints.items()
+        )
     raise ValueError(f"Unsupported migration version: {version}")
+
+
+def _migration_statements(version: str, migration_path: Path) -> list[str]:
+    statements = _split_sql_statements(migration_path.read_text(encoding="utf-8"))
+    if version in {"012", "013"}:
+        if len(statements) != 1 or not statements[0].lstrip().upper().startswith("ALTER TABLE"):
+            raise RuntimeError(
+                f"Migration {version} must contain exactly one atomic ALTER"
+            )
+        return statements
+    if version == "014":
+        if len(statements) != 5:
+            raise RuntimeError(
+                "Migration 014 must contain four additive CREATE TABLE statements "
+                "and one online index ALTER"
+            )
+        if any(
+            not statement.lstrip().upper().startswith("CREATE TABLE IF NOT EXISTS")
+            for statement in statements[:4]
+        ) or not statements[4].lstrip().upper().startswith(
+            "ALTER TABLE `MEDIAOCCURRENCE`"
+        ):
+            raise RuntimeError("Migration 014 contains an unsupported DDL statement")
+        return statements
+    raise ValueError(f"Unsupported migration version: {version}")
+
+
+def _apply_migration(
+    connection: pymysql.Connection, version: str, migration_path: Path
+) -> None:
+    statements = _migration_statements(version, migration_path)
+    if version != "014":
+        with connection.cursor() as cursor:
+            cursor.execute(statements[0])
+        return
+
+    # CREATE TABLE IF NOT EXISTS makes every committed table step replay-safe.
+    # MySQL has no portable ADD INDEX IF NOT EXISTS, so reconcile that final
+    # online ALTER independently after a crash before attempting it again.
+    with connection.cursor() as cursor:
+        for statement in statements[:4]:
+            cursor.execute(statement)
+    if "Ix_MediaOccurrence_User_Asset_DeletionState" not in _indexes(
+        connection, "MediaOccurrence"
+    ):
+        with connection.cursor() as cursor:
+            cursor.execute(statements[4])
 
 
 def _assert_idle(connection: pymysql.Connection) -> None:
@@ -156,6 +419,15 @@ def _assert_idle(connection: pymysql.Connection) -> None:
         raise RuntimeError(
             "ImageTracker processing must be idle before schema migration"
         )
+
+
+def _requires_idle(connection: pymysql.Connection, versions: set[str]) -> bool:
+    """Only the legacy table-rewriting ALTERs require a quiet database."""
+
+    return any(
+        version not in versions and not _satisfied(connection, version)
+        for version in ("012", "013")
+    )
 
 
 def _record(
@@ -202,24 +474,29 @@ def main() -> int:
             raise RuntimeError(
                 f"Required base migrations are missing: {', '.join(missing)}"
             )
-        _assert_idle(connection)
+        if _requires_idle(connection, versions):
+            _assert_idle(connection)
         for version, path in MIGRATIONS.items():
             if version in versions:
+                if not _satisfied(connection, version):
+                    raise RuntimeError(
+                        f"Migration {version} is recorded but its schema is incomplete"
+                    )
                 actions.append({"version": version, "action": "AlreadyApplied"})
                 continue
             satisfied = _satisfied(connection, version)
-            action = "ReconcileLedger" if satisfied else "ApplyAlter"
+            action = (
+                "ReconcileLedger"
+                if satisfied
+                else "ApplyAdditiveSchema"
+                if version == "014"
+                else "ApplyAlter"
+            )
             actions.append({"version": version, "action": action})
             if not args.apply:
                 continue
             if not satisfied:
-                statements = _split_sql_statements(path.read_text(encoding="utf-8"))
-                if len(statements) != 1:
-                    raise RuntimeError(
-                        f"Migration {version} must contain exactly one atomic ALTER"
-                    )
-                with connection.cursor() as cursor:
-                    cursor.execute(statements[0])
+                _apply_migration(connection, version, path)
                 if not _satisfied(connection, version):
                     raise RuntimeError(
                         f"Migration {version} did not produce its required schema"

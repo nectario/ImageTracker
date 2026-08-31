@@ -61,6 +61,29 @@ class OutboxBatch:
 
 
 @dataclass(frozen=True)
+class BulkManifestOutboxItem:
+    bulk_id: str
+    source_id: str
+    snapshot_id: str
+    idempotency_key: str
+    artifact_path: str
+    artifact_sha256: str
+    artifact_bytes: int
+    entry_count: int
+    state: str
+    server_import_id: str | None = None
+    server_status: str | None = None
+    server_phase: str | None = None
+    processed_entries: int = 0
+    result_path: str | None = None
+    result_sha256: str | None = None
+    result_bytes: int | None = None
+    result_applied_through: int = 0
+    superseded_batch_ids: tuple[str, ...] = ()
+    failure: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True)
 class BatchResolution:
     accepted_entries: int
     failed_entries: int
@@ -207,6 +230,33 @@ class LocalState:
                 );
                 CREATE INDEX IF NOT EXISTS IX_ManifestOutbox_Pending
                     ON ManifestOutbox (SourceId, State, SequenceNumber);
+                CREATE TABLE IF NOT EXISTS BulkManifestOutbox (
+                    BulkId TEXT PRIMARY KEY,
+                    SourceId TEXT NOT NULL,
+                    SnapshotId TEXT NOT NULL,
+                    IdempotencyKey TEXT NOT NULL UNIQUE,
+                    ArtifactPath TEXT NOT NULL,
+                    ArtifactSha256 TEXT NOT NULL,
+                    ArtifactBytes INTEGER NOT NULL,
+                    EntryCount INTEGER NOT NULL,
+                    State TEXT NOT NULL DEFAULT 'Prepared',
+                    ServerImportId TEXT,
+                    ServerStatus TEXT,
+                    ServerPhase TEXT,
+                    ProcessedEntries INTEGER NOT NULL DEFAULT 0,
+                    ResultPath TEXT,
+                    ResultSha256 TEXT,
+                    ResultBytes INTEGER,
+                    ResultAppliedThrough INTEGER NOT NULL DEFAULT 0,
+                    SupersededBatchIdsJson TEXT NOT NULL DEFAULT '[]',
+                    FailureJson TEXT,
+                    CreatedAtUtc TEXT NOT NULL,
+                    UpdatedAtUtc TEXT NOT NULL,
+                    CompletedAtUtc TEXT,
+                    UNIQUE (SourceId, SnapshotId)
+                );
+                CREATE INDEX IF NOT EXISTS IX_BulkManifestOutbox_Source_State
+                    ON BulkManifestOutbox (SourceId, State, CreatedAtUtc);
                 CREATE TABLE IF NOT EXISTS DescriptionOutbox (
                     JobId TEXT PRIMARY KEY,
                     SourceId TEXT NOT NULL,
@@ -261,6 +311,20 @@ class LocalState:
                 if column not in columns:
                     connection.execute(
                         f"ALTER TABLE ManifestOutbox ADD COLUMN {column} {declaration}"
+                    )
+            bulk_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(BulkManifestOutbox)"
+                ).fetchall()
+            }
+            for column, declaration in (
+                ("ServerPhase", "TEXT"),
+                ("ProcessedEntries", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if column not in bulk_columns:
+                    connection.execute(
+                        f"ALTER TABLE BulkManifestOutbox ADD COLUMN {column} {declaration}"
                     )
         if os.name != "nt":
             self.path.chmod(0o600)
@@ -376,6 +440,7 @@ class LocalState:
             # look unchanged and prevent those occurrences from being restored.
             connection.execute("DELETE FROM KnownOccurrence WHERE SourceId = ?", (source_id,))
             connection.execute("DELETE FROM ManifestOutbox WHERE SourceId = ?", (source_id,))
+            connection.execute("DELETE FROM BulkManifestOutbox WHERE SourceId = ?", (source_id,))
             affected_jobs = [
                 str(row["JobId"])
                 for row in connection.execute(
@@ -1133,8 +1198,12 @@ class LocalState:
         source_id: str,
         *,
         now_utc: datetime | None = None,
-        limit: int = 100,
+        limit: int,
     ) -> list[DescriptionOutboxItem]:
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise ValueError("Description outbox limit must be an integer")
+        if not 1 <= limit <= 1000:
+            raise ValueError("Description outbox limit must be between 1 and 1000")
         now = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
         now_text = now.isoformat().replace("+00:00", "Z")
         return self._description_items(
@@ -1619,6 +1688,569 @@ class LocalState:
                     "UPDATE ScanRun SET Status = 'CompleteWithDiscarded' WHERE ScanId = ?",
                     (row["ScanId"],),
                 )
+
+    def queue_bulk_manifest(
+        self,
+        source_id: str,
+        snapshot_id: str,
+        *,
+        artifact_path: Path,
+        artifact_sha256: str,
+        artifact_bytes: int,
+        entry_count: int,
+        superseded_batch_ids: Sequence[str] = (),
+    ) -> BulkManifestOutboxItem:
+        """Persist a prepared artifact before any network request is made."""
+
+        try:
+            normalized_sha256 = artifact_sha256.strip().lower()
+            if len(normalized_sha256) != 64:
+                raise ValueError
+            int(normalized_sha256, 16)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("Bulk artifact SHA-256 is invalid") from exc
+        if isinstance(artifact_bytes, bool) or not isinstance(artifact_bytes, int):
+            raise ValueError("Bulk artifact byte count must be an integer")
+        if isinstance(entry_count, bool) or not isinstance(entry_count, int):
+            raise ValueError("Bulk artifact entry count must be an integer")
+        if artifact_bytes <= 0 or entry_count <= 0:
+            raise ValueError("Bulk artifact byte and entry counts must be positive")
+        selected_path = artifact_path.expanduser().resolve(strict=True)
+        if not selected_path.is_file() or selected_path.stat().st_size != artifact_bytes:
+            raise ValueError("Bulk artifact file size does not match its declaration")
+        batch_ids = tuple(dict.fromkeys(str(value) for value in superseded_batch_ids))
+        now = utc_now_text()
+        with self._connect() as connection:
+            source = connection.execute(
+                "SELECT 1 FROM SourceBinding WHERE SourceId = ?",
+                (source_id,),
+            ).fetchone()
+            if source is None:
+                raise ValueError(f"Local source binding {source_id!r} was not found")
+            active = connection.execute(
+                """
+                SELECT SnapshotId FROM BulkManifestOutbox
+                WHERE SourceId = ?
+                  AND State NOT IN (
+                    'Applied', 'FailedPermanent', 'Cancelled', 'Expired'
+                  )
+                ORDER BY CreatedAtUtc DESC LIMIT 1
+                """,
+                (source_id,),
+            ).fetchone()
+            if active is not None and str(active["SnapshotId"]) != snapshot_id:
+                raise ValueError("A bulk manifest import is already active for this source")
+            existing = connection.execute(
+                """
+                SELECT * FROM BulkManifestOutbox
+                WHERE SourceId = ? AND SnapshotId = ?
+                """,
+                (source_id, snapshot_id),
+            ).fetchone()
+            if existing is not None:
+                item = self._bulk_manifest_item(existing)
+                if (
+                    item.artifact_sha256 != normalized_sha256
+                    or item.artifact_bytes != artifact_bytes
+                    or item.entry_count != entry_count
+                    or item.superseded_batch_ids != batch_ids
+                ):
+                    raise ValueError(
+                        "The bulk snapshot is already associated with different content"
+                    )
+                return item
+
+            if batch_ids:
+                placeholders = ",".join("?" for _ in batch_ids)
+                rows = connection.execute(
+                    f"""
+                    SELECT BatchId, PayloadJson FROM ManifestOutbox
+                    WHERE SourceId = ? AND State = 'Pending'
+                      AND BatchId IN ({placeholders})
+                    """,
+                    (source_id, *batch_ids),
+                ).fetchall()
+                found = {str(row["BatchId"]) for row in rows}
+                if found != set(batch_ids):
+                    raise ValueError(
+                        "Bulk supersede members must be pending batches for this source"
+                    )
+                represented_entries = 0
+                for row in rows:
+                    payload = json.loads(str(row["PayloadJson"]))
+                    entries = payload.get("entries") or []
+                    for entry in entries:
+                        content_hash = entry.get("contentSha256")
+                        if (
+                            entry.get("operation") != "Upsert"
+                            or not isinstance(content_hash, str)
+                            or len(content_hash) != 64
+                        ):
+                            raise ValueError(
+                                "Bulk supersede batches must contain only hash-enriched upserts"
+                            )
+                        try:
+                            int(content_hash, 16)
+                        except ValueError as exc:
+                            raise ValueError(
+                                "Bulk supersede batches contain an invalid content hash"
+                            ) from exc
+                    represented_entries += len(entries)
+                if represented_entries != entry_count:
+                    raise ValueError(
+                        "Bulk artifact entry count must match its captured batches"
+                    )
+
+            bulk_id = str(uuid.uuid4())
+            idempotency_key = f"manifest-import:{source_id}:{snapshot_id}"
+            connection.execute(
+                """
+                INSERT INTO BulkManifestOutbox (
+                    BulkId, SourceId, SnapshotId, IdempotencyKey,
+                    ArtifactPath, ArtifactSha256, ArtifactBytes, EntryCount,
+                    State, SupersededBatchIdsJson, CreatedAtUtc, UpdatedAtUtc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Prepared', ?, ?, ?)
+                """,
+                (
+                    bulk_id,
+                    source_id,
+                    snapshot_id,
+                    idempotency_key,
+                    normalized_path(selected_path),
+                    normalized_sha256,
+                    artifact_bytes,
+                    entry_count,
+                    json.dumps(batch_ids, separators=(",", ":")),
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM BulkManifestOutbox WHERE BulkId = ?",
+                (bulk_id,),
+            ).fetchone()
+            assert row is not None
+            return self._bulk_manifest_item(row)
+
+    def bulk_manifest(self, bulk_id: str) -> BulkManifestOutboxItem | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM BulkManifestOutbox WHERE BulkId = ?",
+                (bulk_id,),
+            ).fetchone()
+        return self._bulk_manifest_item(row) if row is not None else None
+
+    def active_bulk_manifest(
+        self, source_id: str
+    ) -> BulkManifestOutboxItem | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM BulkManifestOutbox
+                WHERE SourceId = ?
+                  AND State NOT IN (
+                    'Applied', 'FailedPermanent', 'Cancelled', 'Expired'
+                  )
+                ORDER BY CreatedAtUtc DESC LIMIT 1
+                """,
+                (source_id,),
+            ).fetchone()
+        return self._bulk_manifest_item(row) if row is not None else None
+
+    def active_bulk_manifests(self) -> list[BulkManifestOutboxItem]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM BulkManifestOutbox
+                WHERE State NOT IN (
+                    'Applied', 'FailedPermanent', 'Cancelled', 'Expired'
+                )
+                ORDER BY CreatedAtUtc
+                """
+            ).fetchall()
+        return [self._bulk_manifest_item(row) for row in rows]
+
+    def list_bulk_manifests(
+        self,
+        source_id: str | None = None,
+        *,
+        limit: int = 100,
+    ) -> list[BulkManifestOutboxItem]:
+        if not 1 <= limit <= 1000:
+            raise ValueError("Bulk outbox limit must be between 1 and 1000")
+        query = "SELECT * FROM BulkManifestOutbox"
+        parameters: list[Any] = []
+        if source_id is not None:
+            query += " WHERE SourceId = ?"
+            parameters.append(source_id)
+        query += " ORDER BY CreatedAtUtc DESC LIMIT ?"
+        parameters.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [self._bulk_manifest_item(row) for row in rows]
+
+    def set_bulk_manifest_server_import(
+        self,
+        bulk_id: str,
+        *,
+        server_import_id: str,
+        status: str = "AwaitingUpload",
+        phase: str | None = None,
+    ) -> None:
+        now = utc_now_text()
+        with self._connect() as connection:
+            row = self._require_bulk_manifest(connection, bulk_id)
+            current = str(row["ServerImportId"] or "")
+            if current and current != server_import_id:
+                raise ValueError("Bulk outbox item is already bound to another import")
+            connection.execute(
+                """
+                UPDATE BulkManifestOutbox
+                SET ServerImportId = ?, ServerStatus = ?, ServerPhase = ?,
+                    State = ?, UpdatedAtUtc = ?
+                WHERE BulkId = ?
+                """,
+                (server_import_id, status, phase, status, now, bulk_id),
+            )
+
+    def update_bulk_manifest_status(
+        self,
+        bulk_id: str,
+        *,
+        status: str,
+        phase: str | None = None,
+        processed_entries: int | None = None,
+        failure: Mapping[str, Any] | None = None,
+    ) -> None:
+        if not status or len(status) > 64:
+            raise ValueError("Bulk import status is invalid")
+        if phase is not None and (not phase or len(phase) > 64):
+            raise ValueError("Bulk import phase is invalid")
+        if processed_entries is not None and (
+            isinstance(processed_entries, bool)
+            or not isinstance(processed_entries, int)
+            or processed_entries < 0
+        ):
+            raise ValueError("Bulk processed entry count is invalid")
+        safe_failure = self._safe_bulk_failure(failure)
+        with self._connect() as connection:
+            bulk = self._require_bulk_manifest(connection, bulk_id)
+            if (
+                processed_entries is not None
+                and processed_entries > int(bulk["EntryCount"])
+            ):
+                raise ValueError("Bulk processed entry count exceeds the manifest")
+            connection.execute(
+                """
+                UPDATE BulkManifestOutbox
+                SET State = ?, ServerStatus = ?,
+                    ServerPhase = COALESCE(?, ServerPhase),
+                    ProcessedEntries = COALESCE(?, ProcessedEntries),
+                    FailureJson = ?, UpdatedAtUtc = ?
+                WHERE BulkId = ?
+                """,
+                (
+                    status,
+                    status,
+                    phase,
+                    processed_entries,
+                    json.dumps(safe_failure, sort_keys=True) if safe_failure else None,
+                    utc_now_text(),
+                    bulk_id,
+                ),
+            )
+
+    def record_bulk_manifest_result(
+        self,
+        bulk_id: str,
+        *,
+        result_path: Path,
+        result_sha256: str,
+        result_bytes: int,
+    ) -> None:
+        selected = result_path.expanduser().resolve(strict=True)
+        if not selected.is_file() or selected.stat().st_size != result_bytes:
+            raise ValueError("Bulk result file size does not match its declaration")
+        normalized_sha256 = result_sha256.strip().lower()
+        try:
+            if len(normalized_sha256) != 64:
+                raise ValueError
+            int(normalized_sha256, 16)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Bulk result SHA-256 is invalid") from exc
+        with self._connect() as connection:
+            bulk = self._require_bulk_manifest(connection, bulk_id)
+            if not bulk["ServerImportId"] or str(bulk["ServerStatus"] or "") not in {
+                "Succeeded",
+                "CompletedWithErrors",
+            }:
+                raise ValueError("Bulk result is not available for this import")
+            connection.execute(
+                """
+                UPDATE BulkManifestOutbox
+                SET ResultPath = ?, ResultSha256 = ?, ResultBytes = ?,
+                    State = 'ResultReady', UpdatedAtUtc = ?
+                WHERE BulkId = ?
+                """,
+                (
+                    normalized_path(selected),
+                    normalized_sha256,
+                    result_bytes,
+                    utc_now_text(),
+                    bulk_id,
+                ),
+            )
+
+    def apply_bulk_result_rows(
+        self,
+        bulk_id: str,
+        rows: Sequence[tuple[int, Mapping[str, Any], Mapping[str, Any]]],
+    ) -> int:
+        """Apply one contiguous result page and its resume cursor atomically."""
+
+        if not rows:
+            raise ValueError("Bulk result page cannot be empty")
+        with self._connect() as connection:
+            bulk = self._require_bulk_manifest(connection, bulk_id)
+            if str(bulk["State"]) not in {"ResultReady", "ApplyingResult"}:
+                raise ValueError("Bulk result has not been downloaded and verified")
+            current = int(bulk["ResultAppliedThrough"])
+            entry_count = int(bulk["EntryCount"])
+            expected = current + 1
+            for row_number, entry, result in rows:
+                if row_number != expected or row_number > entry_count:
+                    raise ValueError(
+                        "Bulk result rows must be contiguous with the saved cursor"
+                    )
+                expected += 1
+                item_id = str(entry.get("sourceItemId") or "")
+                outcome = str(result.get("outcome") or "")
+                if outcome not in {
+                    "CreatedOccurrence",
+                    "UpdatedOccurrence",
+                    "DuplicateLinked",
+                    "Unchanged",
+                    "Rejected",
+                }:
+                    raise ValueError("Bulk result contains an unsupported outcome")
+                if result.get("uploadRequired"):
+                    raise ValueError("A Local bulk result unexpectedly requires upload")
+                result_item_id = str(result.get("sourceItemId") or "")
+                if outcome == "Rejected":
+                    if result_item_id != item_id and not result_item_id.startswith(
+                        "__invalid_row__:"
+                    ):
+                        raise ValueError(
+                            "Bulk rejected result identity is not a safe placeholder"
+                        )
+                    continue
+                if not item_id or item_id != result_item_id:
+                    raise ValueError("Bulk result identity does not match its manifest row")
+                if entry.get("operation") != "Upsert":
+                    raise ValueError("Bulk result accepted a non-Upsert manifest row")
+                required = (
+                    entry.get("sourceRevision"),
+                    entry.get("fileName"),
+                )
+                if any(not isinstance(value, str) or not value for value in required):
+                    raise ValueError("Bulk manifest row is missing occurrence identity")
+                connection.execute(
+                    """
+                    INSERT INTO KnownOccurrence
+                        (SourceId, SourceItemId, SourceRevision, RelativePath, UpdatedAtUtc)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT (SourceId, SourceItemId) DO UPDATE SET
+                        SourceRevision = excluded.SourceRevision,
+                        RelativePath = excluded.RelativePath,
+                        UpdatedAtUtc = excluded.UpdatedAtUtc
+                    """,
+                    (
+                        str(bulk["SourceId"]),
+                        item_id,
+                        str(entry["sourceRevision"]),
+                        str(entry.get("localLocator") or entry["fileName"]),
+                        utc_now_text(),
+                    ),
+                )
+                self._queue_description_in_transaction(
+                    connection,
+                    source_id=str(bulk["SourceId"]),
+                    entry=entry,
+                    result=result,
+                )
+            applied_through = rows[-1][0]
+            connection.execute(
+                """
+                UPDATE BulkManifestOutbox
+                SET ResultAppliedThrough = ?, State = 'ApplyingResult',
+                    UpdatedAtUtc = ?
+                WHERE BulkId = ?
+                """,
+                (applied_through, utc_now_text(), bulk_id),
+            )
+        return applied_through
+
+    def complete_bulk_manifest(self, bulk_id: str) -> None:
+        """Finalize a fully applied result and supersede only captured batches."""
+
+        now = utc_now_text()
+        with self._connect() as connection:
+            bulk = self._require_bulk_manifest(connection, bulk_id)
+            if str(bulk["ServerStatus"] or "") != "Succeeded":
+                raise ValueError(
+                    "Only a rejection-free bulk result can supersede manifest batches"
+                )
+            if int(bulk["ResultAppliedThrough"]) != int(bulk["EntryCount"]):
+                raise ValueError("Bulk result has not been fully applied")
+            batch_ids = tuple(json.loads(str(bulk["SupersededBatchIdsJson"])))
+            scan_ids: set[str] = set()
+            if batch_ids:
+                placeholders = ",".join("?" for _ in batch_ids)
+                member_rows = connection.execute(
+                    f"""
+                    SELECT BatchId, ScanId, State FROM ManifestOutbox
+                    WHERE SourceId = ? AND BatchId IN ({placeholders})
+                    """,
+                    (str(bulk["SourceId"]), *batch_ids),
+                ).fetchall()
+                if {str(row["BatchId"]) for row in member_rows} != set(batch_ids):
+                    raise ValueError("A captured manifest batch no longer exists")
+                scan_ids = {str(row["ScanId"]) for row in member_rows}
+                note = json.dumps(
+                    {
+                        "reason": "SupersededByBulkManifestImport",
+                        "bulkId": bulk_id,
+                        "serverImportId": bulk["ServerImportId"],
+                    },
+                    sort_keys=True,
+                )
+                connection.executemany(
+                    """
+                    UPDATE ManifestOutbox
+                    SET State = 'Discarded', FailureJson = ?, DiscardedAtUtc = ?
+                    WHERE BatchId = ? AND State = 'Pending'
+                    """,
+                    ((note, now, batch_id) for batch_id in batch_ids),
+                )
+            for scan_id in scan_ids:
+                remaining = int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*) FROM ManifestOutbox
+                        WHERE ScanId = ? AND State = 'Pending'
+                        """,
+                        (scan_id,),
+                    ).fetchone()[0]
+                )
+                if remaining == 0:
+                    connection.execute(
+                        """
+                        UPDATE ScanRun SET Status = 'SupersededByBulkManifestImport'
+                        WHERE ScanId = ?
+                        """,
+                        (scan_id,),
+                    )
+            connection.execute(
+                """
+                UPDATE BulkManifestOutbox
+                SET State = 'Applied', UpdatedAtUtc = ?, CompletedAtUtc = ?,
+                    FailureJson = NULL
+                WHERE BulkId = ?
+                """,
+                (now, now, bulk_id),
+            )
+
+    def fail_bulk_manifest(
+        self,
+        bulk_id: str,
+        *,
+        state: str,
+        code: str,
+        message: str,
+        server_status: str | None = None,
+    ) -> None:
+        if state not in {"FailedPermanent", "Cancelled", "Expired"}:
+            raise ValueError("Bulk terminal failure state is invalid")
+        failure = self._safe_bulk_failure({"code": code, "message": message})
+        now = utc_now_text()
+        with self._connect() as connection:
+            self._require_bulk_manifest(connection, bulk_id)
+            connection.execute(
+                """
+                UPDATE BulkManifestOutbox
+                SET State = ?, ServerStatus = ?, FailureJson = ?,
+                    UpdatedAtUtc = ?, CompletedAtUtc = ?
+                WHERE BulkId = ?
+                """,
+                (
+                    state,
+                    server_status or state,
+                    json.dumps(failure, sort_keys=True),
+                    now,
+                    now,
+                    bulk_id,
+                ),
+            )
+
+    @staticmethod
+    def _require_bulk_manifest(
+        connection: sqlite3.Connection,
+        bulk_id: str,
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM BulkManifestOutbox WHERE BulkId = ?",
+            (bulk_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Bulk outbox item {bulk_id!r} was not found")
+        return row
+
+    @staticmethod
+    def _bulk_manifest_item(row: sqlite3.Row) -> BulkManifestOutboxItem:
+        batch_ids = json.loads(str(row["SupersededBatchIdsJson"] or "[]"))
+        failure = json.loads(str(row["FailureJson"])) if row["FailureJson"] else None
+        return BulkManifestOutboxItem(
+            bulk_id=str(row["BulkId"]),
+            source_id=str(row["SourceId"]),
+            snapshot_id=str(row["SnapshotId"]),
+            idempotency_key=str(row["IdempotencyKey"]),
+            artifact_path=str(row["ArtifactPath"]),
+            artifact_sha256=str(row["ArtifactSha256"]),
+            artifact_bytes=int(row["ArtifactBytes"]),
+            entry_count=int(row["EntryCount"]),
+            state=str(row["State"]),
+            server_import_id=(
+                str(row["ServerImportId"]) if row["ServerImportId"] else None
+            ),
+            server_status=(
+                str(row["ServerStatus"]) if row["ServerStatus"] else None
+            ),
+            server_phase=(
+                str(row["ServerPhase"]) if row["ServerPhase"] else None
+            ),
+            processed_entries=int(row["ProcessedEntries"]),
+            result_path=str(row["ResultPath"]) if row["ResultPath"] else None,
+            result_sha256=(
+                str(row["ResultSha256"]) if row["ResultSha256"] else None
+            ),
+            result_bytes=(int(row["ResultBytes"]) if row["ResultBytes"] else None),
+            result_applied_through=int(row["ResultAppliedThrough"]),
+            superseded_batch_ids=tuple(str(value) for value in batch_ids),
+            failure=failure,
+        )
+
+    @classmethod
+    def _safe_bulk_failure(
+        cls,
+        failure: Mapping[str, Any] | None,
+    ) -> dict[str, str] | None:
+        if not failure:
+            return None
+        code = cls._safe_error_text(failure.get("code"), 128) or "BULK_IMPORT_FAILED"
+        message = cls._safe_error_text(failure.get("message"), 500) or (
+            "The bulk manifest import failed."
+        )
+        return {"code": code, "message": message}
 
     def pending_count(self) -> int:
         with self._connect() as connection:

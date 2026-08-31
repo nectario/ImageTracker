@@ -100,6 +100,17 @@ def test_implemented_authenticated_phase1_operations_document_service_outages():
         "/v1/sources": ("get", "post"),
         "/v1/sources/{sourceId}": ("get", "patch", "delete"),
         "/v1/sources/{sourceId}/manifest": ("post",),
+        "/v1/sources/{sourceId}/manifest-imports": ("post",),
+        "/v1/sources/{sourceId}/manifest-imports/{manifestImportId}/upload-url": (
+            "post",
+        ),
+        "/v1/sources/{sourceId}/manifest-imports/{manifestImportId}/complete": (
+            "post",
+        ),
+        "/v1/sources/{sourceId}/manifest-imports/{manifestImportId}": ("get",),
+        "/v1/sources/{sourceId}/manifest-imports/{manifestImportId}/result": (
+            "get",
+        ),
         "/v1/changes": ("get",),
         "/v1/media": ("get",),
         "/v1/media/search": ("get",),
@@ -116,6 +127,55 @@ def test_implemented_authenticated_phase1_operations_document_service_outages():
             assert document["paths"][path][method]["responses"]["503"] == {
                 "$ref": "#/components/responses/ServiceUnavailable"
             }
+
+
+def test_bulk_manifest_import_contract_is_checksum_bound_and_asynchronous():
+    document = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+    paths = document["paths"]
+    schemas = document["components"]["schemas"]
+    base = "/v1/sources/{sourceId}/manifest-imports"
+
+    assert paths[base]["post"]["operationId"] == "createManifestImport"
+    assert {"200", "201", "409", "503"}.issubset(
+        paths[base]["post"]["responses"]
+    )
+    assert (
+        paths[f"{base}/{{manifestImportId}}/complete"]["post"]["operationId"]
+        == "completeManifestImportUpload"
+    )
+    assert (
+        paths[f"{base}/{{manifestImportId}}/result"]["get"]["operationId"]
+        == "getManifestImportResult"
+    )
+
+    request = schemas["ManifestImportCreateRequest"]
+    assert {
+        "snapshotId",
+        "permissionState",
+        "checksumSha256",
+        "byteSize",
+        "entryCount",
+    } == set(request["required"])
+    assert request["properties"]["schemaVersion"]["enum"] == [
+        "ManifestNdjsonV1"
+    ]
+    assert request["properties"]["deletionDetectionReliable"]["enum"] == [False]
+    assert request["properties"]["entryCount"]["maximum"] == 250_000
+    assert request["properties"]["byteSize"]["maximum"] == 268_435_456
+    assert request["properties"]["checksumSha256"]["pattern"].endswith("{64}$")
+
+    response = schemas["ManifestImport"]
+    assert response["properties"]["status"] == {
+        "$ref": "#/components/schemas/ManifestImportStatus"
+    }
+    assert response["properties"]["phase"] == {
+        "$ref": "#/components/schemas/ManifestImportPhase"
+    }
+    assert "CompletedWithErrors" in schemas["ManifestImportStatus"]["enum"]
+    assert "WritingResult" in schemas["ManifestImportPhase"]["enum"]
+    assert schemas["ManifestImportResultDownload"]["properties"][
+        "checksumSha256"
+    ]["pattern"].endswith("{64}$")
 
 
 def test_manifest_variants_preserve_filename_and_match_live_column_limits():
