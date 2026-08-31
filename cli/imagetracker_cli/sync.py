@@ -33,7 +33,7 @@ from .state import (
 
 
 MANIFEST_BATCH_SIZE = 100
-DEFAULT_ENRICHMENT_LIMIT = 100
+DEFAULT_ENRICHMENT_LIMIT = 64
 BULK_AUTO_BATCH_THRESHOLD = 10
 BULK_AUTO_ROW_THRESHOLD = 1_000
 BULK_RESULT_APPLY_PAGE_SIZE = 500
@@ -62,6 +62,8 @@ class SyncSummary:
     quarantined_entries: int = 0
     rejected_entries: int = 0
     descriptions_staged: int = 0
+    geocode_jobs_queued: int = 0
+    description_jobs_prepared: int = 0
     description_pending: int = 0
     description_deferred: int = 0
     description_quarantined: int = 0
@@ -87,6 +89,8 @@ class EnrichmentSummary:
     source_id: str
     root_path: str
     limit: int
+    geocode_jobs_queued: int = 0
+    description_jobs_prepared: int = 0
     descriptions_staged: int = 0
     descriptions_recovered: int = 0
     description_pending: int = 0
@@ -109,6 +113,7 @@ class SyncEngine:
         preview_factory: Callable[[str | Path], ScenePreview] = prepare_scene_preview,
         hash_file: Callable[[Path], str] = stream_sha256,
         sleep: Callable[[float], None] = time.sleep,
+        device_id: str | None = None,
     ):
         self.api = api
         self.state = state
@@ -117,6 +122,7 @@ class SyncEngine:
         self.preview_factory = preview_factory
         self.hash_file = hash_file
         self.sleep = sleep
+        self.device_id = device_id
 
     def sync(
         self,
@@ -229,6 +235,7 @@ class SyncEngine:
             self.progress("Library is already in sync")
             if not dry_run:
                 if with_enrichment:
+                    self._prepare_enrichment(binding, summary, limit=enrichment_limit)
                     self._flush_description_outbox(
                         binding,
                         summary,
@@ -276,6 +283,7 @@ class SyncEngine:
             )
             return summary
         if with_enrichment:
+            self._prepare_enrichment(binding, summary, limit=enrichment_limit)
             self._flush_description_outbox(
                 binding,
                 summary,
@@ -306,6 +314,7 @@ class SyncEngine:
             root_path=binding.root_path,
             limit=limit,
         )
+        self._prepare_enrichment(binding, summary, limit=limit)
         self._flush_description_outbox(binding, summary, limit=limit)
         self._add_description_attention_counts(
             binding,
@@ -313,6 +322,75 @@ class SyncEngine:
             count_as_failed=True,
         )
         return summary
+
+    def _prepare_enrichment(
+        self,
+        binding: SourceBinding,
+        summary: SyncSummary | EnrichmentSummary,
+        *,
+        limit: int,
+    ) -> None:
+        self.progress(
+            f"Preparing explicit enrichment for up to {limit:,} media asset(s)"
+        )
+        device_id = self.device_id or str(
+            self.state.get_setting("device-id") or ""
+        )
+        if not device_id:
+            raise ValueError(
+                "Explicit enrichment requires this registered source device"
+            )
+        prepare_setting = (
+            f"enrichment-prepare-key:{binding.source_id}:{limit}"
+        )
+        prepare_key = self.state.get_setting(prepare_setting)
+        if not prepare_key:
+            prepare_key = (
+                f"enrichment-prepare:{binding.source_id}:{uuid.uuid4()}"
+            )
+            self.state.set_setting(prepare_setting, prepare_key)
+        prepared = self.api.prepare_enrichment(
+            binding.source_id,
+            {
+                "types": ["Geocode", "Description"],
+                "limit": limit,
+            },
+            device_id=device_id,
+            key=prepare_key,
+        )
+        if str(prepared.get("sourceId") or "") != binding.source_id:
+            raise ApiError(
+                ApiProblem(
+                    422,
+                    "Invalid enrichment response",
+                    "The prepared enrichment tasks did not match this source.",
+                    code="ENRICHMENT_SOURCE_MISMATCH",
+                )
+            )
+        tasks = prepared.get("sceneDescriptionTasks") or []
+        if not isinstance(tasks, list):
+            raise ApiError(
+                ApiProblem(
+                    422,
+                    "Invalid enrichment response",
+                    "The prepared scene-description tasks were malformed.",
+                    code="ENRICHMENT_TASKS_INVALID",
+                )
+            )
+        self.state.queue_scene_description_tasks(binding.source_id, tasks)
+        self.state.set_setting(
+            prepare_setting,
+            f"enrichment-prepare:{binding.source_id}:{uuid.uuid4()}",
+        )
+        geocode_jobs = int(prepared.get("geocodeJobsQueued") or 0)
+        description_jobs = int(prepared.get("descriptionJobsPrepared") or 0)
+        summary.geocode_jobs_queued += geocode_jobs
+        summary.description_jobs_prepared += description_jobs
+        self.progress(
+            "Explicit enrichment prepared · "
+            f"{geocode_jobs:,} location job(s) · "
+            f"{description_jobs:,} scene job(s)"
+        )
 
     def _deliver_pending(
         self,
@@ -1644,8 +1722,10 @@ class SyncEngine:
     def _validate_enrichment_limit(limit: int) -> None:
         if isinstance(limit, bool) or not isinstance(limit, int):
             raise ValueError("Scene-preview limit must be an integer")
-        if not 1 <= limit <= 1_000:
-            raise ValueError("Scene-preview limit must be between 1 and 1000")
+        if not 1 <= limit <= DEFAULT_ENRICHMENT_LIMIT:
+            raise ValueError(
+                f"Enrichment limit must be between 1 and {DEFAULT_ENRICHMENT_LIMIT}"
+            )
 
     @staticmethod
     def _is_permanent_request_error(error: ApiError) -> bool:

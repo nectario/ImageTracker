@@ -15,6 +15,8 @@ from services.api.models import (
     Device,
     DevicePage,
     DeviceRegistrationRequest,
+    EnrichmentPrepareRequest,
+    EnrichmentPrepareResponse,
     ManifestRequest,
     ManifestResponse,
     MediaAssetDetail,
@@ -224,6 +226,15 @@ class Phase1Service(Protocol):
         payload: ManifestRequest,
         mutation: MutationContext,
     ) -> MutationResult[ManifestResponse]: ...
+
+    async def prepare_enrichment(
+        self,
+        user_id: UUID,
+        source_id: UUID,
+        requesting_device_id: UUID,
+        payload: EnrichmentPrepareRequest,
+        mutation: MutationContext,
+    ) -> MutationResult[EnrichmentPrepareResponse]: ...
 
     async def create_upload_plan(
         self,

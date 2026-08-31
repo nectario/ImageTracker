@@ -30,6 +30,7 @@ from services.api.models import (
     Device,
     DevicePage,
     DeviceStatus,
+    EnrichmentPrepareResponse,
     ManifestCounts,
     ManifestEntryResult,
     ManifestOutcome,
@@ -47,6 +48,7 @@ from services.api.models import (
     ProcessingJob,
     ProcessingJobPage,
     ProcessingJobType,
+    SceneDescriptionTask,
     SourceStatus,
     SourceType,
     SyncSettings,
@@ -229,6 +231,31 @@ class FakePhase1Service:
                 ],
             ),
             200,
+        )
+
+    async def prepare_enrichment(
+        self, *args: Any
+    ) -> MutationResult[EnrichmentPrepareResponse]:
+        self.calls.append(("prepare_enrichment", args))
+        return MutationResult(
+            EnrichmentPrepareResponse(
+                source_id=SOURCE_ID,
+                geocode_jobs_queued=1,
+                description_jobs_prepared=1,
+                scene_description_tasks=[
+                    SceneDescriptionTask(
+                        job_id=JOB_ID,
+                        media_asset_id=ASSET_ID,
+                        occurrence_id=OCCURRENCE_ID,
+                        source_item_id="item-1",
+                        local_locator="C:/Photos/IMG_0001.JPG",
+                        asset_content_sha256="a" * 64,
+                        file_name="IMG_0001.JPG",
+                    )
+                ],
+            ),
+            200,
+            replayed=True,
         )
 
     async def list_changes(self, *args: Any) -> ChangePage:
@@ -832,6 +859,77 @@ def test_manifest_forwards_deletions_for_the_domain_safety_decision_and_valid_up
     assert response.status_code == 200
     assert response.json()["counts"]["created"] == 1
     assert response.json()["results"][0]["uploadRequired"] is False
+
+
+def test_enrichment_prepare_is_explicit_bounded_idempotent_and_device_scoped():
+    service = FakePhase1Service()
+    path = f"/v1/sources/{SOURCE_ID}/enrichment/prepare"
+
+    missing_headers = _request(_app(service), "POST", path, json={})
+    assert missing_headers.status_code == 400
+    missing_fields = {
+        item["field"] for item in missing_headers.json()["fieldErrors"]
+    }
+    assert "header.X-ImageTracker-Device-Id" in missing_fields
+    assert "header.Idempotency-Key" in missing_fields
+
+    response = _request(
+        _app(service),
+        "POST",
+        path,
+        headers=_headers(device=True, idempotency=True),
+        json={},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["idempotency-replayed"] == "true"
+    assert response.json() == {
+        "sourceId": str(SOURCE_ID),
+        "geocodeJobsQueued": 1,
+        "descriptionJobsPrepared": 1,
+        "sceneDescriptionTasks": [
+            {
+                "jobId": str(JOB_ID),
+                "mediaAssetId": str(ASSET_ID),
+                "occurrenceId": str(OCCURRENCE_ID),
+                "sourceItemId": "item-1",
+                "localLocator": "C:/Photos/IMG_0001.JPG",
+                "assetContentSha256": "a" * 64,
+                "fileName": "IMG_0001.JPG",
+            }
+        ],
+    }
+    name, args = service.calls[-1]
+    assert name == "prepare_enrichment"
+    assert args[:3] == (USER_ID, SOURCE_ID, DEVICE_ID)
+    payload = args[3]
+    assert payload.types == ["Geocode", "Description"]
+    assert payload.limit == 64
+    mutation = args[4]
+    assert mutation.idempotency_key == "request-0001"
+    assert mutation.operation == "POST"
+    assert mutation.target == path
+    assert len(mutation.request_hash) == 64
+
+    duplicates = _request(
+        _app(service),
+        "POST",
+        path,
+        headers=_headers(device=True, idempotency=True),
+        json={"types": ["Geocode", "Geocode"], "limit": 1},
+    )
+    assert duplicates.status_code == 422
+    assert "must not contain duplicates" in duplicates.text
+
+    for invalid_limit in (0, 65):
+        invalid = _request(
+            _app(service),
+            "POST",
+            path,
+            headers=_headers(device=True, idempotency=True),
+            json={"limit": invalid_limit},
+        )
+        assert invalid.status_code == 422
 
 
 def test_manifest_requires_aware_and_consistent_capture_utc():

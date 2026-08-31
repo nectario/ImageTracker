@@ -54,6 +54,7 @@ class ManifestImportClaim:
 
 @dataclass(frozen=True)
 class MergeSettings:
+    enqueue_enrichment_jobs: bool = False
     description_model: str = "gpt-5.6-terra"
     description_prompt_version: str = "scene-search-v1"
     description_detail: str = "high"
@@ -68,6 +69,8 @@ class MergeSettings:
     trash_retention_days: int = 30
 
     def __post_init__(self) -> None:
+        if not isinstance(self.enqueue_enrichment_jobs, bool):
+            raise ValueError("Bulk enrichment opt-in must be boolean")
         if self.description_reserved_usd_per_request < scene_description_maximum_cost_usd(
             input_usd_per_million=self.description_input_usd_per_million,
             cached_input_usd_per_million=(
@@ -540,8 +543,9 @@ class MySqlManifestImportRepository:
                 self._merge_assets(cursor, claim)
                 self._merge_occurrences(cursor, claim)
                 self._merge_locations(cursor, claim)
-                self._merge_geocode_jobs(cursor, claim)
-                self._merge_description_jobs(cursor, claim, selected)
+                if selected.enqueue_enrichment_jobs:
+                    self._merge_geocode_jobs(cursor, claim)
+                    self._merge_description_jobs(cursor, claim, selected)
                 self._write_failures(cursor, claim)
                 self._write_source_change(cursor, claim)
                 result = self._counts(cursor, claim.internal_id)

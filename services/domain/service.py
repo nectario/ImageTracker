@@ -14,8 +14,8 @@ from uuid import UUID
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import and_, case, func, or_, select, update
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import Numeric, and_, case, cast, func, or_, select, update
+from sqlalchemy.orm import Session, aliased, sessionmaker
 
 from services.data.database import transaction_scope
 from services.data.models import (
@@ -46,6 +46,8 @@ from services.domain.models import (
     DescriptionRecord,
     DeviceRecord,
     DeviceRegistration,
+    EnrichmentPreparation,
+    EnrichmentPrepareCommand,
     FieldProvenance,
     JobDispatcher,
     JobQuery,
@@ -66,6 +68,7 @@ from services.domain.models import (
     MutationResult,
     OccurrenceRecord,
     Page,
+    SceneDescriptionTaskRecord,
     SourceCreate,
     SourceRecord,
     SourceUpdate,
@@ -133,6 +136,7 @@ DISPATCH_RECOVERY_DELAY = timedelta(minutes=5)
 DESCRIPTION_PROVIDER = "OpenAI"
 SCENE_PREVIEW_MIME_TYPE = "image/jpeg"
 SCENE_PREVIEW_MAX_BYTES = 25 * 1024 * 1024
+MAX_ENRICHMENT_PREPARE = 64
 SCENE_PREVIEW_EXTENSIONS = (
     ".avif",
     ".bmp",
@@ -238,6 +242,7 @@ class Phase1DomainService:
         trash_retention_days: int = 30,
         idempotency_hours: int = 24,
         job_dispatcher: JobDispatcher | None = None,
+        enrichment_processing_enabled: bool = True,
         temporary_object_store: TemporaryObjectStore | None = None,
         scene_description_model: str = "gpt-5.6-terra",
         scene_description_detail: str = "high",
@@ -254,6 +259,8 @@ class Phase1DomainService:
     ) -> None:
         if not 0 <= geocode_reuse_radius_meters <= 100:
             raise ValueError("The geocode reuse radius must be between 0 and 100 meters")
+        if not isinstance(enrichment_processing_enabled, bool):
+            raise ValueError("The enrichment processing switch must be boolean")
         if scene_description_monthly_call_limit < 0:
             raise ValueError("The scene-description monthly limit cannot be negative")
         cost_values = {
@@ -300,6 +307,7 @@ class Phase1DomainService:
         self._trash_retention = timedelta(days=trash_retention_days)
         self._idempotency_retention = timedelta(hours=idempotency_hours)
         self._job_dispatcher = job_dispatcher
+        self._enrichment_processing_enabled = enrichment_processing_enabled
         self._temporary_object_store = temporary_object_store
         self._scene_description_model = scene_description_model
         self._scene_description_detail = scene_description_detail
@@ -706,7 +714,6 @@ class Phase1DomainService:
             raise ConflictError(
                 "InvalidManifestSize", "A manifest must contain between 1 and 500 entries"
             )
-        geocode_job_ids: list[UUID] = []
         with transaction_scope(self._session_factory) as session:
             account = self._account(session, user_id)
 
@@ -753,26 +760,8 @@ class Phase1DomainService:
                     asset_index=asset_index,
                     now=now,
                 )
-                preexisting_asset_ids = {
-                    asset.id
-                    for content_hash, asset in asset_index.items()
-                    if content_hash not in new_asset_hashes
-                }
-                description_index = AssetRepository(session).current_descriptions(
-                    user_id=account.id,
-                    asset_ids=preexisting_asset_ids,
-                )
-                description_job_index = JobRepository(session).by_idempotency_keys(
-                    user_id=account.id,
-                    idempotency_keys={
-                        f"description:{asset.public_id}"
-                        for content_hash, asset in asset_index.items()
-                        if content_hash not in new_asset_hashes
-                    },
-                )
                 deferred_pending_occurrences: list[MediaOccurrence] = []
                 deferred_hashed_occurrences: list[MediaOccurrence] = []
-                deferred_description_jobs: list[ProcessingJob] = []
                 for entry in command.entries:
                     if entry.source_item_id in seen_item_ids:
                         result = ManifestEntryResult(
@@ -802,20 +791,14 @@ class Phase1DomainService:
                                     source=source,
                                     entry=entry,
                                     now=now,
-                                    geocode_job_ids=geocode_job_ids,
                                     occurrence_index=occurrence_index,
                                     asset_index=asset_index,
                                     new_asset_hashes=new_asset_hashes,
-                                    description_index=description_index,
-                                    description_job_index=description_job_index,
                                     deferred_pending_occurrences=(
                                         deferred_pending_occurrences
                                     ),
                                     deferred_hashed_occurrences=(
                                         deferred_hashed_occurrences
-                                    ),
-                                    deferred_description_jobs=(
-                                        deferred_description_jobs
                                     ),
                                 )
                         except (ConflictError, ValueError) as exc:
@@ -838,22 +821,12 @@ class Phase1DomainService:
                     counts[count_key] += 1
                     results.append(result)
 
-                # New occurrences and description jobs are flushed as ORM
-                # batches, then their ID-dependent change rows are queued.
+                # New occurrences are flushed as ORM batches, then their
+                # ID-dependent change rows are queued. Metadata ingestion is
+                # deliberately enrichment-free; explicit preparation owns
+                # all ProcessingJob creation and dispatch.
                 session.flush()
                 changes = ChangeRepository(session)
-                for job in deferred_description_jobs:
-                    changes.add(
-                        user_id=account.id,
-                        source_id=job.media_source_id,
-                        asset_id=job.media_asset_id,
-                        entity_type="ProcessingJob",
-                        entity_id=job.id,
-                        entity_public_id=job.public_id,
-                        change_type="Upsert",
-                        now=now,
-                        flush=False,
-                    )
                 for occurrence in (
                     *deferred_pending_occurrences,
                     *deferred_hashed_occurrences,
@@ -907,8 +880,353 @@ class Phase1DomainService:
                 action=action,
                 replay_decoder=self._manifest_from_json,
             )
+        return result
+
+    async def prepare_enrichment(
+        self,
+        user_id: UUID,
+        requesting_device_id: UUID,
+        source_id: UUID,
+        command: EnrichmentPrepareCommand,
+        context: MutationContext,
+    ) -> MutationResult[EnrichmentPreparation]:
+        """Explicitly prepare bounded enrichment without replaying metadata.
+
+        Ordinary manifests never create ``ProcessingJob`` rows. This mutation
+        is the sole user-facing opt-in boundary for geocoding and scene
+        descriptions, and local locators are returned only to the source's
+        registered device.
+        """
+
+        if not self._enrichment_processing_enabled:
+            raise ConflictError(
+                "EnrichmentProcessingPaused",
+                "Enrichment processing is paused; metadata sync remains available",
+            )
+        selected_types = tuple(dict.fromkeys(command.types))
+        if (
+            not selected_types
+            or len(selected_types) != len(command.types)
+            or any(value not in {"Geocode", "Description"} for value in selected_types)
+        ):
+            raise ConflictError(
+                "InvalidEnrichmentTypes",
+                "Choose Geocode, Description, or both exactly once",
+            )
+        if (
+            isinstance(command.limit, bool)
+            or not 1 <= command.limit <= MAX_ENRICHMENT_PREPARE
+        ):
+            raise ConflictError(
+                "InvalidEnrichmentLimit",
+                f"Enrichment limit must be between 1 and {MAX_ENRICHMENT_PREPARE}",
+            )
+
+        geocode_job_ids: list[UUID] = []
+        with transaction_scope(self._session_factory) as session:
+            account = self._account(session, user_id)
+            device = DeviceRepository(session).require(
+                user_id=account.id,
+                device_public_id=requesting_device_id,
+            )
+            source = SourceRepository(session).require(
+                user_id=account.id,
+                source_public_id=source_id,
+            )
+            if source.device_id != device.id:
+                raise ForbiddenError(
+                    "SourceDeviceMismatch",
+                    "Local enrichment must be requested by the source device",
+                )
+            if source.storage_mode != "Local":
+                raise ConflictError(
+                    "LocalEnrichmentRequired",
+                    "This enrichment preparation flow currently supports Local sources",
+                )
+
+            def action() -> tuple[EnrichmentPreparation, int]:
+                occurrence_ids = (
+                    select(
+                        MediaOccurrence.media_asset_id.label("MediaAssetId"),
+                        func.min(MediaOccurrence.id).label("OccurrenceId"),
+                    )
+                    .where(
+                        MediaOccurrence.user_id == account.id,
+                        MediaOccurrence.media_source_id == source.id,
+                        MediaOccurrence.media_asset_id.is_not(None),
+                        MediaOccurrence.deletion_state == "Active",
+                        MediaOccurrence.availability_state != "Unavailable",
+                    )
+                    .group_by(MediaOccurrence.media_asset_id)
+                    .subquery()
+                )
+                current_description = (
+                    select(MediaDescription.id)
+                    .where(
+                        MediaDescription.user_id == account.id,
+                        MediaDescription.media_asset_id == MediaAsset.id,
+                        MediaDescription.is_current == 1,
+                        MediaDescription.status == "Succeeded",
+                        func.length(func.trim(MediaDescription.description)) > 0,
+                    )
+                    .exists()
+                )
+                normalized_name = func.lower(MediaOccurrence.original_file_name)
+                description_job = aliased(ProcessingJob)
+                geocode_job = aliased(ProcessingJob)
+                supported_photo = and_(
+                    MediaAsset.media_type == "Photo",
+                    MediaOccurrence.local_locator.is_not(None),
+                    or_(
+                        *(normalized_name.like(f"%{extension}") for extension in SCENE_PREVIEW_EXTENSIONS)
+                    ),
+                    ~current_description,
+                )
+                description_actionable = and_(
+                    supported_photo,
+                    or_(
+                        description_job.id.is_(None),
+                        description_job.status == "Preparing",
+                    ),
+                )
+                unresolved_location = and_(
+                    MediaLocation.latitude.is_not(None),
+                    MediaLocation.longitude.is_not(None),
+                    or_(
+                        MediaLocation.provider.is_(None),
+                        MediaLocation.provider_updated_at_utc.is_(None),
+                    ),
+                )
+                geocode_actionable = and_(
+                    unresolved_location,
+                    or_(
+                        geocode_job.id.is_(None),
+                        geocode_job.status == "Succeeded",
+                    ),
+                )
+                eligibility = []
+                if "Geocode" in selected_types:
+                    eligibility.append(geocode_actionable)
+                if "Description" in selected_types:
+                    eligibility.append(description_actionable)
+                rows = session.execute(
+                    select(
+                        MediaAsset,
+                        MediaOccurrence,
+                        MediaLocation,
+                        description_job,
+                        geocode_job,
+                    )
+                    .join(
+                        occurrence_ids,
+                        occurrence_ids.c.MediaAssetId == MediaAsset.id,
+                    )
+                    .join(
+                        MediaOccurrence,
+                        MediaOccurrence.id == occurrence_ids.c.OccurrenceId,
+                    )
+                    .outerjoin(
+                        MediaLocation,
+                        and_(
+                            MediaLocation.user_id == account.id,
+                            MediaLocation.media_asset_id == MediaAsset.id,
+                        ),
+                    )
+                    .outerjoin(
+                        description_job,
+                        and_(
+                            description_job.user_id == account.id,
+                            description_job.media_asset_id == MediaAsset.id,
+                            description_job.job_type == "Description",
+                        ),
+                    )
+                    .outerjoin(
+                        geocode_job,
+                        and_(
+                            geocode_job.user_id == account.id,
+                            geocode_job.media_asset_id == MediaAsset.id,
+                            geocode_job.job_type == "Geocode",
+                            cast(
+                                geocode_job.request_json["latitude"].as_string(),
+                                Numeric(9, 6),
+                            )
+                            == MediaLocation.latitude,
+                            cast(
+                                geocode_job.request_json["longitude"].as_string(),
+                                Numeric(10, 6),
+                            )
+                            == MediaLocation.longitude,
+                        ),
+                    )
+                    .where(
+                        MediaAsset.user_id == account.id,
+                        MediaAsset.lifecycle_state == "Active",
+                        or_(*eligibility),
+                    )
+                    .order_by(MediaAsset.id, MediaOccurrence.id)
+                    .limit(command.limit)
+                ).all()
+
+                now = self._now()
+                new_jobs: list[ProcessingJob] = []
+                changed_jobs: list[ProcessingJob] = []
+                task_sources: list[
+                    tuple[MediaAsset, MediaOccurrence, ProcessingJob]
+                ] = []
+                geocode_jobs: list[ProcessingJob] = []
+                for (
+                    asset,
+                    occurrence,
+                    location,
+                    existing_description_job,
+                    existing_geocode_job,
+                ) in rows:
+                    if (
+                        "Geocode" in selected_types
+                        and location is not None
+                        and location.latitude is not None
+                        and location.longitude is not None
+                        and (
+                            location.provider is None
+                            or location.provider_updated_at_utc is None
+                        )
+                        and (
+                            existing_geocode_job is None
+                            or existing_geocode_job.status == "Succeeded"
+                        )
+                    ):
+                        revision = _coordinate_revision(
+                            location.latitude,
+                            location.longitude,
+                        )
+                        request = {
+                                "latitude": f"{location.latitude:.6f}",
+                                "longitude": f"{location.longitude:.6f}",
+                                "coordinateRevision": revision,
+                                "locationPublicId": location.public_id,
+                        }
+                        selected_geocode_job = existing_geocode_job
+                        if selected_geocode_job is None:
+                            selected_geocode_job = ProcessingJob(
+                                public_id=str(uuid4()),
+                                user_id=account.id,
+                                media_asset_id=asset.id,
+                                media_source_id=source.id,
+                                idempotency_key=(
+                                    f"geocode:{asset.public_id}:{revision}"
+                                ),
+                                job_type="Geocode",
+                                status="Queued",
+                                provider=GEOCODE_PROVIDER,
+                                attempt_count=0,
+                                max_attempts=5,
+                                next_attempt_at_utc=now,
+                                request_json=request,
+                                created_at_utc=now,
+                                updated_at_utc=now,
+                            )
+                            new_jobs.append(selected_geocode_job)
+                        else:
+                            selected_geocode_job.status = "Queued"
+                            selected_geocode_job.attempt_count = 0
+                            selected_geocode_job.next_attempt_at_utc = now
+                            selected_geocode_job.lease_token_hash = None
+                            selected_geocode_job.lease_expires_at_utc = None
+                            selected_geocode_job.failure_class = None
+                            selected_geocode_job.failure_code = None
+                            selected_geocode_job.failure_message = None
+                            selected_geocode_job.started_at_utc = None
+                            selected_geocode_job.completed_at_utc = None
+                            selected_geocode_job.request_json = request
+                            selected_geocode_job.updated_at_utc = now
+                        changed_jobs.append(selected_geocode_job)
+                        geocode_jobs.append(selected_geocode_job)
+
+                    if (
+                        "Description" not in selected_types
+                        or occurrence.local_locator is None
+                        or not self._scene_preview_supported(
+                            asset=asset,
+                            file_name=occurrence.original_file_name,
+                        )
+                    ):
+                        continue
+                    selected_description_job = existing_description_job
+                    if selected_description_job is None:
+                        selected_description_job = self._new_description_job(
+                            account=account,
+                            asset=asset,
+                            source=source,
+                            now=now,
+                        )
+                        new_jobs.append(selected_description_job)
+                        changed_jobs.append(selected_description_job)
+                    else:
+                        configured_request = self._description_request(
+                            asset=asset,
+                            source=source,
+                        )
+                        if selected_description_job.request_json != configured_request:
+                            selected_description_job.request_json = configured_request
+                            selected_description_job.updated_at_utc = now
+                            changed_jobs.append(selected_description_job)
+                    if selected_description_job.status != "Preparing":
+                        continue
+                    task_sources.append(
+                        (asset, occurrence, selected_description_job)
+                    )
+
+                session.add_all(new_jobs)
+                session.flush()
+                changes = ChangeRepository(session)
+                for job in changed_jobs:
+                    changes.add(
+                        user_id=account.id,
+                        source_id=source.id,
+                        asset_id=job.media_asset_id,
+                        entity_type="ProcessingJob",
+                        entity_id=job.id,
+                        entity_public_id=job.public_id,
+                        change_type="Upsert",
+                        now=now,
+                        flush=False,
+                    )
+                tasks = tuple(
+                        SceneDescriptionTaskRecord(
+                            job_id=_uuid(job.public_id),
+                            media_asset_id=_uuid(asset.public_id),
+                            occurrence_id=_uuid(occurrence.public_id),
+                            source_item_id=occurrence.source_item_id,
+                            local_locator=str(occurrence.local_locator),
+                            asset_content_sha256=asset.content_sha256.lower(),
+                            file_name=occurrence.original_file_name,
+                        )
+                    for asset, occurrence, job in task_sources
+                    )
+                geocode_job_ids.extend(
+                    _uuid(job.public_id) for job in geocode_jobs
+                )
+                session.flush()
+                return (
+                    EnrichmentPreparation(
+                        source_id=_uuid(source.public_id),
+                        geocode_jobs_queued=len(geocode_jobs),
+                        description_jobs_prepared=len(tasks),
+                        scene_description_tasks=tasks,
+                    ),
+                    200,
+                )
+
+            result = self._mutation(
+                session=session,
+                account=account,
+                context=context,
+                action=action,
+                replay_decoder=self._enrichment_preparation_from_json,
+            )
         self._dispatch_after_commit(
-            job_ids=tuple(geocode_job_ids), job_type="Geocode"
+            job_ids=tuple(geocode_job_ids),
+            job_type="Geocode",
         )
         return result
 
@@ -920,15 +1238,11 @@ class Phase1DomainService:
         source: MediaSource,
         entry: ManifestUpsert,
         now: datetime,
-        geocode_job_ids: list[UUID],
         occurrence_index: dict[str, MediaOccurrence] | None = None,
         asset_index: dict[str, MediaAsset] | None = None,
         new_asset_hashes: set[str] | None = None,
-        description_index: dict[int, MediaDescription] | None = None,
-        description_job_index: dict[str, ProcessingJob] | None = None,
         deferred_pending_occurrences: list[MediaOccurrence] | None = None,
         deferred_hashed_occurrences: list[MediaOccurrence] | None = None,
-        deferred_description_jobs: list[ProcessingJob] | None = None,
     ) -> ManifestEntryResult:
         if entry.byte_size <= 0:
             raise ConflictError("InvalidByteSize", "Media byte size must be positive")
@@ -1070,18 +1384,6 @@ class Phase1DomainService:
                     change_type="Upsert",
                     now=now,
                 )
-            description_job_id = (
-                self._ensure_description_job(
-                    session=session,
-                    account=account,
-                    asset=linked_asset,
-                    source=source,
-                    file_name=entry.file_name,
-                    now=now,
-                )
-                if linked_asset is not None
-                else None
-            )
             return ManifestEntryResult(
                 source_item_id=entry.source_item_id,
                 outcome="CreatedOccurrence" if occurrence_created else (
@@ -1096,7 +1398,7 @@ class Phase1DomainService:
                     and source.storage_mode == "Remote"
                     and linked_asset.storage_state != "RemoteAvailable"
                 ),
-                description_job_id=description_job_id,
+                description_job_id=None,
             )
 
         content_hash = entry.content_sha256.lower()
@@ -1245,27 +1547,13 @@ class Phase1DomainService:
                 source_id=source.id,
             )
         if entry.location is not None:
-            geocode_job_id = self._upsert_location(
+            self._upsert_location(
                 session=session,
                 account=account,
                 asset=asset,
-                source=source,
                 entry=entry,
                 now=now,
             )
-            if geocode_job_id is not None:
-                geocode_job_ids.append(geocode_job_id)
-        description_job_id = self._ensure_description_job(
-            session=session,
-            account=account,
-            asset=asset,
-            source=source,
-            file_name=entry.file_name,
-            now=now,
-            description_index=description_index,
-            job_index=description_job_index,
-            deferred_jobs=deferred_description_jobs,
-        )
         if not existing_unchanged:
             if not occurrence_created or deferred_hashed_occurrences is None:
                 ChangeRepository(session).add(
@@ -1299,7 +1587,7 @@ class Phase1DomainService:
                 source.storage_mode == "Remote"
                 and asset.storage_state != "RemoteAvailable"
             ),
-            description_job_id=description_job_id,
+            description_job_id=None,
         )
 
     def _manifest_delete(
@@ -1514,10 +1802,9 @@ class Phase1DomainService:
         session: Session,
         account: UserAccount,
         asset: MediaAsset,
-        source: MediaSource,
         entry: ManifestUpsert,
         now: datetime,
-    ) -> UUID | None:
+    ) -> None:
         assert entry.location is not None
         latitude = entry.location.latitude
         longitude = entry.location.longitude
@@ -1582,16 +1869,6 @@ class Phase1DomainService:
         else:
             self._clear_resolved_location(location)
         session.flush()
-        if reusable is not None:
-            return None
-        return self._ensure_geocode_job(
-            session=session,
-            account=account,
-            asset=asset,
-            source=source,
-            location=location,
-            now=now,
-        )
 
     @staticmethod
     def _copy_resolved_location(source: MediaLocation, target: MediaLocation) -> None:
@@ -1637,249 +1914,69 @@ class Phase1DomainService:
         ):
             setattr(location, attribute, None)
 
-    def _ensure_geocode_job(
-        self,
-        *,
-        session: Session,
-        account: UserAccount,
-        asset: MediaAsset,
-        source: MediaSource,
-        location: MediaLocation,
-        now: datetime,
-    ) -> UUID | None:
-        assert location.latitude is not None and location.longitude is not None
-        revision = _coordinate_revision(location.latitude, location.longitude)
-        idempotency_key = f"geocode:{asset.public_id}:{revision}"
-        repository = JobRepository(session)
-        existing = repository.by_idempotency_key(
-            user_id=account.id, idempotency_key=idempotency_key
-        )
-        if existing is not None:
-            if existing.status in {
-                "Succeeded",
-                "Failed",
-                "Cancelled",
-                "DeferredQuota",
-            }:
-                self._settle_provider_reservation(
-                    session, job=existing, now=now, consumed=False
-                )
-                existing.status = "Queued"
-                existing.attempt_count = 0
-                existing.next_attempt_at_utc = now
-                existing.lease_token_hash = None
-                existing.lease_expires_at_utc = None
-                existing.failure_class = None
-                existing.failure_code = None
-                existing.failure_message = None
-                existing.started_at_utc = None
-                existing.completed_at_utc = None
-                existing.request_json = {
-                    "latitude": f"{location.latitude:.6f}",
-                    "longitude": f"{location.longitude:.6f}",
-                    "coordinateRevision": revision,
-                    "locationPublicId": location.public_id,
-                }
-                existing.updated_at_utc = now
-                ChangeRepository(session).add(
-                    user_id=account.id,
-                    source_id=source.id,
-                    asset_id=asset.id,
-                    entity_type="ProcessingJob",
-                    entity_id=existing.id,
-                    entity_public_id=existing.public_id,
-                    change_type="Upsert",
-                    now=now,
-                )
-                return _uuid(existing.public_id)
-            return None
-        job = ProcessingJob(
-            user_id=account.id,
-            media_asset_id=asset.id,
-            media_source_id=source.id,
-            idempotency_key=idempotency_key,
-            job_type="Geocode",
-            status="Queued",
-            provider=GEOCODE_PROVIDER,
-            attempt_count=0,
-            max_attempts=5,
-            next_attempt_at_utc=now,
-            request_json={
-                "latitude": f"{location.latitude:.6f}",
-                "longitude": f"{location.longitude:.6f}",
-                "coordinateRevision": revision,
-                "locationPublicId": location.public_id,
-            },
-            created_at_utc=now,
-            updated_at_utc=now,
-        )
-        session.add(job)
-        session.flush()
-        ChangeRepository(session).add(
-            user_id=account.id,
-            source_id=source.id,
-            asset_id=asset.id,
-            entity_type="ProcessingJob",
-            entity_id=job.id,
-            entity_public_id=job.public_id,
-            change_type="Upsert",
-            now=now,
-        )
-        return _uuid(job.public_id)
-
-    def _ensure_description_job(
-        self,
-        *,
-        session: Session,
-        account: UserAccount,
-        asset: MediaAsset,
-        source: MediaSource,
-        file_name: str,
-        now: datetime,
-        description_index: dict[int, MediaDescription] | None = None,
-        job_index: dict[str, ProcessingJob] | None = None,
-        deferred_jobs: list[ProcessingJob] | None = None,
-    ) -> UUID | None:
-        """Return the one staging-gated scene-description job for a photo."""
-
+    @staticmethod
+    def _scene_preview_supported(*, asset: MediaAsset, file_name: str) -> bool:
         normalized_name = file_name.casefold()
-        if (
-            asset.media_type != "Photo"
-            or normalized_name.endswith(RAW_PHOTO_EXTENSIONS)
-            or not normalized_name.endswith(SCENE_PREVIEW_EXTENSIONS)
-        ):
-            return None
-        current = (
-            description_index.get(asset.id)
-            if description_index is not None
-            else AssetRepository(session).current_description(
-                user_id=account.id, asset_id=asset.id
-            )
+        return (
+            asset.media_type == "Photo"
+            and not normalized_name.endswith(RAW_PHOTO_EXTENSIONS)
+            and normalized_name.endswith(SCENE_PREVIEW_EXTENSIONS)
         )
-        if (
-            current is not None
-            and current.status == "Succeeded"
-            and current.is_current == 1
-            and bool(current.description and current.description.strip())
-        ):
-            return None
 
-        idempotency_key = f"description:{asset.public_id}"
-        repository = JobRepository(session)
-        existing = (
-            job_index.get(idempotency_key)
-            if job_index is not None
-            else repository.by_idempotency_key(
-                user_id=account.id, idempotency_key=idempotency_key
-            )
-        )
-        if existing is not None:
-            request = (
-                dict(existing.request_json)
-                if isinstance(existing.request_json, dict)
-                else {}
-            )
-            configured = {
-                "model": self._scene_description_model,
-                "promptVersion": SCENE_DESCRIPTION_PROMPT_VERSION,
-                "detail": self._scene_description_detail,
-                "serviceTier": self._scene_description_service_tier,
-                "maxWords": self._scene_description_max_words,
-                "monthlyCallLimit": self._scene_description_monthly_call_limit,
-                "monthlyUsdLimit": str(self._scene_description_monthly_usd_limit),
-                "reservedUsdPerRequest": str(
-                    self._scene_description_reserved_usd_per_request
-                ),
-                "inputUsdPerMillion": str(
-                    self._scene_description_input_usd_per_million
-                ),
-                "cachedInputUsdPerMillion": str(
-                    self._scene_description_cached_input_usd_per_million
-                ),
-                "outputUsdPerMillion": str(
-                    self._scene_description_output_usd_per_million
-                ),
-            }
-            configuration_changed = any(
-                request.get(key) != value for key, value in configured.items()
-            )
-            request.update(configured)
-            request["assetRevision"] = asset.content_sha256.lower()
-            request["sourceId"] = source.public_id
-            existing.request_json = request
-            if (
-                existing.status != "Running"
-                and configuration_changed
-                and asset.lifecycle_state == "Active"
-            ):
-                existing.status = "Preparing"
-                existing.next_attempt_at_utc = None
-                existing.lease_token_hash = None
-                existing.lease_expires_at_utc = None
-                existing.failure_class = None
-                existing.failure_code = None
-                existing.failure_message = None
-                existing.started_at_utc = None
-                existing.completed_at_utc = None
-                existing.updated_at_utc = now
-            return _uuid(existing.public_id)
+    def _description_request(
+        self,
+        *,
+        asset: MediaAsset,
+        source: MediaSource,
+    ) -> dict[str, object]:
+        return {
+            "assetRevision": asset.content_sha256.lower(),
+            "sourceId": source.public_id,
+            "model": self._scene_description_model,
+            "promptVersion": SCENE_DESCRIPTION_PROMPT_VERSION,
+            "detail": self._scene_description_detail,
+            "serviceTier": self._scene_description_service_tier,
+            "maxWords": self._scene_description_max_words,
+            "monthlyCallLimit": self._scene_description_monthly_call_limit,
+            "monthlyUsdLimit": str(self._scene_description_monthly_usd_limit),
+            "reservedUsdPerRequest": str(
+                self._scene_description_reserved_usd_per_request
+            ),
+            "inputUsdPerMillion": str(
+                self._scene_description_input_usd_per_million
+            ),
+            "cachedInputUsdPerMillion": str(
+                self._scene_description_cached_input_usd_per_million
+            ),
+            "outputUsdPerMillion": str(
+                self._scene_description_output_usd_per_million
+            ),
+        }
 
-        job = ProcessingJob(
+    def _new_description_job(
+        self,
+        *,
+        account: UserAccount,
+        asset: MediaAsset,
+        source: MediaSource,
+        now: datetime,
+    ) -> ProcessingJob:
+        return ProcessingJob(
             public_id=str(uuid4()),
             user_id=account.id,
             media_asset_id=asset.id,
             media_source_id=source.id,
-            idempotency_key=idempotency_key,
+            idempotency_key=f"description:{asset.public_id}",
             job_type="Description",
             status="Preparing",
             provider=DESCRIPTION_PROVIDER,
             attempt_count=0,
             max_attempts=5,
             next_attempt_at_utc=None,
-            request_json={
-                "assetRevision": asset.content_sha256.lower(),
-                "sourceId": source.public_id,
-                "model": self._scene_description_model,
-                "promptVersion": SCENE_DESCRIPTION_PROMPT_VERSION,
-                "detail": self._scene_description_detail,
-                "serviceTier": self._scene_description_service_tier,
-                "maxWords": self._scene_description_max_words,
-                "monthlyCallLimit": self._scene_description_monthly_call_limit,
-                "monthlyUsdLimit": str(self._scene_description_monthly_usd_limit),
-                "reservedUsdPerRequest": str(
-                    self._scene_description_reserved_usd_per_request
-                ),
-                "inputUsdPerMillion": str(
-                    self._scene_description_input_usd_per_million
-                ),
-                "cachedInputUsdPerMillion": str(
-                    self._scene_description_cached_input_usd_per_million
-                ),
-                "outputUsdPerMillion": str(
-                    self._scene_description_output_usd_per_million
-                ),
-            },
+            request_json=self._description_request(asset=asset, source=source),
             created_at_utc=now,
             updated_at_utc=now,
         )
-        session.add(job)
-        if job_index is not None:
-            job_index[idempotency_key] = job
-        if deferred_jobs is not None:
-            deferred_jobs.append(job)
-        else:
-            session.flush()
-            ChangeRepository(session).add(
-                user_id=account.id,
-                source_id=source.id,
-                asset_id=asset.id,
-                entity_type="ProcessingJob",
-                entity_id=job.id,
-                entity_public_id=job.public_id,
-                change_type="Upsert",
-                now=now,
-            )
-        return _uuid(job.public_id)
 
     def _require_temporary_object_store(self) -> TemporaryObjectStore:
         if self._temporary_object_store is None:
@@ -5977,6 +6074,35 @@ class Phase1DomainService:
                 rejected=int(count_values.get("rejected", 0)),
             ),
             results=tuple(results),
+        )
+
+    @staticmethod
+    def _enrichment_preparation_from_json(
+        value: Mapping[str, Any],
+    ) -> EnrichmentPreparation:
+        task_values = value.get("scene_description_tasks")
+        if not isinstance(task_values, list):
+            task_values = []
+        tasks = tuple(
+            SceneDescriptionTaskRecord(
+                job_id=UUID(str(item["job_id"])),
+                media_asset_id=UUID(str(item["media_asset_id"])),
+                occurrence_id=UUID(str(item["occurrence_id"])),
+                source_item_id=str(item["source_item_id"]),
+                local_locator=str(item["local_locator"]),
+                asset_content_sha256=str(item["asset_content_sha256"]),
+                file_name=str(item["file_name"]),
+            )
+            for item in task_values
+            if isinstance(item, Mapping)
+        )
+        return EnrichmentPreparation(
+            source_id=UUID(str(value["source_id"])),
+            geocode_jobs_queued=int(value.get("geocode_jobs_queued", 0)),
+            description_jobs_prepared=int(
+                value.get("description_jobs_prepared", 0)
+            ),
+            scene_description_tasks=tasks,
         )
 
     @staticmethod

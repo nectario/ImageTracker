@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID, uuid4
@@ -23,6 +24,7 @@ from services.domain.errors import ConflictError
 from services.domain.models import (
     AccountIdentity,
     DeviceRegistration,
+    EnrichmentPrepareCommand,
     ManifestCommand,
     ManifestUpsert,
     MutationContext,
@@ -182,6 +184,29 @@ def setup_photo(service: Phase1DomainService):
             context("scene-manifest"),
         )
     ).value
+    prepared = run(
+        service.prepare_enrichment(
+            user.user_id,
+            device.device_id,
+            source.source_id,
+            EnrichmentPrepareCommand(types=("Description",), limit=10),
+            context("scene-enrichment-prepare"),
+        )
+    ).value
+    jobs_by_asset = {
+        task.media_asset_id: task.job_id
+        for task in prepared.scene_description_tasks
+    }
+    manifest = replace(
+        manifest,
+        results=tuple(
+            replace(
+                result,
+                description_job_id=jobs_by_asset.get(result.media_asset_id),
+            )
+            for result in manifest.results
+        ),
+    )
     return user, source, manifest
 
 
@@ -979,7 +1004,25 @@ def test_provider_auth_failure_opens_circuit_until_explicit_retry(
             ),
             context("circuit-second-manifest"),
         )
-    ).value.results[0]
+        ).value.results[0]
+    second_preparation = run(
+        service.prepare_enrichment(
+            user.user_id,
+            source.device_id,
+            source.source_id,
+            EnrichmentPrepareCommand(types=("Description",), limit=10),
+            context("circuit-second-prepare"),
+        )
+    ).value
+    second_task = next(
+        task
+        for task in second_preparation.scene_description_tasks
+        if task.media_asset_id == second_manifest.media_asset_id
+    )
+    second_manifest = replace(
+        second_manifest,
+        description_job_id=second_task.job_id,
+    )
     deferred = run(
         service.create_upload_plan(
             user.user_id,

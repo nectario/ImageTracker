@@ -79,6 +79,9 @@ class LazyConfiguredPhase1Service:
                         Phase1DomainService(
                             self._runtime.session_factory,
                             job_dispatcher=dispatcher,
+                            enrichment_processing_enabled=(
+                                self._settings.enrichment_processing_enabled
+                            ),
                             temporary_object_store=temporary_store,
                             scene_description_monthly_call_limit=(
                                 self._settings.scene_description_monthly_call_limit

@@ -257,6 +257,33 @@ def _manifest(value: domain.ManifestResult) -> api.ManifestResponse:
     return api.ManifestResponse.model_validate(value)
 
 
+def _scene_description_task(
+    value: domain.SceneDescriptionTaskRecord,
+) -> api.SceneDescriptionTask:
+    return api.SceneDescriptionTask(
+        job_id=value.job_id,
+        media_asset_id=value.media_asset_id,
+        occurrence_id=value.occurrence_id,
+        source_item_id=value.source_item_id,
+        local_locator=value.local_locator,
+        asset_content_sha256=value.asset_content_sha256,
+        file_name=value.file_name,
+    )
+
+
+def _enrichment_preparation(
+    value: domain.EnrichmentPreparation,
+) -> api.EnrichmentPrepareResponse:
+    return api.EnrichmentPrepareResponse(
+        source_id=value.source_id,
+        geocode_jobs_queued=value.geocode_jobs_queued,
+        description_jobs_prepared=value.description_jobs_prepared,
+        scene_description_tasks=[
+            _scene_description_task(item) for item in value.scene_description_tasks
+        ],
+    )
+
+
 def _upload_plan(value: domain.UploadPlanRecord) -> api.UploadPlan:
     return api.UploadPlan.model_validate(value)
 
@@ -492,6 +519,28 @@ class DomainServiceAdapter:
             )
         )
         return _mutation_result(value, _manifest)
+
+    async def prepare_enrichment(
+        self,
+        user_id: UUID,
+        source_id: UUID,
+        requesting_device_id: UUID,
+        payload: api.EnrichmentPrepareRequest,
+        mutation: MutationContext,
+    ) -> MutationResult[api.EnrichmentPrepareResponse]:
+        value = await _domain_call(
+            self._service.prepare_enrichment(
+                user_id,
+                requesting_device_id,
+                source_id,
+                domain.EnrichmentPrepareCommand(
+                    types=tuple(str(item) for item in payload.types),
+                    limit=payload.limit,
+                ),
+                _domain_mutation(mutation),
+            )
+        )
+        return _mutation_result(value, _enrichment_preparation)
 
     async def create_upload_plan(
         self,

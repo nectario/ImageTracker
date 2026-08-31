@@ -152,7 +152,7 @@ imagetracker source add "/mnt/d/Pictures/Camera Uploads" \
 imagetracker source list
 imagetracker sync "Camera Uploads" --fast-add
 imagetracker sync "Camera Uploads" --scan-workers 64
-imagetracker enrich "Camera Uploads" --limit 100
+imagetracker enrich "Camera Uploads" --limit 64
 imagetracker status
 ```
 
@@ -200,13 +200,14 @@ only missing pending-hash occurrences and their change rows set-wise, and
 commits once. It refuses to race a live manifest sender unless the stopped
 outbox is explicitly replaced with `--replace-pending-outbox`.
 
-`sync` is metadata-only by default: it scans, hashes, extracts metadata, and
-sends resumable manifests without staging paid scene-description work. Use the
-separate bounded command when you are ready to process due previews, or add
-`--with-enrichment` to stage up to 100 after a metadata sync:
+`sync` is metadata-only by design: it scans, hashes, extracts metadata, stores
+raw GPS coordinates, and sends resumable manifests without creating or queuing
+any enrichment job. Use the separate bounded command when you explicitly want
+location and scene processing, or add `--with-enrichment` after a metadata
+sync:
 
 ```bash
-imagetracker enrich "Camera Uploads" --limit 100
+imagetracker enrich "Camera Uploads" --limit 64
 imagetracker sync "Camera Uploads" --with-enrichment
 ```
 
@@ -216,11 +217,11 @@ unacknowledged work after a network failure or interruption. Unchanged files
 reuse the local hash/metadata cache. Deletions are emitted only after the
 scanner completes a reliable read of the whole source.
 
-On the service side, each manifest prefetches existing assets, descriptions,
-and jobs once and batches new asset, occurrence, job, and change-feed writes at
-transaction boundaries. This keeps database round trips tied to the batch
-rather than multiplying them for every photo while preserving exact-hash
-deduplication and idempotent resume behavior.
+On the service side, each manifest batches asset, occurrence, raw-location,
+and change-feed writes at transaction boundaries. Enrichment preparation is a
+separate authenticated, device-scoped, idempotent mutation, so ingestion can
+never accidentally spend provider quota. This keeps database round trips tied
+to the batch while preserving exact-hash deduplication and resumable imports.
 
 Useful operating commands:
 
@@ -256,11 +257,12 @@ imagetracker jobs list
 imagetracker jobs retry JOB_ID
 ```
 
-GPS in a manifest queues reverse geocoding. Each eligible photo also receives a
-server-owned description job, but metadata sync leaves its local preview safely
-queued. `enrich` creates deterministic JPEG previews and stages only the number
-requested with `--limit`, without rescanning files or draining manifests. Useful
-WSL commands for watching or repairing that work are:
+GPS in a manifest stores coordinates only. `enrich` explicitly creates a
+bounded set of reverse-geocode and scene-description jobs, then creates
+deterministic JPEG previews for the returned local-photo tasks. It does not
+rescan files or drain metadata manifests. If enrichment processing is paused in
+the deployed environment, the command fails before creating jobs or reserving
+provider usage. Useful WSL commands for watching or repairing that work are:
 
 ```bash
 ./scripts/cli.sh status --follow
@@ -275,7 +277,7 @@ WSL commands for watching or repairing that work are:
 
 # Retry a server job that is Failed or waiting on quota.
 ./scripts/cli.sh jobs retry JOB_ID
-./scripts/cli.sh enrich "Camera Uploads" --limit 100
+./scripts/cli.sh enrich "Camera Uploads" --limit 64
 ```
 
 `DeferredQuota` is an intentional waiting state, not a failed upload. Once one

@@ -13,6 +13,7 @@ from services.bulk.repository import (
     BulkImportDatabaseError,
     ManifestImportClaim,
     MergeResult,
+    MergeSettings,
     MySqlManifestImportRepository,
 )
 
@@ -274,7 +275,8 @@ def test_merge_uses_bounded_set_statements_and_one_commit():
     assert any(sql.startswith("INSERT INTO MediaAsset") for sql in statements)
     assert any(sql.startswith("INSERT INTO MediaOccurrence") for sql in statements)
     assert any(sql.startswith("INSERT INTO MediaLocation") for sql in statements)
-    assert any(sql.startswith("INSERT INTO ProcessingJob") for sql in statements)
+    assert not any("ProcessingJob" in sql for sql in statements)
+    assert not any("MediaDescription" in sql for sql in statements)
     assert len(statements) < 40
     assert connection.commits == 1
     assert connection.rollbacks == 0
@@ -296,7 +298,7 @@ def test_merge_rejects_hash_relink_before_any_canonical_asset_write():
     assert connection.rollbacks >= 1
 
 
-def test_location_merge_preserves_resolved_evidence_and_jobs_filter_unresolved():
+def test_location_merge_preserves_resolved_evidence_without_creating_jobs():
     connection = FakeConnection()
     repository = MySqlManifestImportRepository(
         lambda: connection, clock=lambda: FIXED_NOW
@@ -342,14 +344,31 @@ def test_location_merge_preserves_resolved_evidence_and_jobs_filter_unresolved()
     assert location.index("ProviderUpdatedAtUtc = IF") < location.index(
         "Latitude = VALUES(Latitude)"
     )
-    geocode = [sql for sql in statements if "'geocode:'" in sql]
-    assert geocode
-    assert all("StoredLocation.Provider IS NULL" in sql for sql in geocode)
+    assert not any("ProcessingJob" in sql for sql in statements)
+    assert not any("'geocode:'" in sql for sql in statements)
     asset_update = next(
         sql for sql in statements if sql.startswith("UPDATE MediaAsset AS Asset")
     )
     assert "Asset.OriginalS3ObjectKey IS NOT NULL" in asset_update
     assert "Asset.MetadataVersion = IF(" in asset_update
+
+
+def test_explicit_bulk_enrichment_opt_in_retains_job_creation_path():
+    connection = FakeConnection()
+    repository = MySqlManifestImportRepository(
+        lambda: connection, clock=lambda: FIXED_NOW
+    )
+
+    repository.merge(
+        _claim(), settings=MergeSettings(enqueue_enrichment_jobs=True)
+    )
+
+    statements = [sql for sql, _ in connection.cursor_value.calls]
+    geocode = [sql for sql in statements if "'geocode:'" in sql]
+    assert geocode
+    assert all("StoredLocation.Provider IS NULL" in sql for sql in geocode)
+    assert any(sql.startswith("INSERT INTO ProcessingJob") for sql in statements)
+    assert any("MediaDescription" in sql for sql in statements)
 
 
 def test_stage_rejects_a_manifest_for_another_snapshot(tmp_path: Path):

@@ -1127,6 +1127,7 @@ class LocalState:
                 now,
             ),
         )
+
         connection.execute(
             """
             INSERT INTO DescriptionOutbox
@@ -1151,6 +1152,98 @@ class LocalState:
                 now,
             ),
         )
+
+    def queue_scene_description_tasks(
+        self,
+        source_id: str,
+        tasks: Sequence[Mapping[str, Any]],
+    ) -> int:
+        """Persist explicit server-prepared scene work in one local transaction."""
+
+        queued = 0
+        with self._connect() as connection:
+            for task in tasks:
+                if str(task.get("sourceId") or source_id) != source_id:
+                    raise ValueError("Prepared scene task belongs to another source")
+                entry = {
+                    "sourceItemId": task.get("sourceItemId"),
+                    "localLocator": task.get("localLocator"),
+                    "contentSha256": task.get("assetContentSha256"),
+                    "fileName": task.get("fileName"),
+                    "mediaType": "Photo",
+                }
+                result = {
+                    "descriptionJobId": task.get("jobId"),
+                    "occurrenceId": task.get("occurrenceId"),
+                    "mediaAssetId": task.get("mediaAssetId"),
+                }
+                existing = connection.execute(
+                    """
+                    SELECT OccurrenceId, MediaAssetId, SourceItemId, LocalPath,
+                           AssetContentSha256, FileName, State
+                    FROM DescriptionOutbox WHERE JobId = ?
+                    """,
+                    (str(task.get("jobId") or ""),),
+                ).fetchone()
+                self._queue_description_in_transaction(
+                    connection,
+                    source_id=source_id,
+                    entry=entry,
+                    result=result,
+                )
+                if existing is None:
+                    queued += 1
+                    continue
+                identity = (
+                    str(task.get("occurrenceId") or ""),
+                    str(task.get("mediaAssetId") or ""),
+                    str(task.get("sourceItemId") or ""),
+                    str(task.get("localLocator") or ""),
+                    str(task.get("assetContentSha256") or "").lower(),
+                    str(task.get("fileName") or ""),
+                )
+                previous_identity = (
+                    str(existing["OccurrenceId"]),
+                    str(existing["MediaAssetId"]),
+                    str(existing["SourceItemId"]),
+                    str(existing["LocalPath"]),
+                    str(existing["AssetContentSha256"]).lower(),
+                    str(existing["FileName"]),
+                )
+                reset = (
+                    str(existing["State"]) != "Sent"
+                    and (
+                        identity != previous_identity
+                        or str(existing["State"]) in {"Deferred", "Failed", "Skipped"}
+                    )
+                )
+                connection.execute(
+                    """
+                    UPDATE DescriptionOutbox
+                    SET SourceId = ?, OccurrenceId = ?, MediaAssetId = ?,
+                        SourceItemId = ?, LocalPath = ?, AssetContentSha256 = ?,
+                        FileName = ?,
+                        State = CASE WHEN ? THEN 'Pending' ELSE State END,
+                        NextAttemptAtUtc = CASE WHEN ? THEN NULL ELSE NextAttemptAtUtc END,
+                        ErrorJson = CASE WHEN ? THEN NULL ELSE ErrorJson END,
+                        FailedAtUtc = CASE WHEN ? THEN NULL ELSE FailedAtUtc END,
+                        UpdatedAtUtc = ?
+                    WHERE JobId = ?
+                    """,
+                    (
+                        source_id,
+                        *identity,
+                        int(reset),
+                        int(reset),
+                        int(reset),
+                        int(reset),
+                        utc_now_text(),
+                        str(task.get("jobId") or ""),
+                    ),
+                )
+                if reset:
+                    queued += 1
+        return queued
 
     @staticmethod
     def _reselect_description_candidate(

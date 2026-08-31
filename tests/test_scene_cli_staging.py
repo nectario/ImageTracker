@@ -114,8 +114,30 @@ class UploadApi:
         self.put_headers: Mapping[str, str] | None = None
         self.completion: Mapping[str, Any] | None = None
         self.plan_calls = 0
+        self.prepare_calls: list[tuple[str, Mapping[str, Any], str]] = []
         self.cancelled_jobs: list[tuple[str, str, str]] = []
         self.retried_jobs: list[tuple[str, str]] = []
+
+    def register_device(self, _payload: Mapping[str, Any], *, key: str):
+        assert key.startswith("device:")
+        return {"deviceId": "20000000-0000-4000-8000-000000000001"}
+
+    def prepare_enrichment(
+        self,
+        source_id: str,
+        payload: Mapping[str, Any],
+        *,
+        device_id: str,
+        key: str,
+    ) -> Mapping[str, Any]:
+        assert device_id
+        self.prepare_calls.append((source_id, dict(payload), key))
+        return {
+            "sourceId": source_id,
+            "geocodeJobsQueued": 0,
+            "descriptionJobsPrepared": 0,
+            "sceneDescriptionTasks": [],
+        }
 
     def create_upload_plan(self, payload: Mapping[str, Any], *, key: str):
         self.plan_calls += 1
@@ -182,12 +204,13 @@ def test_sync_is_metadata_only_until_enrichment_is_explicit(tmp_path: Path):
     _queue_photo(state, photo)
     api = UploadApi()
     scanner = EmptyScanner()
-    engine = SyncEngine(api, state, scanner)  # type: ignore[arg-type]
+    engine = SyncEngine(api, state, scanner, device_id="device-test")  # type: ignore[arg-type]
 
     metadata = engine.sync(_binding(tmp_path))
 
     assert scanner.calls == 1
     assert api.plan_calls == 0
+    assert api.prepare_calls == []
     assert metadata.descriptions_staged == 0
     assert metadata.description_pending == 1
     assert metadata.failed == 0
@@ -199,6 +222,11 @@ def test_sync_is_metadata_only_until_enrichment_is_explicit(tmp_path: Path):
     )
 
     assert scanner.calls == 2
+    assert len(api.prepare_calls) == 1
+    assert api.prepare_calls[0][1] == {
+        "types": ["Geocode", "Description"],
+        "limit": 1,
+    }
     assert api.plan_calls == 1
     assert enriched.descriptions_staged == 1
     assert enriched.description_pending == 0
@@ -224,17 +252,55 @@ def test_enrich_honors_limit_without_scanning_or_flushing_manifests(
     api = UploadApi()
     scanner = EmptyScanner()
 
-    summary = SyncEngine(api, state, scanner).enrich(  # type: ignore[arg-type]
+    summary = SyncEngine(api, state, scanner, device_id="device-test").enrich(  # type: ignore[arg-type]
         _binding(tmp_path),
         limit=1,
     )
 
     assert scanner.calls == 0
+    assert len(api.prepare_calls) == 1
     assert api.plan_calls == 1
     assert summary.limit == 1
     assert summary.descriptions_staged == 1
     assert summary.description_pending == 1
     assert state.pending_count() == 0
+
+
+def test_prepare_identity_survives_response_failure_until_local_commit(
+    tmp_path: Path,
+) -> None:
+    photo = tmp_path / "retry.jpg"
+    _photo(photo)
+    state = LocalState(tmp_path / "state.sqlite3")
+    _queue_photo(state, photo)
+
+    class FailOncePrepareApi(UploadApi):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed = False
+
+        def prepare_enrichment(self, *args: Any, **kwargs: Any):
+            result = super().prepare_enrichment(*args, **kwargs)
+            if not self.failed:
+                self.failed = True
+                raise ApiError(
+                    ApiProblem(
+                        0,
+                        "Network error",
+                        "The response was lost after submission.",
+                    )
+                )
+            return result
+
+    api = FailOncePrepareApi()
+    engine = SyncEngine(api, state, device_id="device-test")  # type: ignore[arg-type]
+
+    with pytest.raises(ApiError):
+        engine.enrich(_binding(tmp_path), limit=1)
+    engine.enrich(_binding(tmp_path), limit=1)
+
+    assert len(api.prepare_calls) == 2
+    assert api.prepare_calls[0][2] == api.prepare_calls[1][2]
 
 
 def test_description_due_limit_is_explicit_and_bounded(tmp_path: Path):
@@ -243,6 +309,53 @@ def test_description_due_limit_is_explicit_and_bounded(tmp_path: Path):
     for invalid in (0, 1001):
         with pytest.raises(ValueError, match="between 1 and 1000"):
             state.due_description_tasks(SOURCE_ID, limit=invalid)
+
+
+def test_explicit_preparation_queues_scene_task_idempotently(tmp_path: Path):
+    photo = tmp_path / "prepared.jpg"
+    _photo(photo)
+    state = LocalState(tmp_path / "state.sqlite3")
+    task = {
+        "jobId": JOB_ID,
+        "mediaAssetId": ASSET_ID,
+        "occurrenceId": OCCURRENCE_ID,
+        "sourceItemId": "photo:prepared",
+        "localLocator": str(photo),
+        "assetContentSha256": stream_sha256(photo),
+        "fileName": photo.name,
+    }
+
+    first = state.queue_scene_description_tasks(SOURCE_ID, [task])
+    second = state.queue_scene_description_tasks(SOURCE_ID, [task])
+
+    assert first == 1
+    assert second == 0
+    queued = state.due_description_tasks(SOURCE_ID, limit=10)
+    assert len(queued) == 1
+    assert queued[0].job_id == JOB_ID
+    assert queued[0].local_path == str(photo)
+
+    moved = tmp_path / "moved.jpg"
+    photo.replace(moved)
+    changed = {
+        **task,
+        "occurrenceId": "71000000-0000-4000-8000-000000000001",
+        "sourceItemId": "photo:moved",
+        "localLocator": str(moved),
+        "fileName": moved.name,
+    }
+    assert state.queue_scene_description_tasks(SOURCE_ID, [changed]) == 1
+    refreshed = state.due_description_tasks(SOURCE_ID, limit=10)[0]
+    assert refreshed.occurrence_id == changed["occurrenceId"]
+    assert refreshed.local_path == str(moved)
+
+    state.mark_description_skipped(
+        JOB_ID,
+        code="source_photo_changed",
+        message="The prior local candidate changed.",
+    )
+    assert state.queue_scene_description_tasks(SOURCE_ID, [changed]) == 1
+    assert state.due_description_tasks(SOURCE_ID, limit=10)[0].state == "Pending"
 
 
 def test_enrich_cli_emits_one_json_result_and_resumes_cleanly_after_interrupt(
@@ -263,6 +376,7 @@ def test_enrich_cli_emits_one_json_result_and_resumes_cleanly_after_interrupt(
         },
         root,
     )
+    state.set_setting("device-id", "20000000-0000-4000-8000-000000000001")
     _queue_photo(state, photo)
     monkeypatch.setattr(
         cli_app_module,
@@ -294,6 +408,9 @@ def test_enrich_cli_emits_one_json_result_and_resumes_cleanly_after_interrupt(
             "storageMode": "Local",
         },
         interrupted_root,
+    )
+    interrupted_state.set_setting(
+        "device-id", "20000000-0000-4000-8000-000000000001"
     )
     _queue_photo(interrupted_state, interrupted_photo)
 
@@ -546,6 +663,48 @@ def test_signed_preview_put_uses_plan_headers_without_cognito_authorization():
     assert seen["headers"]["content-type"] == "image/jpeg"
     assert seen["headers"]["content-length"] == "12"
     assert seen["headers"]["x-amz-checksum-sha256"] == "checksum"
+
+
+def test_prepare_enrichment_sends_owning_device_and_idempotency_headers():
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["headers"] = dict(request.headers)
+        seen["path"] = request.url.path
+        return httpx.Response(
+            200,
+            json={
+                "sourceId": SOURCE_ID,
+                "geocodeJobsQueued": 0,
+                "descriptionJobsPrepared": 0,
+                "sceneDescriptionTasks": [],
+            },
+        )
+
+    sessions = SimpleNamespace(
+        current_tokens=lambda: SimpleNamespace(
+            access_token="access-token",
+            refresh_token=None,
+        )
+    )
+    api = ApiClient(
+        "https://api.example",
+        sessions,  # type: ignore[arg-type]
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    api.prepare_enrichment(
+        SOURCE_ID,
+        {"types": ["Geocode", "Description"], "limit": 10},
+        device_id="20000000-0000-4000-8000-000000000001",
+        key="enrichment-test-key",
+    )
+
+    assert seen["path"] == f"/v1/sources/{SOURCE_ID}/enrichment/prepare"
+    assert seen["headers"]["x-imagetracker-device-id"] == (
+        "20000000-0000-4000-8000-000000000001"
+    )
+    assert seen["headers"]["idempotency-key"] == "enrichment-test-key"
 
 
 def test_changed_original_is_quarantined_before_preview_upload(tmp_path: Path):

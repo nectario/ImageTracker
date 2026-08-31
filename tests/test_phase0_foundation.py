@@ -175,6 +175,7 @@ def test_worker_infrastructure_is_bounded_and_schedules_stay_disabled():
     assert "- geo-places:ReverseGeocode" in serverless
     assert "::provider/default" in serverless
     assert "IMAGETRACKER_GEOCODE_REUSE_RADIUS_METERS: '5'" in serverless
+    assert "IMAGETRACKER_ENRICHMENT_PROCESSING_ENABLED: 'false'" in serverless
     assert "IMAGETRACKER_GEOCODE_MONTHLY_CALL_LIMIT: '1000'" in serverless
     assert "IMAGETRACKER_SCENE_DESCRIPTION_MODEL: gpt-5.6-terra" in serverless
     assert "IMAGETRACKER_SCENE_DESCRIPTION_SERVICE_TIER: flex" in serverless
@@ -188,9 +189,17 @@ def test_worker_infrastructure_is_bounded_and_schedules_stay_disabled():
     )
     assert "IMAGETRACKER_SCENE_DESCRIPTION_OUTPUT_USD_PER_MILLION: '12.000000'" in serverless
     assert serverless.count("State: ${self:custom.maintenanceSchedulesState}") == 3
-    assert "retryScheduleState: ${param:retryScheduleState, 'ENABLED'}" in serverless
+    assert "retryScheduleState: ${param:retryScheduleState, 'DISABLED'}" in serverless
+    assert (
+        "manifestImportRetryScheduleState: "
+        "${param:manifestImportRetryScheduleState, 'ENABLED'}"
+        in serverless
+    )
     assert "State: ${self:custom.retryScheduleState}" in serverless
+    assert "State: ${self:custom.manifestImportRetryScheduleState}" in serverless
     assert "maintenanceSchedulesState: ${param:maintenanceSchedulesState, 'DISABLED'}" in serverless
+    assert serverless.count("enabled: false") == 1
+    assert serverless.count("enabled: true") == 1
     assert "maxReceiveCount: 8" in serverless
     assert "handler: services/bulk/handler.handler" in serverless
     assert "name: ${self:service}-${sls:stage}-manifest-import-worker" in serverless

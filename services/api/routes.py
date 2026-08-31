@@ -22,6 +22,8 @@ from services.api.models import (
     Device,
     DevicePage,
     DeviceRegistrationRequest,
+    EnrichmentPrepareRequest,
+    EnrichmentPrepareResponse,
     HealthStatus,
     ManifestRequest,
     ManifestResponse,
@@ -81,6 +83,7 @@ def _mutation(
     | MediaSourceCreateRequest
     | MediaSourceUpdateRequest
     | ManifestRequest
+    | EnrichmentPrepareRequest
     | UploadPlanRequest
     | UploadCompleteRequest
     | UploadCancelRequest
@@ -277,6 +280,37 @@ def create_phase1_router() -> APIRouter:
                 request,
                 idempotency_key,
                 f"/v1/sources/{source_id}/manifest",
+                payload,
+            ),
+        )
+        _apply_mutation_response(
+            response, result, allowed_statuses={200}, default_status=200
+        )
+        return result.value
+
+    @router.post(
+        "/sources/{source_id}/enrichment/prepare",
+        response_model=EnrichmentPrepareResponse,
+    )
+    async def prepare_enrichment(
+        source_id: UUID,
+        payload: EnrichmentPrepareRequest,
+        request: Request,
+        response: Response,
+        requesting_device_id: DeviceId,
+        idempotency_key: IdempotencyKey,
+        user: CurrentUser = Depends(get_current_user),
+        service: Phase1Service = Depends(get_phase1_service),
+    ) -> EnrichmentPrepareResponse:
+        result = await service.prepare_enrichment(
+            user.user_id,
+            source_id,
+            requesting_device_id,
+            payload,
+            _mutation(
+                request,
+                idempotency_key,
+                f"/v1/sources/{source_id}/enrichment/prepare",
                 payload,
             ),
         )

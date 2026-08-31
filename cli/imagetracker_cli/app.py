@@ -549,6 +549,8 @@ def _print_sync(summary: SyncSummary) -> None:
         "Quarantined entries": summary.quarantined_entries,
         "Rejected entries": summary.rejected_entries,
         "Manifest batches sent": summary.batches_sent,
+        "Location jobs explicitly queued": summary.geocode_jobs_queued,
+        "Scene jobs explicitly prepared": summary.description_jobs_prepared,
         "Scene previews staged": summary.descriptions_staged,
         "Scene previews recovered": summary.descriptions_recovered,
         "Scene previews pending": summary.description_pending,
@@ -574,11 +576,13 @@ def _print_sync(summary: SyncSummary) -> None:
 
 
 def _print_enrichment(summary: EnrichmentSummary) -> None:
-    table = _table(title="ImageTracker scene enrichment")
+    table = _table(title="ImageTracker enrichment")
     table.add_column("Result", style="accent")
     table.add_column("Count", justify="right", style="key")
     rows = {
         "Run limit": summary.limit,
+        "Location jobs queued": summary.geocode_jobs_queued,
+        "Scene jobs prepared": summary.description_jobs_prepared,
         "Scene previews staged": summary.descriptions_staged,
         "Scene previews recovered": summary.descriptions_recovered,
         "Scene previews pending": summary.description_pending,
@@ -629,9 +633,9 @@ def sync(
         typer.Option(
             "--with-enrichment",
             help=(
-                "After metadata sync, stage up to "
-                f"{DEFAULT_ENRICHMENT_LIMIT} due scene previews. By default "
-                "sync performs metadata work only."
+                "After metadata sync, explicitly queue location enrichment and "
+                f"prepare up to {DEFAULT_ENRICHMENT_LIMIT} scene previews. "
+                "Provider usage may incur cost; default sync is metadata-only."
             ),
         ),
     ] = False,
@@ -678,7 +682,16 @@ def sync(
                 progress = (lambda message: None) if json_output else (
                     lambda message: console.print(f"[progress]{message}[/progress]")
                 )
-                engine = SyncEngine(runtime.api, runtime.state, progress=progress)
+                engine = SyncEngine(
+                    runtime.api,
+                    runtime.state,
+                    progress=progress,
+                    device_id=(
+                        _registered_device_id(runtime)
+                        if with_enrichment
+                        else None
+                    ),
+                )
                 summary = engine.sync(
                     binding,
                     dry_run=dry_run,
@@ -718,8 +731,8 @@ def enrich(
         typer.Option(
             "--limit",
             min=1,
-            max=1000,
-            help="Maximum due scene previews to prepare and stage.",
+            max=DEFAULT_ENRICHMENT_LIMIT,
+            help="Maximum media assets to prepare for location and scene enrichment.",
         ),
     ] = DEFAULT_ENRICHMENT_LIMIT,
     json_output: Annotated[
@@ -727,12 +740,12 @@ def enrich(
         typer.Option("--json", help="Emit one machine-readable result."),
     ] = False,
 ) -> None:
-    """Stage due scene previews without rescanning or synchronizing metadata."""
+    """Explicitly request bounded location and scene enrichment."""
 
     with command_errors(
         interrupt_message=(
-            "Stopped. Completed scene previews remain staged; rerun the same "
-            "enrich command to resume due work."
+            "Stopped. Prepared jobs and completed preview staging remain saved; "
+            "rerun the same enrich command to resume due work."
         )
     ):
         runtime = _runtime()
@@ -745,6 +758,7 @@ def enrich(
                 runtime.api,
                 runtime.state,
                 progress=progress,
+                device_id=_registered_device_id(runtime),
             ).enrich(binding, limit=limit)
             if json_output:
                 _emit(summary.as_dict())

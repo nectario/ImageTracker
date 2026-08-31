@@ -4,7 +4,8 @@ configValidationMode: error
 
 custom:
   parameterPrefix: /imagetracker/${sls:stage}
-  retryScheduleState: ${param:retryScheduleState, 'ENABLED'}
+  retryScheduleState: ${param:retryScheduleState, 'DISABLED'}
+  manifestImportRetryScheduleState: ${param:manifestImportRetryScheduleState, 'ENABLED'}
   maintenanceSchedulesState: ${param:maintenanceSchedulesState, 'DISABLED'}
   monthlyBudgetUsd: ${param:monthlyBudgetUsd, 50}
 
@@ -81,6 +82,7 @@ provider:
       Fn::GetAtt:
         - ProcessingQueue
         - Arn
+    IMAGETRACKER_ENRICHMENT_PROCESSING_ENABLED: 'false'
     IMAGETRACKER_MANIFEST_IMPORT_QUEUE_URL:
       Ref: ManifestImportQueue
     IMAGETRACKER_LOCATION_NORMALIZATION_RULES_PATH: /var/task/location_normalization_rules.json
@@ -213,6 +215,7 @@ functions:
             Fn::GetAtt:
               - ProcessingQueue
               - Arn
+          enabled: false
           batchSize: 1
           functionResponseType: ReportBatchItemFailures
   manifestImportWorker:
@@ -229,6 +232,7 @@ functions:
             Fn::GetAtt:
               - ManifestImportQueue
               - Arn
+          enabled: true
           batchSize: 1
           functionResponseType: ReportBatchItemFailures
 
@@ -514,7 +518,7 @@ resources:
         Name: ${self:service}-${sls:stage}-retry-manifest-imports
         Description: Recovers queued, retryable, or expired manifest imports.
         ScheduleExpression: rate(5 minutes)
-        State: ${self:custom.retryScheduleState}
+        State: ${self:custom.manifestImportRetryScheduleState}
         Targets:
           - Arn:
               Fn::GetAtt:

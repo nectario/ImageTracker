@@ -50,6 +50,9 @@ REQUIRED_MARKERS = {
     "processing queue": "Type: AWS::SQS::Queue",
     "dead-letter policy": "RedrivePolicy:",
     "maintenance schedules": "Type: AWS::Events::Rule",
+    "disabled general retry default": "retryScheduleState: ${param:retryScheduleState, 'DISABLED'}",
+    "enabled manifest retry default": "manifestImportRetryScheduleState: ${param:manifestImportRetryScheduleState, 'ENABLED'}",
+    "disabled enrichment API default": "IMAGETRACKER_ENRICHMENT_PROCESSING_ENABLED: 'false'",
     "disabled schedule default": "maintenanceSchedulesState: ${param:maintenanceSchedulesState, 'DISABLED'}",
     "SSM parameter prefix": "IMAGETRACKER_CONFIG_PARAMETER_PREFIX:",
     "incremental budget": "Type: AWS::Budgets::Budget",
@@ -110,6 +113,9 @@ def _validate_packaged_template(path: Path) -> list[str]:
         failures.append("packaged API Lambda memory is not 512 MB")
     if api_lambda.get("Timeout") != 28:
         failures.append("packaged API Lambda timeout is not 28 seconds")
+    api_environment = api_lambda.get("Environment", {}).get("Variables", {})
+    if api_environment.get("IMAGETRACKER_ENRICHMENT_PROCESSING_ENABLED") != "false":
+        failures.append("packaged API must reject enrichment while processing is paused")
 
     worker_lambda = resources.get("WorkerLambdaFunction", {}).get("Properties", {})
     if worker_lambda.get("Runtime") != "python3.12":
@@ -167,6 +173,10 @@ def _validate_packaged_template(path: Path) -> list[str]:
             failures.append("packaged worker does not report partial SQS batch failures")
         if "ProcessingQueue" not in json.dumps(worker_mapping.get("EventSourceArn")):
             failures.append("packaged worker event source is not ProcessingQueue")
+        if worker_mapping.get("Enabled") is not False:
+            failures.append(
+                "packaged general enrichment worker event source must be disabled"
+            )
 
     bulk_mappings = [
         mapping
@@ -193,6 +203,10 @@ def _validate_packaged_template(path: Path) -> list[str]:
         ):
             failures.append(
                 "packaged manifest import event source is not ManifestImportQueue"
+            )
+        if bulk_mapping.get("Enabled") is not True:
+            failures.append(
+                "packaged manifest import worker event source must be enabled"
             )
 
     execution_role = resources.get("IamRoleLambdaExecution", {}).get("Properties", {})
@@ -222,8 +236,10 @@ def _validate_packaged_template(path: Path) -> list[str]:
         failures.append("Cognito SES SourceArn is not scoped to info@nektron.ai")
 
     retry_state = resources.get("RetrySchedule", {}).get("Properties", {}).get("State")
-    if retry_state != "ENABLED":
-        failures.append("RetrySchedule must package as ENABLED for durable job recovery")
+    if retry_state != "DISABLED":
+        failures.append(
+            "RetrySchedule must package as DISABLED while enrichment is paused"
+        )
     bulk_retry_state = (
         resources.get("ManifestImportRetrySchedule", {})
         .get("Properties", {})

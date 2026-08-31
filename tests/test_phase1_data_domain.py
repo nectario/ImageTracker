@@ -36,10 +36,11 @@ from services.data.models import (
     UserAccount,
 )
 from services.enrichment.models import GeocodeResolution, ReverseGeocodeResult
-from services.domain.errors import ConflictError, NotFoundError
+from services.domain.errors import ConflictError, ForbiddenError, NotFoundError
 from services.domain.models import (
     AccountIdentity,
     DeviceRegistration,
+    EnrichmentPrepareCommand,
     GeoPoint,
     JobQuery,
     ManifestCommand,
@@ -150,6 +151,27 @@ def create_source(
             context(f"source-{source_key}"),
         )
     ).value
+
+
+def prepare_enrichment(
+    service: Phase1DomainService,
+    user_id: UUID,
+    device_id: UUID,
+    source_id: UUID,
+    *,
+    key: str,
+    types: tuple[str, ...] = ("Geocode", "Description"),
+    limit: int = 64,
+):
+    return run(
+        service.prepare_enrichment(
+            user_id,
+            device_id,
+            source_id,
+            EnrichmentPrepareCommand(types=types, limit=limit),  # type: ignore[arg-type]
+            context(key),
+        )
+    )
 
 
 def manifest_upsert(
@@ -647,7 +669,8 @@ def test_hash_manifest_batch_does_not_select_once_per_entry(
     with transaction_scope(session_factory) as session:
         assert session.scalar(select(func.count()).select_from(MediaAsset)) == 50
         assert session.scalar(select(func.count()).select_from(MediaOccurrence)) == 50
-        assert session.scalar(select(func.count()).select_from(ProcessingJob)) == 50
+        assert session.scalar(select(func.count()).select_from(ProcessingJob)) == 0
+        assert session.scalar(select(func.count()).select_from(ProviderUsageMonth)) == 0
         occurrence_changes = list(
             session.scalars(
                 select(MediaChange).where(
@@ -657,6 +680,101 @@ def test_hash_manifest_batch_does_not_select_once_per_entry(
         )
         assert len(occurrence_changes) == 50
         assert all(change.media_asset_id is not None for change in occurrence_changes)
+
+
+def test_bounded_enrichment_prepare_is_set_oriented_and_advances(
+    session_factory,
+) -> None:
+    service = Phase1DomainService(session_factory, clock=lambda: FIXED_NOW)
+    user = bootstrap(service)
+    device = register_device(
+        service,
+        user.user_id,
+        key="00000000-0000-0000-0000-000000000093",
+        name="Bounded prepare",
+    )
+    source = create_source(
+        service,
+        user.user_id,
+        device.device_id,
+        source_key="bounded-prepare",
+    )
+    entries = tuple(
+        replace(
+            manifest_upsert(
+                f"prepare-{index:03d}",
+                content_hash=f"{index + 1:064x}",
+            ),
+            location=None,
+        )
+        for index in range(65)
+    )
+    run(
+        service.submit_manifest(
+            user.user_id,
+            source.source_id,
+            ManifestCommand(
+                kind="Incremental",
+                permission_state="NotApplicable",
+                deletion_detection_reliable=True,
+                entries=entries,
+            ),
+            context("bounded-prepare-manifest"),
+        )
+    )
+
+    selects: list[str] = []
+    engine = session_factory.kw["bind"]
+
+    def record_select(
+        _connection, _cursor, statement, _parameters, _context, _executemany
+    ) -> None:
+        if statement.lstrip().upper().startswith("SELECT"):
+            selects.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record_select)
+    try:
+        first = prepare_enrichment(
+            service,
+            user.user_id,
+            device.device_id,
+            source.source_id,
+            key="bounded-prepare-first",
+            types=("Description",),
+            limit=64,
+        ).value
+    finally:
+        event.remove(engine, "before_cursor_execute", record_select)
+
+    assert first.description_jobs_prepared == 64
+    assert len(first.scene_description_tasks) == 64
+    assert len(selects) <= 8, "\n\n".join(selects)
+    with transaction_scope(session_factory) as session:
+        jobs = list(
+            session.scalars(
+                select(ProcessingJob).where(
+                    ProcessingJob.job_type == "Description"
+                )
+            )
+        )
+        assert len(jobs) == 64
+        for job in jobs:
+            job.status = "Queued"
+
+    second = prepare_enrichment(
+        service,
+        user.user_id,
+        device.device_id,
+        source.source_id,
+        key="bounded-prepare-second",
+        types=("Description",),
+        limit=64,
+    ).value
+    assert second.description_jobs_prepared == 1
+    assert len(second.scene_description_tasks) == 1
+    with transaction_scope(session_factory) as session:
+        assert session.scalar(select(func.count()).select_from(ProcessingJob)) == 65
+        assert session.scalar(select(func.count()).select_from(ProviderUsageMonth)) == 0
 
 
 def test_hash_manifest_precreation_preserves_mixed_batch_rejections(
@@ -728,10 +846,8 @@ def test_hash_manifest_precreation_preserves_mixed_batch_rejections(
         assert session.scalar(select(func.count()).select_from(MediaAsset)) == 1
         occurrences = list(session.scalars(select(MediaOccurrence)))
         assert [item.source_item_id for item in occurrences] == ["accepted"]
-        jobs = list(session.scalars(select(ProcessingJob)))
-        assert len(jobs) == 1
-        assert jobs[0].job_type == "Description"
-        assert jobs[0].media_asset_id == occurrences[0].media_asset_id
+        assert list(session.scalars(select(ProcessingJob))) == []
+        assert session.scalar(select(func.count()).select_from(ProviderUsageMonth)) == 0
 
 
 def test_geocode_jobs_dispatch_once_and_reuse_full_nearby_resolution(
@@ -767,9 +883,37 @@ def test_geocode_jobs_dispatch_once_and_reuse_full_nearby_resolution(
             request_context,
         )
     )
+    assert first.value.results[0].description_job_id is None
+    assert dispatcher.calls == []
+    with transaction_scope(session_factory) as session:
+        location = session.scalar(select(MediaLocation))
+        assert location.latitude == Decimal("40.668700")
+        assert location.longitude == Decimal("-74.114300")
+        assert location.provider is None
+        assert session.scalar(select(func.count()).select_from(ProcessingJob)) == 0
+        assert session.scalar(select(func.count()).select_from(ProviderUsageMonth)) == 0
+    prepared = prepare_enrichment(
+        service,
+        user.user_id,
+        device.device_id,
+        source.source_id,
+        key="geocode-first-prepare",
+    )
+    assert prepared.value.geocode_jobs_queued == 1
+    assert prepared.value.description_jobs_prepared == 1
     assert len(dispatcher.calls) == 1
     assert dispatcher.calls[0][1] == "Geocode"
     assert len(dispatcher.calls[0][0]) == 1
+
+    prepared_replay = prepare_enrichment(
+        service,
+        user.user_id,
+        device.device_id,
+        source.source_id,
+        key="geocode-first-prepare",
+    )
+    assert prepared_replay.replayed is True
+    assert len(dispatcher.calls) == 1
 
     replay = run(
         service.submit_manifest(
@@ -840,6 +984,15 @@ def test_geocode_jobs_dispatch_once_and_reuse_full_nearby_resolution(
             context("geocode-nearby"),
         )
     ).value
+    second_prepared = prepare_enrichment(
+        service,
+        user.user_id,
+        device.device_id,
+        source.source_id,
+        key="geocode-nearby-prepare",
+    )
+    assert second_prepared.value.geocode_jobs_queued == 0
+    assert second_prepared.value.description_jobs_prepared == 2
     assert second.results[0].outcome == "CreatedOccurrence"
     assert len(dispatcher.calls) == 1
     with transaction_scope(session_factory) as session:
@@ -902,6 +1055,13 @@ def test_geocode_jobs_dispatch_once_and_reuse_full_nearby_resolution(
             context("other-user-geocode"),
         )
     )
+    prepare_enrichment(
+        service,
+        other_user.user_id,
+        other_device.device_id,
+        other_source.source_id,
+        key="other-user-geocode-prepare",
+    )
     assert len(dispatcher.calls) == 2
     with transaction_scope(session_factory) as session:
         other_account_id = session.scalar(
@@ -923,6 +1083,113 @@ def test_geocode_jobs_dispatch_once_and_reuse_full_nearby_resolution(
                 ProcessingJob.job_type == "Description"
             )
         ) == 3
+
+
+def test_explicit_enrichment_fails_closed_when_processing_is_paused(
+    session_factory,
+) -> None:
+    service = Phase1DomainService(
+        session_factory,
+        clock=lambda: FIXED_NOW,
+        enrichment_processing_enabled=False,
+    )
+    user = bootstrap(service)
+    device = register_device(
+        service,
+        user.user_id,
+        key="00000000-0000-0000-0000-000000000069",
+        name="Paused enrichment",
+    )
+    source = create_source(
+        service,
+        user.user_id,
+        device.device_id,
+        source_key="paused-enrichment",
+    )
+    result = run(
+        service.submit_manifest(
+            user.user_id,
+            source.source_id,
+            ManifestCommand(
+                kind="Incremental",
+                permission_state="NotApplicable",
+                deletion_detection_reliable=True,
+                entries=(manifest_upsert("paused-photo"),),
+            ),
+            context("paused-enrichment-manifest"),
+        )
+    ).value
+    assert result.results[0].description_job_id is None
+
+    with pytest.raises(ConflictError, match="Enrichment processing is paused"):
+        prepare_enrichment(
+            service,
+            user.user_id,
+            device.device_id,
+            source.source_id,
+            key="paused-enrichment-prepare",
+        )
+    with transaction_scope(session_factory) as session:
+        assert session.scalar(select(func.count()).select_from(ProcessingJob)) == 0
+        assert session.scalar(select(func.count()).select_from(ProviderUsageMonth)) == 0
+
+
+def test_enrichment_replay_never_reveals_local_locator_to_another_device(
+    service,
+) -> None:
+    user = bootstrap(service)
+    owner = register_device(
+        service,
+        user.user_id,
+        key="00000000-0000-0000-0000-000000000070",
+        name="Enrichment owner",
+    )
+    other = register_device(
+        service,
+        user.user_id,
+        key="00000000-0000-0000-0000-000000000071",
+        name="Other device",
+    )
+    source = create_source(
+        service,
+        user.user_id,
+        owner.device_id,
+        source_key="device-scoped-enrichment",
+    )
+    run(
+        service.submit_manifest(
+            user.user_id,
+            source.source_id,
+            ManifestCommand(
+                kind="Incremental",
+                permission_state="NotApplicable",
+                deletion_detection_reliable=True,
+                entries=(replace(manifest_upsert("private-enrichment"), location=None),),
+            ),
+            context("device-scoped-manifest"),
+        )
+    )
+    prepared = prepare_enrichment(
+        service,
+        user.user_id,
+        owner.device_id,
+        source.source_id,
+        key="device-scoped-prepare",
+        types=("Description",),
+    )
+    assert prepared.value.scene_description_tasks[0].local_locator.endswith(
+        "private-enrichment.JPG"
+    )
+
+    with pytest.raises(ForbiddenError, match="source device"):
+        prepare_enrichment(
+            service,
+            user.user_id,
+            other.device_id,
+            source.source_id,
+            key="device-scoped-prepare",
+            types=("Description",),
+        )
 
 
 def test_geocode_worker_claim_quota_and_completion_are_transactional(
@@ -950,6 +1217,14 @@ def test_geocode_worker_claim_quota_and_completion_are_transactional(
             ),
             context("worker-one"),
         )
+    )
+    prepare_enrichment(
+        service,
+        user.user_id,
+        device.device_id,
+        source.source_id,
+        key="worker-one-prepare",
+        types=("Geocode",),
     )
     with transaction_scope(session_factory) as session:
         first_job_id = UUID(
@@ -1056,6 +1331,14 @@ def test_geocode_worker_claim_quota_and_completion_are_transactional(
             context("worker-two"),
         )
     )
+    prepare_enrichment(
+        service,
+        user.user_id,
+        device.device_id,
+        source.source_id,
+        key="worker-two-prepare",
+        types=("Geocode",),
+    )
     with transaction_scope(session_factory) as session:
         second_job_id = UUID(
             session.scalar(
@@ -1117,6 +1400,14 @@ def test_geocode_completion_cannot_overwrite_newer_coordinates(
             ),
             context("stale"),
         )
+    )
+    prepare_enrichment(
+        service,
+        user.user_id,
+        device.device_id,
+        source.source_id,
+        key="stale-prepare",
+        types=("Geocode",),
     )
     with transaction_scope(session_factory) as session:
         job_id = UUID(
@@ -1185,6 +1476,14 @@ def test_returning_to_an_earlier_coordinate_requeues_its_terminal_job(
             context("coordinate-a"),
         )
     )
+    prepare_enrichment(
+        service,
+        user.user_id,
+        device.device_id,
+        source.source_id,
+        key="coordinate-a-prepare",
+        types=("Geocode",),
+    )
     with transaction_scope(session_factory) as session:
         first_job = session.scalar(select(ProcessingJob))
         first_job_id = UUID(first_job.public_id)
@@ -1215,6 +1514,14 @@ def test_returning_to_an_earlier_coordinate_requeues_its_terminal_job(
             context("coordinate-b"),
         )
     )
+    prepare_enrichment(
+        service,
+        user.user_id,
+        device.device_id,
+        source.source_id,
+        key="coordinate-b-prepare",
+        types=("Geocode",),
+    )
     with transaction_scope(session_factory) as session:
         second_job = session.scalar(
             select(ProcessingJob).where(
@@ -1240,6 +1547,14 @@ def test_returning_to_an_earlier_coordinate_requeues_its_terminal_job(
             ),
             context("coordinate-a-again"),
         )
+    )
+    prepare_enrichment(
+        service,
+        user.user_id,
+        device.device_id,
+        source.source_id,
+        key="coordinate-a-again-prepare",
+        types=("Geocode",),
     )
 
     assert dispatcher.calls[-1] == ((first_job_id,), "Geocode")
@@ -1569,6 +1884,14 @@ def test_quota_deferred_job_manual_retry_dispatches_once(session_factory) -> Non
             context("quota-create"),
         )
     )
+    prepare_enrichment(
+        service,
+        user.user_id,
+        device.device_id,
+        source.source_id,
+        key="quota-create-prepare",
+        types=("Geocode",),
+    )
     assert len(dispatcher.calls) == 1
     with transaction_scope(session_factory) as session:
         job = session.scalar(
@@ -1629,6 +1952,13 @@ def test_due_job_sweep_recovers_orphans_and_promotes_description_restage(
             ),
             context("recovery-create"),
         )
+    )
+    prepare_enrichment(
+        service,
+        user.user_id,
+        device.device_id,
+        source.source_id,
+        key="recovery-create-prepare",
     )
     dispatcher.calls.clear()
     with transaction_scope(session_factory) as session:
@@ -1721,6 +2051,14 @@ def test_due_job_sweep_conservatively_charges_expired_exhausted_attempt(
             context("expired-attempt-create"),
         )
     )
+    prepare_enrichment(
+        service,
+        user.user_id,
+        device.device_id,
+        source.source_id,
+        key="expired-attempt-prepare",
+        types=("Geocode",),
+    )
     dispatcher.calls.clear()
     with transaction_scope(session_factory) as session:
         job_id = UUID(
@@ -1789,6 +2127,14 @@ def test_due_job_dispatch_failure_is_recovered_by_the_next_sweep(
             ),
             context("dispatch-retry-create"),
         )
+    )
+    prepare_enrichment(
+        service,
+        user.user_id,
+        device.device_id,
+        source.source_id,
+        key="dispatch-retry-prepare",
+        types=("Geocode",),
     )
     with transaction_scope(session_factory) as session:
         job = session.scalar(

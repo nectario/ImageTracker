@@ -18,6 +18,7 @@ PACKAGE_ROOT = BUILD_ROOT / ".serverless"
 TEMPLATE_PATH = PACKAGE_ROOT / "cloudformation-template-update-stack.json"
 ALLOWED_PARAMETERS = {
     "allowedOrigin",
+    "manifestImportRetryScheduleState",
     "maintenanceSchedulesState",
     "monthlyBudgetUsd",
     "retryScheduleState",

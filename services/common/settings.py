@@ -33,6 +33,7 @@ class AppSettings(BaseSettings):
     openai_secret_parameter: str = "/imagetracker/prod/openai"
     elevenlabs_secret_parameter: str = "/imagetracker/prod/elevenlabs"
     processing_queue_url: str = ""
+    enrichment_processing_enabled: bool = False
     manifest_import_queue_url: str = ""
     manifest_import_max_entries: int = Field(default=250_000, ge=1, le=1_000_000)
     manifest_import_max_compressed_bytes: int = Field(

@@ -59,26 +59,31 @@ not yet the desired WOW result; MySQL auto-increment/ORM insert work now
 dominates, so the next large gain requires a truly set-based staging-table or
 asynchronous bulk-ingest path.
 
-That set-based path is now implemented and package-validated in the repository,
-but has not yet been migrated or deployed. Migration 014 adds durable import,
+That set-based path is deployed, and migration 014 is recorded in production.
+Migration 014 adds durable import,
 raw/normalized staging, asset-work, and failure-audit tables plus an online
 occurrence index. The authenticated API issues a checksum-bound private S3
 upload, a dedicated one-concurrent 15-minute Lambda performs one validated
 `LOAD DATA LOCAL INFILE` and set merge, and a durable result artifact lets the
 CLI resume SQLite reconciliation after interruption. `sync --transport auto`
 uses bulk above 10 batches or 1,000 eligible rows and preserves the existing
-batch outbox for all fallbacks. Ordinary sync is metadata-only; paid preview
-staging now requires `enrich --limit N` or `--with-enrichment` explicitly.
+batch outbox for all fallbacks. Ordinary batch and bulk manifests are now
+strictly metadata-only: they store raw coordinates but cannot create, requeue,
+or dispatch any enrichment job. The device-scoped `enrich --limit N` command
+uses a separate idempotent preparation mutation; `--with-enrichment` is an
+explicit convenience alias after metadata fully drains.
 
-The complete candidate passes 361 tests, validates 33 OpenAPI operations/93
-schemas/29 paths, and produces a valid production CloudFormation/Lambda
-package. The remaining release gate is intentionally operational: apply
-migration 014 with the existing administrative MySQL credential, run a tiny
-disposable real-MySQL canary, inspect its rows/result/CloudWatch duration, then
-scale through 1,000 and 10,000 rows before allowing the saved production
-backlog to use bulk transport.
-The CLI supports that gate directly through `--bulk-max-rows`; a completed
-segment stops before rescanning and leaves uncaptured batches pending.
+The current candidate passes 370 tests and validates 34 OpenAPI operations,
+97 schemas, and 30 paths. Production migration 014 and the self-cleaning
+four-row MySQL canary pass. A 1,000-row bulk stage also completed with zero
+metadata rejects, but exposed that the previous worker automatically dispatched
+Amazon Location jobs. The general enrichment event mapping and recovery rule
+were immediately disabled. The next release encodes that pause in
+CloudFormation, rejects explicit preparation while paused, and must prove a
+10,000-row metadata import changes neither `ProcessingJob`, provider usage, nor
+the general processing queue. The CLI supports that gate through
+`--bulk-max-rows`; a completed segment stops before rescanning and leaves
+uncaptured batches pending.
 
 ## Scope delivered in the repository
 
@@ -98,19 +103,18 @@ segment stops before rescanning and leaves uncaptured batches pending.
 
 ## Enrichment candidate in the repository
 
-- A GPS-bearing manifest creates an idempotent `Geocode` processing job. Before
-  calling Amazon Location Service Places V2, the service looks for a complete
-  same-user resolution within 5 metres and copies the full normalized address
-  and provider provenance when one exists.
+- A GPS-bearing manifest stores raw coordinates and may reuse an already-stored
+  same-user resolution within 5 metres without a provider call. Only explicit
+  enrichment preparation creates an idempotent `Geocode` processing job.
 - A bounded SQS worker processes geocode jobs one message at a time.
   `ReverseGeocode` receives coordinates only and declares
   `IntendedUse=Storage`, `MaxResults=1`, and address-oriented place types. The
   durable provider identifier is `AmazonLocationPlacesV2`. The default hard
   limit is 1,000 provider calls per user per calendar month; exhausted work
   becomes `DeferredQuota`.
-- Every eligible photo without a current description receives one idempotent
-  `Description` job in `Preparing`. The CLI keeps an account-scoped durable
-  outbox for preparing and staging its preview.
+- Explicit enrichment preparation creates one idempotent `Description` job for
+  each selected eligible photo. The CLI durably saves the request identity and
+  returned local staging tasks before preparing previews.
 - The preview is a deterministic, metadata-free JPEG with a maximum 1,024-pixel
   long edge. It is checksum-bound to a single-part signed PUT under `staging/`,
   then exposed to the worker through a short-lived signed GET.
@@ -166,8 +170,10 @@ and the existing MySQL database.
 - No NAT gateway, load balancer, CDN, RDS Proxy, ECS service, vector database,
   or always-on SageMaker endpoint is introduced.
 - The enrichment worker is bounded to one concurrent Lambda and one SQS message
-  per batch. A five-minute retry/recovery sweep is enabled; reconciliation,
-  quota-reset, and trash-purge schedules remain disabled.
+  per batch. Its event mapping, API preparation switch, and five-minute
+  retry/recovery sweep are disabled during metadata rollout. The bulk worker
+  and bulk recovery schedule remain enabled; other maintenance schedules remain
+  disabled.
 - Amazon Location reverse geocoding reuses same-user results within 5 metres
   and has a 1,000-call monthly per-user ceiling. At the 2026-08-28 `us-east-2`
   list price, that caps this component at about USD 4 per user per month.

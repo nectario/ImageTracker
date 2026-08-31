@@ -21,7 +21,7 @@ Individual commands:
 ./scripts/cli.sh sync "My Photos" --transport bulk
 ./scripts/cli.sh sync "My Photos" --transport bulk --bulk-max-rows 1000
 ./scripts/cli.sh sync "My Photos" --transport batch
-./scripts/cli.sh enrich "My Photos" --limit 100
+./scripts/cli.sh enrich "My Photos" --limit 64
 ./scripts/test.sh
 ./scripts/api-smoke.sh
 ./scripts/aws-smoke.sh
@@ -37,10 +37,12 @@ Individual commands:
   --admin-env-file /path/to/ignored/.env.prod
 ```
 
-`sync` performs metadata work only unless `--with-enrichment` is supplied.
-Use `enrich --limit N` to stage a bounded number of due scene previews without
-rescanning the source or sending queued manifests. Both commands are resumable;
-stopping with `Ctrl+C` leaves completed work saved.
+`sync` creates no enrichment jobs unless `--with-enrichment` is supplied.
+Use `enrich --limit N` to explicitly prepare bounded location and scene jobs,
+then stage the returned scene previews without rescanning the source or sending
+queued manifests. If production enrichment is paused, it fails before creating
+jobs. Both commands are resumable; stopping with `Ctrl+C` leaves completed work
+saved.
 
 `sync --transport auto` uses one asynchronous import above 10 batches or 1,000
 eligible rows. `bulk` requests that path explicitly, while `batch` is the safe

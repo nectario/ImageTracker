@@ -261,7 +261,8 @@ class BulkManifestProcessor:
                 )
                 merge = self._repository.merge(claim, settings=self._settings.merge)
                 counts = merge.as_counts()
-                self._dispatch_geocode_jobs(claim)
+                if self._settings.merge.enqueue_enrichment_jobs:
+                    self._dispatch_geocode_jobs(claim)
             elif claim.phase in {"Staged", "Merging"}:
                 self._repository.set_phase(
                     claim,
@@ -270,7 +271,8 @@ class BulkManifestProcessor:
                 )
                 merge = self._repository.merge(claim, settings=self._settings.merge)
                 counts = merge.as_counts()
-                self._dispatch_geocode_jobs(claim)
+                if self._settings.merge.enqueue_enrichment_jobs:
+                    self._dispatch_geocode_jobs(claim)
             else:
                 merge = self._repository.current_result(claim)
                 counts = merge.as_counts()

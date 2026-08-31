@@ -212,6 +212,24 @@ class ApiClient:
             headers={"Idempotency-Key": key},
         )
 
+    def prepare_enrichment(
+        self,
+        source_id: str,
+        payload: Mapping[str, Any],
+        *,
+        device_id: str,
+        key: str,
+    ) -> Mapping[str, Any]:
+        return self.request(
+            "POST",
+            f"/v1/sources/{source_id}/enrichment/prepare",
+            json=payload,
+            headers={
+                "Idempotency-Key": key,
+                "X-ImageTracker-Device-Id": device_id,
+            },
+        )
+
     def create_manifest_import(
         self,
         source_id: str,

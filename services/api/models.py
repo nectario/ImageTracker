@@ -160,6 +160,11 @@ class ProcessingJobType(StringEnum):
     LEGACY_MIGRATION = "LegacyMigration"
 
 
+class EnrichmentKind(StringEnum):
+    GEOCODE = "Geocode"
+    DESCRIPTION = "Description"
+
+
 class UploadPurpose(StringEnum):
     ORIGINAL = "Original"
     PREVIEW = "Preview"
@@ -437,6 +442,44 @@ class ManifestResponse(ApiModel):
     source_cursor: str | None = None
     counts: ManifestCounts
     results: list[ManifestEntryResult]
+
+
+class EnrichmentPrepareRequest(ApiModel):
+    types: list[EnrichmentKind] = Field(
+        default_factory=lambda: [
+            EnrichmentKind.GEOCODE,
+            EnrichmentKind.DESCRIPTION,
+        ],
+        min_length=1,
+        max_length=2,
+    )
+    limit: int = Field(default=64, ge=1, le=64)
+
+    @field_validator("types")
+    @classmethod
+    def require_unique_types(
+        cls, value: list[EnrichmentKind]
+    ) -> list[EnrichmentKind]:
+        if len({str(item) for item in value}) != len(value):
+            raise ValueError("types must not contain duplicates")
+        return value
+
+
+class SceneDescriptionTask(ApiModel):
+    job_id: UUID
+    media_asset_id: UUID
+    occurrence_id: UUID
+    source_item_id: str = Field(min_length=1, max_length=512)
+    local_locator: str = Field(min_length=1, max_length=4096)
+    asset_content_sha256: str = Field(pattern=r"^[A-Fa-f0-9]{64}$")
+    file_name: str = Field(min_length=1, max_length=512)
+
+
+class EnrichmentPrepareResponse(ApiModel):
+    source_id: UUID
+    geocode_jobs_queued: int = Field(ge=0)
+    description_jobs_prepared: int = Field(ge=0)
+    scene_description_tasks: list[SceneDescriptionTask]
 
 
 class ManifestImportCreateRequest(ApiModel):

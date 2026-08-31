@@ -288,6 +288,31 @@ class ManifestResult:
 
 
 @dataclass(frozen=True)
+class EnrichmentPrepareCommand:
+    types: tuple[Literal["Geocode", "Description"], ...]
+    limit: int
+
+
+@dataclass(frozen=True)
+class SceneDescriptionTaskRecord:
+    job_id: UUID
+    media_asset_id: UUID
+    occurrence_id: UUID
+    source_item_id: str
+    local_locator: str
+    asset_content_sha256: str
+    file_name: str
+
+
+@dataclass(frozen=True)
+class EnrichmentPreparation:
+    source_id: UUID
+    geocode_jobs_queued: int
+    description_jobs_prepared: int
+    scene_description_tasks: tuple[SceneDescriptionTaskRecord, ...]
+
+
+@dataclass(frozen=True)
 class MediaQuery:
     cursor: str | None = None
     limit: int = 50

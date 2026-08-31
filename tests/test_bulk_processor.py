@@ -20,6 +20,7 @@ from services.bulk.repository import (
     BulkImportDatabaseError,
     ManifestImportClaim,
     MergeResult,
+    MergeSettings,
 )
 
 
@@ -97,6 +98,8 @@ class FakeRepository:
         self.completed: dict[str, object] | None = None
         self.failures: list[dict[str, object]] = []
         self.phases: list[str] = []
+        self.merge_settings: list[MergeSettings] = []
+        self.geocode_batch_queries = 0
 
     def claim(self, **_kwargs):
         return self.claim_value
@@ -105,9 +108,14 @@ class FakeRepository:
         assert parsed.entry_count == 1
         self.loaded += 1
 
-    def merge(self, _claim, **_kwargs):
+    def merge(self, _claim, **kwargs):
         self.merged += 1
+        self.merge_settings.append(kwargs["settings"])
         return MergeResult(1, 1, 0, 0, 0, 0)
+
+    def queued_geocode_job_batches(self, _claim):
+        self.geocode_batch_queries += 1
+        yield (UUID("00000000-0000-0000-0000-000000000405"),)
 
     def set_phase(self, _claim, *, phase, allowed_phases):
         assert phase in {"Merging", "WritingResult"}
@@ -143,18 +151,28 @@ class FakeStore:
         self.upload = {**kwargs, "content": source.read_bytes()}
 
 
+class FakeJobDispatcher:
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[UUID, ...], str]] = []
+
+    def dispatch(self, *, job_ids, job_type):
+        self.calls.append((tuple(job_ids), job_type))
+
+
 def test_processor_runs_verified_stage_merge_and_deterministic_result(tmp_path: Path):
     source = tmp_path / "input.gz"
     byte_size, checksum = _artifact(source)
     claim = _claim(byte_size, checksum)
     repository = FakeRepository(claim)
     store = FakeStore(source)
+    dispatcher = FakeJobDispatcher()
     processor = BulkManifestProcessor(
         repository=repository,  # type: ignore[arg-type]
         object_store=store,
         settings=BulkProcessorSettings(
             result_bucket="media-bucket", work_root=tmp_path
         ),
+        job_dispatcher=dispatcher,
     )
 
     disposition = processor.process(import_id=IMPORT_ID, message_id="message-one")
@@ -163,12 +181,43 @@ def test_processor_runs_verified_stage_merge_and_deterministic_result(tmp_path: 
     assert repository.loaded == 1
     assert repository.merged == 1
     assert repository.phases == ["Merging", "WritingResult"]
+    assert repository.merge_settings == [MergeSettings()]
+    assert repository.geocode_batch_queries == 0
+    assert dispatcher.calls == []
     assert repository.completed is not None
     assert store.download_bounds == (byte_size, 256 * 1024 * 1024)
     assert store.upload is not None
     assert store.upload["object_key"] == (
         f"manifests/result/{USER_ID}/{SOURCE_ID}/{IMPORT_ID}.ndjson.gz"
     )
+
+
+def test_explicit_bulk_enrichment_opt_in_dispatches_geocode_jobs(tmp_path: Path):
+    source = tmp_path / "input-opt-in.gz"
+    byte_size, checksum = _artifact(source)
+    repository = FakeRepository(_claim(byte_size, checksum))
+    dispatcher = FakeJobDispatcher()
+    processor = BulkManifestProcessor(
+        repository=repository,  # type: ignore[arg-type]
+        object_store=FakeStore(source),
+        settings=BulkProcessorSettings(
+            result_bucket="media-bucket",
+            work_root=tmp_path,
+            merge=MergeSettings(enqueue_enrichment_jobs=True),
+        ),
+        job_dispatcher=dispatcher,
+    )
+
+    disposition = processor.process(import_id=IMPORT_ID, message_id="message-one")
+
+    assert disposition is BulkMessageDisposition.ACK
+    assert repository.merge_settings == [
+        MergeSettings(enqueue_enrichment_jobs=True)
+    ]
+    assert repository.geocode_batch_queries == 1
+    assert dispatcher.calls == [
+        ((UUID("00000000-0000-0000-0000-000000000405"),), "Geocode")
+    ]
 
 
 def test_claim_time_database_failure_requests_sqs_retry(tmp_path: Path):

@@ -203,11 +203,19 @@ the stack succeeds:
 npm run deploy -- --budget-email info@nektron.ai
 ```
 
+The staged metadata rollout declares both the general enrichment event-source
+mapping and `RetryDueJobs` rule disabled, and sets
+`IMAGETRACKER_ENRICHMENT_PROCESSING_ENABLED=false`. The manifest-import worker
+and its recovery rule remain enabled. Enabling enrichment later is a deliberate
+release that must change all three controls together; the API otherwise rejects
+preparation before creating jobs or provider reservations.
+
 Other supported parameters are:
 
 - `monthlyBudgetUsd` (default `50`)
 - `allowedOrigin` (default `*`; native clients do not depend on browser CORS)
-- `retryScheduleState` (`ENABLED` for durable job recovery)
+- `retryScheduleState` (`DISABLED` while general enrichment is paused)
+- `manifestImportRetryScheduleState` (`ENABLED` for bulk-import recovery)
 - `maintenanceSchedulesState` (`DISABLED` for deferred maintenance jobs)
 
 AWS cost-allocation tags `Application` and `Environment` must be activated in
