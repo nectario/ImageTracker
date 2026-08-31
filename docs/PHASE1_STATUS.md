@@ -78,12 +78,14 @@ The current candidate passes 370 tests and validates 34 OpenAPI operations,
 four-row MySQL canary pass. A 1,000-row bulk stage also completed with zero
 metadata rejects, but exposed that the previous worker automatically dispatched
 Amazon Location jobs. The general enrichment event mapping and recovery rule
-were immediately disabled. The next release encodes that pause in
-CloudFormation, rejects explicit preparation while paused, and must prove a
-10,000-row metadata import changes neither `ProcessingJob`, provider usage, nor
-the general processing queue. The CLI supports that gate through
-`--bulk-max-rows`; a completed segment stops before rescanning and leaves
-uncaptured batches pending.
+were immediately disabled. Commit `ce2ff53` now encodes that pause in
+CloudFormation and rejects explicit preparation before creating jobs while
+paused. Its production 10,000-row metadata gate completed in 10.30 seconds with
+10,000 updates, zero rejects, and no change to `ProcessingJob` count/max ID,
+job-state totals, either provider ledger, the general processing queue, or the
+local scene outbox. The CLI supports staged gates through `--bulk-max-rows`; a
+completed segment stops before rescanning and leaves uncaptured batches
+pending. The remaining 780 saved metadata batches were deliberately not run.
 
 ## Scope delivered in the repository
 
@@ -215,21 +217,24 @@ that subject, and confirms both Cognito and MySQL cleanup before returning.
 
 | Criterion | Expected result | Evidence |
 | --- | --- | --- |
-| Focused Phase 1 tests | API, domain/data, CLI, and shell tests pass | Pass; included in the 131-test final suite |
-| Full repository tests | Entire pytest suite passes | Pass; 131 tests |
-| Contract validation | Structural and specification checks pass | Pass; 27 operations, 87 schemas, 23 paths |
+| Focused Phase 1 tests | API, domain/data, CLI, and shell tests pass | Pass; included in the 370-test final suite |
+| Full repository tests | Entire pytest suite passes | Pass; 370 tests |
+| Contract validation | Structural and specification checks pass | Pass; 34 operations, 97 schemas, 30 paths |
 | Infrastructure package | Foundation validator and Serverless packaging pass | Pass; CloudFormation and root-level Lambda archive validated before deploy |
 | Authenticated live API | Cognito user can call Phase 1 routes; unauthenticated call is rejected | Pass; two concurrent first-use calls returned the same account with 200; no token returned 401 |
 | Exact duplicate behavior | Two different paths with identical bytes produce one asset and two occurrences | Pass live; `MediaAsset=1`, `MediaOccurrence=2`, distinct paths=2 |
 | Repeat safety | Repeating the same manifest creates no duplicate asset or occurrence | Pass live; durable replay matched and a new-key rerun returned `unchanged=2` |
 | Resume safety | An unacknowledged local outbox batch is sent successfully on the next sync | Pass in integration tests; failed entries are separately quarantined and releasable |
+| Bulk MySQL canary | Exact deduplication, rejection audit, replay, and cleanup pass | Pass live; four rows produced two assets, three occurrences, one duplicate link, one expected rejection, and zero residue |
+| Staged bulk metadata | 1,000 then 10,000 rows complete without metadata rejection | Pass live; 1,000/1,000 then 10,000/10,000, zero rejects and zero failed local batches |
+| Metadata/enrichment boundary | Metadata changes no job, provider-ledger, scene-outbox, or general-queue state | Pass live at 10,000 rows; `ProcessingJob=73,155`, max ID `74,844`, provider rows and 240 paused messages remained exact |
 | Local storage boundary | Local sync performs zero original/preview writes to S3 | Pass live; bucket inventory remained 0 objects/0 bytes and every asset S3 locator was null |
 | Reliable deletion | Completed scan emits a deletion; incomplete traversal does not infer deletion | Pass in scanner/domain integration tests; unreadable traversal exits partial |
 | Legacy safety | Audit/preview use a read-only transaction and report zero writes | Pass live; 2,099 rows audited, one temporal-review row identified, bounded preview reported `writesPerformed=0` |
 | Stored reverse geocode | Synthetic GPS resolves through Amazon Location Places V2 | Pass live; provider `AmazonLocationPlacesV2`, street address `338-350 5th Ave` |
 | Scene description | Metadata-free preview is described by the pinned model | Pass live; provider `OpenAI`, model `gpt-5.6-terra`, searchable sentence persisted |
 | Temporary preview cleanup | Local asset remains LocalOnly and staging is deleted | Pass live; durable S3 locators null, zero staging objects after processing |
-| Worker cost/recovery controls | Queue, concurrency, DLQ, retry rule, and alert are bounded | Pass live; concurrency 1, visibility 900, max receives 8, retry every 5 minutes, 80% budget alert to `info@nektron.ai` |
+| Worker cost/recovery controls | Queue, concurrency, DLQ, retry rule, and alert are bounded | Pass live; enrichment mapping/retry disabled during metadata rollout, bulk mapping/retry enabled, both DLQs empty, 80% budget alert to `info@nektron.ai` |
 
 ## Enrichment deployment prerequisites
 
